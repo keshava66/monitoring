@@ -563,7 +563,7 @@ export function Tabs({ tabs, value, onChange, label, variant = 'underline', clas
 
 const FOCUSABLE = 'a[href],button:not([disabled]),textarea:not([disabled]),input:not([disabled]),select:not([disabled]),[tabindex]:not([tabindex="-1"])';
 
-function useDialogBehaviour(open, onClose, containerRef) {
+export function useDialogBehaviour(open, onClose, containerRef) {
   const onCloseRef = useRef(onClose);
   useEffect(() => { onCloseRef.current = onClose; }, [onClose]);
   useEffect(() => {
@@ -672,10 +672,10 @@ export function Menu({ trigger, children, align = 'right', className, open, onOp
   );
 }
 
-export function MenuItem({ children, onClick, active, tone, title }) {
+export function MenuItem({ children, onClick, active, tone, title, disabled = false }) {
   return (
-    <button type="button" role="menuitem" onClick={onClick} title={title}
-      className={cx('w-full text-left px-3 py-2 rounded-xl font-johnson-text text-sm transition-colors focus-ring-inset',
+    <button type="button" role="menuitem" onClick={onClick} title={title} disabled={disabled}
+      className={cx('w-full text-left px-3 py-2 rounded-xl font-johnson-text text-sm transition-colors focus-ring-inset disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:bg-transparent',
         tone === 'danger' ? 'text-jj-red hover:bg-red-50' : 'text-jj-gray-07 hover:bg-jj-gray-01',
         active && 'text-jj-red font-semibold')}>
       {children}

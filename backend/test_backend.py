@@ -10,6 +10,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -586,3 +587,137 @@ def test_config_injection_rejected(tmp_path, monkeypatch):
         db_common.table_identifier("public.t; DROP TABLE x", "public")
     with pytest.raises(ValueError):
         db_common.table_identifier('a"b', "public")
+
+
+# ── linux_manage/manage.py ───────────────────────────────────────────────────
+
+@pytest.fixture()
+def manager(tmp_path, monkeypatch):
+    import importlib.util
+    svc_dir = tmp_path / "svc"
+    svc_dir.mkdir()
+    script = tmp_path / "svc.sh"
+    script.write_text('echo "step one for $1"\nsleep "${SLEEP:-0}"\necho done\n')
+    cfg = tmp_path / "config.ini"
+    cfg.write_text(
+        f"[backend]\nname = API\ndir = {svc_dir}\nport = 9001\nentry = Backend:app\n"
+        f"[frontend]\nname = UI\ndir = {svc_dir}\nport = 9002\n"
+        f"[scripts]\nbackend = {script}\nfrontend = {script}\n"
+        f"[search_paths]\nroot = {tmp_path}\n"
+    )
+    monkeypatch.setenv("MANAGE_CONFIG", str(cfg))
+    monkeypatch.setenv("AD_GROUP_ADMIN", "admins")
+    path = Path(__file__).resolve().parent.parent / "linux_manage" / "manage.py"
+    spec = importlib.util.spec_from_file_location(f"manage_{uuid.uuid4().hex}", path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod  # pydantic resolves the postponed annotations through it
+    spec.loader.exec_module(mod)
+    monkeypatch.setattr(mod, "_admin_email", lambda token: "ops@x.com" if token == "adm" else None)
+    mod.svc_dir = svc_dir
+    return mod
+
+
+ADM = {"Authorization": "Bearer adm"}
+
+
+def test_manager_requires_admin(manager):
+    mc = TestClient(manager.app)
+    assert mc.get("/health").status_code == 200
+    assert mc.get("/api/overview").status_code == 401
+    assert mc.get("/api/overview", headers={"Authorization": "Bearer other"}).status_code == 403
+    assert mc.post("/api/terminal/ticket", headers=ADM).json()["expires_in"] == manager.TICKET_TTL
+    assert mc.post("/api/reboot/backend", headers=ADM).status_code == 404
+    assert mc.post("/api/start/nope", headers=ADM).status_code == 404
+
+
+def test_manager_overview_and_pid_checks(manager):
+    mc = TestClient(manager.app)
+    pidfile = manager.svc_dir / "backend.pid"
+    pidfile.write_text(str(os.getpid()))
+    body = mc.get("/api/overview", headers=ADM).json()
+    assert body["services"]["backend"]["running"] and body["services"]["backend"]["pid"] == os.getpid()
+    assert body["services"]["backend"]["cpu"] is not None and body["services"]["frontend"]["running"] is False
+    assert body["host"]["cores"] >= 1 and body["git"] is None
+    # A process started long after the pid file was written is a recycled PID.
+    os.utime(pidfile, (1, 1))
+    assert manager.read_pid(str(manager.svc_dir), "backend") is None
+
+
+def test_manager_action_streams_and_claims(manager, monkeypatch):
+    mc = TestClient(manager.app)
+    with mc.stream("POST", "/api/restart/frontend", headers={**ADM, "Accept": "application/x-ndjson"}) as resp:
+        events = [json.loads(l) for l in resp.iter_lines() if l]
+    assert events[0] == {"type": "line", "text": "step one for restart"}
+    assert events[-1] == {"type": "exit", "returncode": 0, "service": "frontend", "action": "restart"}
+    plain = mc.post("/api/stop/frontend", headers=ADM).json()
+    assert plain["returncode"] == 0 and plain["output"] == "step one for stop\ndone"
+
+    monkeypatch.setenv("SLEEP", "2")
+    import threading
+    first = threading.Thread(target=lambda: mc.post("/api/start/backend", headers=ADM))
+    first.start()
+    deadline = time.time() + 5
+    while not manager._busy("backend") and time.time() < deadline:
+        time.sleep(0.02)
+    busy = mc.post("/api/stop/backend", headers=ADM)
+    assert busy.status_code == 409 and "start started by ops@x.com" in busy.json()["detail"]
+    assert mc.get("/api/overview", headers=ADM).json()["services"]["backend"]["busy"]["action"] == "start"
+    first.join()
+    assert manager._busy("backend") is None
+
+
+def test_manager_dir_switch_refused_while_running(manager, tmp_path):
+    mc = TestClient(manager.app)
+    other = tmp_path / "other"
+    other.mkdir()
+    (manager.svc_dir / "backend.pid").write_text(str(os.getpid()))
+    resp = mc.post("/api/service/backend/dir", headers=ADM, json={"dir": str(other)})
+    assert resp.status_code == 409
+    (manager.svc_dir / "backend.pid").unlink()
+    assert mc.post("/api/service/backend/dir", headers=ADM, json={"dir": str(other)}).json()["dir"] == str(other.resolve())
+    assert mc.post("/api/service/backend/dir", headers=ADM, json={"dir": "/"}).status_code == 400
+
+
+def test_manager_tail_and_logs(manager):
+    log = manager.svc_dir / "backend.log"
+    log.write_text("".join(f"line {i}\n" for i in range(20000)))
+    assert manager.tail_file(log, 3) == "line 19997\nline 19998\nline 19999"
+    mc = TestClient(manager.app)
+    assert mc.get("/api/logs/backend?lines=2", headers=ADM).json()["logs"] == "line 19998\nline 19999"
+    assert mc.get("/api/logs/frontend", headers=ADM).json()["logs"] == ""
+
+
+def test_manager_terminal_keeps_shell_state(manager, tmp_path):
+    mc = TestClient(manager.app)
+    with mc.websocket_connect("/ws/terminal?ticket=bad") as ws:
+        with pytest.raises(Exception):
+            ws.receive_json()
+
+    def run(ws, cmd):
+        ws.send_json({"cmd": cmd})
+        out = ""
+        while (m := ws.receive_json())["type"] != "exit":
+            out += m.get("data", "")
+        return out, m
+
+    ticket = mc.post("/api/terminal/ticket", headers=ADM).json()["ticket"]
+    with mc.websocket_connect(f"/ws/terminal?ticket={ticket}") as ws:
+        assert ws.receive_json()["type"] == "cwd"
+        _, m = run(ws, f"cd {tmp_path} && export DEMO=42")
+        assert m == {"type": "exit", "code": 0, "cwd": str(tmp_path.resolve())}
+        out, _ = run(ws, 'echo "$DEMO $(pwd)"; cd /')
+        assert out == f"42 {tmp_path.resolve()}\n"
+        out, m = run(ws, "cd - >/dev/null; pwd; exit 4")
+        assert out == f"{tmp_path.resolve()}\n" and m["code"] == 4
+        out, _ = run(ws, "env | grep -c BASH_ENV")
+        assert out == "0\n"
+        ws.send_json({"cmd": "sleep 20"})
+        time.sleep(0.3)
+        ws.send_json({"type": "signal", "signal": "SIGINT"})
+        assert ws.receive_json()["code"] == 130
+        ws.send_json({"cmd": "clear"})
+        assert ws.receive_json() == {"type": "clear"}
+    # The second use of a ticket is rejected.
+    with mc.websocket_connect(f"/ws/terminal?ticket={ticket}") as ws:
+        with pytest.raises(Exception):
+            ws.receive_json()

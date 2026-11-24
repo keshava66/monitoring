@@ -108,10 +108,11 @@ async function* readLines(res) {
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
+  let finished = false;
   try {
     for (;;) {
       const { done, value } = await reader.read();
-      if (done) break;
+      if (done) { finished = true; break; }
       buffer += decoder.decode(value, { stream: true });
       let nl;
       while ((nl = buffer.indexOf('\n')) >= 0) {
@@ -120,25 +121,36 @@ async function* readLines(res) {
         yield line;
       }
     }
+    buffer += decoder.decode();
     if (buffer) yield buffer;
   } finally {
-    reader.releaseLock();
+    // A fully read body needs nothing; releasing it would make the browser
+    // log the request as aborted. Stop the download only if we quit early.
+    if (!finished) reader.cancel().catch(() => {});
   }
 }
 
-/** Stream newline-delimited JSON from the backend. */
-export async function streamNdjson(path, { signal, onMessage }) {
-  const res = await apiFetch(path, { signal, timeoutMs: 0, cache: 'no-store' });
+/** Stream newline-delimited JSON from an absolute URL; `body` makes it a JSON POST. */
+export async function streamNdjsonUrl(url, { signal, onMessage, body, method = body !== undefined ? 'POST' : 'GET' }) {
+  const res = await absoluteApiFetch(url, {
+    method,
+    signal,
+    timeoutMs: 0,
+    cache: 'no-store',
+    headers: { Accept: 'application/x-ndjson', ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}) },
+    body: body !== undefined ? JSON.stringify(body) : undefined,
+  });
   if (!res.ok) throw new ApiError(await errorMessage(res), res.status);
   for await (const line of readLines(res)) {
     if (line.trim()) onMessage(JSON.parse(line));
   }
 }
 
-/**
- * Server-sent events over fetch (so the bearer token travels in a header,
- * never in a URL). Resolves when the stream ends; rejects on HTTP errors.
- */
+/** Stream newline-delimited JSON from the backend. */
+export function streamNdjson(path, options) {
+  return streamNdjsonUrl(`${API_BASE_URL}${path}`, options);
+}
+
 /**
  * Server-sent events over fetch (so the bearer token stays in a header).
  * onEvent(data, { event, id, hasData }) fires per event block; blocks that

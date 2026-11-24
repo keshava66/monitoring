@@ -51,19 +51,8 @@ install_deps() {
   [ -f "$SERVE" ] || npm install --no-save --no-audit --no-fund serve@14.2.5
 }
 
-start_it() {
-  local pid
-  if pid="$(running_pid)"; then
-    echo "Frontend already running (PID $pid)"
-    return 0
-  fi
-  install_deps
-  if [ ! -f dist/index.html ]; then
-    echo "Building..."
-    npm run build
-  fi
-
-  local scheme=http
+launch() {
+  local scheme=http pid
   local -a ssl_args=()
   if [ -n "${SSL_CERTFILE:-}" ] && [ -n "${SSL_KEYFILE:-}" ] && [ -f "$SSL_CERTFILE" ] && [ -f "$SSL_KEYFILE" ]; then
     ssl_args=(--ssl-cert "$SSL_CERTFILE" --ssl-key "$SSL_KEYFILE")
@@ -76,7 +65,7 @@ start_it() {
   echo "===== $(date '+%Y-%m-%d %H:%M:%S') starting on :$PORT =====" >> "$LOGFILE"
 
   nohup "$NODE" "$SERVE" -s dist -l "tcp://0.0.0.0:$PORT" --no-clipboard --no-port-switching \
-    "${ssl_args[@]}" >> "$LOGFILE" 2>&1 &
+    "${ssl_args[@]}" >> "$LOGFILE" 2>&1 < /dev/null &
   pid=$!
   echo "$pid" > "$PIDFILE"
 
@@ -96,9 +85,32 @@ start_it() {
   echo "Frontend process is up (PID $pid) but :$PORT is not answering yet; check $LOGFILE"
 }
 
+start_it() {
+  local pid
+  if pid="$(running_pid)"; then
+    echo "Frontend already running (PID $pid)"
+    return 0
+  fi
+  install_deps
+  if [ ! -f dist/index.html ]; then
+    echo "Building..."
+    npm run build
+  fi
+  launch
+}
+
+# Build while the old server keeps serving; a failed build leaves it running.
+restart_it() {
+  install_deps
+  echo "Building..."
+  npm run build
+  stop_it
+  launch
+}
+
 case "$ACTION" in
   start)   start_it ;;
   stop)    stop_it ;;
-  restart) stop_it; rm -rf dist; start_it ;;
+  restart) restart_it ;;
   *)       die "unknown action: $ACTION" ;;
 esac
