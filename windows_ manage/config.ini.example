@@ -1,0 +1,12 @@
+[app]
+SCRIPT_PATH = C:\Users\SA-PRD-RDI-WIN-PRD\PycharmProjects\epod-chunk-vectors\main.py
+SCRIPT_ARGS = --doc-workers 8 --workers 2
+LOG_PATH    = C:\Users\SA-PRD-RDI-WIN-PRD\PycharmProjects\epod-chunk-vectors\logs\epod_pipeline.log
+TERMINAL_LOG   = C:\Users\SA-PRD-RDI-WIN-PRD\PycharmProjects\Monitoring\windows_ manage\terminal_output.log
+PYTHON_EXE  = C:\Users\SA-PRD-RDI-WIN-PRD\PycharmProjects\epod-chunk-vectors\venv\Scripts\python.exe
+SERVER_NAME  = EPOD Folder_Name
+PORT         = 8080
+# Shared secret this agent requires on every request (Authorization: Bearer <token>).
+# Generate with: python -c "import secrets; print(secrets.token_urlsafe(32))"
+# Must match the matching *_AGENT_*_TOKEN env var set on the Backend.py side.
+AGENT_TOKEN  =

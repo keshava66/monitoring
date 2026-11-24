@@ -1,0 +1,30 @@
+[manager]
+host = 0.0.0.0
+port = 8001
+
+[backend]
+name = Backend API
+dir = /home/sa-prd-rdi-react-<>/dqe/backend
+port = 8000
+entry = Backend:app
+
+[frontend]
+name = Frontend App
+dir = /home/sa-prd-rdi-react-<>/dqe
+port = 8080
+
+[ssl]
+certfile = /home/sa-prd-rdi-react-<>/SSL2026/awsbjvnval002_jnj_com_cert.pem
+keyfile = /home/sa-prd-rdi-react-<>/SSL2026/awsbjvnval002_jnj_com_key.pem
+
+[scripts]
+backend = /home/sa-prd-rdi-react-<>/monitoring/linux_manage/backend.sh
+frontend = /home/sa-prd-rdi-react-<>/monitoring/linux_manage/frontend.sh
+
+[repo]
+dir = /home/sa-prd-rdi-react-<>/dqe
+username = SA-PRD-RDI-REACT-<>
+password =
+
+[search_paths]
+<> = /home/sa-prd-rdi-react-<>

@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+set -e
+
+AGENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VENV_DIR="$AGENT_DIR/venv"
+PY="$VENV_DIR/bin/python"
+PIP="$VENV_DIR/bin/pip"
+REQUIREMENTS="$AGENT_DIR/requirements.txt"
+LOG="$AGENT_DIR/agent.log"
+PORT="$(grep -i '^PORT' "$AGENT_DIR/config.ini" | head -1 | cut -d'=' -f2 | tr -d ' ')"
+PORT="${PORT:-8090}"
+
+# ── 1. Create venv if missing ─────────────────────────────────────
+if [ ! -x "$PY" ]; then
+    echo "Creating virtual environment..."
+    python3 -m venv "$VENV_DIR"
+fi
+
+# ── 2. Install requirements ───────────────────────────────────────
+if [ -f "$REQUIREMENTS" ]; then
+    echo "Installing requirements..."
+    "$PIP" install -q -r "$REQUIREMENTS"
+else
+    echo "WARNING: requirements.txt not found - skipping."
+fi
+
+# ── 3. Start the agent (detached, survives terminal close) ────────
+echo "Starting RIMDocs agent..."
+nohup "$PY" "$AGENT_DIR/RIMDocs_agent.py" >> "$LOG" 2>&1 &
+disown
+
+# ── 4. Wait and verify ─────────────────────────────────────────────
+echo "Waiting for agent to start on :$PORT..."
+for i in $(seq 1 12); do
+    sleep 1
+    if curl -sf "http://localhost:$PORT/health" > /dev/null 2>&1; then
+        echo "SUCCESS: RIMDocs agent is running on :$PORT"
+        exit 0
+    fi
+done
+
+echo "FAILED: Agent did not respond on :$PORT within 12s."
+echo "Check $LOG for errors."
+exit 1

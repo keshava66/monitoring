@@ -1,0 +1,12 @@
+[app]
+SCRIPT_PATH = C:\Users\SA-PRD-RDI-WIN-PRD\PycharmProjects\rimdocs_s3_pg\main.py
+SCRIPT_ARGS = --source s3 --no-embed --doc-workers 16 --workers 1
+LOG_PATH    = C:\Users\SA-PRD-RDI-WIN-PRD\PycharmProjects\rimdocs_s3_pg\logs\epod_pipeline.log
+TERMINAL_LOG   = C:\Users\SA-PRD-RDI-WIN-PRD\PycharmProjects\Monitoring\rimdocs_agent\windows\terminal_output.log
+PYTHON_EXE  = C:\Users\SA-PRD-RDI-WIN-PRD\PycharmProjects\rimdocs_s3_pg\venv\Scripts\python.exe
+SERVER_NAME  = RIMDocs Folder_Name
+PORT         = 8443
+# Shared secret this agent requires on every request (Authorization: Bearer <token>).
+# Generate with: python -c "import secrets; print(secrets.token_urlsafe(32))"
+# Must match the matching *_AGENT_*_TOKEN env var set on the Backend.py side.
+AGENT_TOKEN  =

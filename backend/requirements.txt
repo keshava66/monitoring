@@ -1,0 +1,20 @@
+# Web framework
+fastapi==0.139.2
+uvicorn[standard]==0.51.0
+# HTTP client (EPOD agent proxy)
+httpx==0.28.1
+# Sync HTTP (Graph API proxy, manage.py auth)
+requests==2.34.2
+# Database
+psycopg2-binary==2.9.12
+snowflake-connector-python[pandas]==4.7.1
+# Crypto (Snowflake private key auth)
+cryptography==49.0.0
+# Data
+pandas==2.3.3
+# Timezone
+pytz==2026.2
+# Config / env
+python-dotenv==1.2.2
+# Pydantic (FastAPI dependency)
+pydantic==2.13.4

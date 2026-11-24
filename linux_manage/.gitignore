@@ -1,0 +1,6 @@
+.idea/
+/.env
+/config.ini
+/service_directories.json
+__pycache__/
+*.pyc
