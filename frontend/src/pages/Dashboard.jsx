@@ -41,12 +41,12 @@ function useToolPulse(paths) {
       });
     }
     if (has('/extraction-pipelines')) {
-      settle(apiJson('/api/agents', opts)).then(async (d) => {
-        const agents = (d?.agents || []).filter((a) => a.configured && a.can_view);
+      settle(apiJson('/api/agents/status', opts)).then((d) => {
+        const agents = d?.agents || [];
+        if (!d) return put('/extraction-pipelines', { value: '—', label: 'pipelines running' });
         if (!agents.length) return put('/extraction-pipelines', { value: '0', label: 'agents configured' });
-        const states = await Promise.all(agents.map((a) => settle(apiJson(`/${a.id}/status`, { ...opts, timeoutMs: 8000 }))));
-        const running = states.filter((s) => s?.running).length;
-        const down = states.filter((s) => !s).length;
+        const running = agents.filter((a) => a.state === 'running').length;
+        const down = agents.filter((a) => a.state === 'unreachable').length;
         put('/extraction-pipelines', {
           value: `${running}/${agents.length}`,
           label: 'pipelines running',

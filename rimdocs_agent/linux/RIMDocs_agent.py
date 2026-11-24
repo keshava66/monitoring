@@ -85,6 +85,7 @@ MODULE_NAME = os.path.splitext(SCRIPT_NAME)[0]
 PID_FILE = BASE_DIR / f".{MODULE_NAME}.pid"
 MAX_LINES = 10_000
 STREAM_BACKLOG = 50
+STREAM_BACKLOG_MAX = 2000
 STREAM_POLL_SECS = 0.25
 STREAM_KEEPALIVE_SECS = 15
 
@@ -176,7 +177,11 @@ def find_proc() -> Optional[psutil.Process]:
 
 # ── Log reading ───────────────────────────────────────────────────────────────
 
-_line_count_cache: Dict[str, Tuple[int, int, float]] = {}
+def _file_identity(st: os.stat_result) -> int:
+    return st.st_ino or st.st_ctime_ns
+
+
+_line_count_cache: Dict[str, Tuple[int, int, int]] = {}
 _line_count_lock = threading.Lock()
 
 
@@ -185,8 +190,8 @@ def _count_lines(path: str) -> int:
     scanned, so polling a multi-GB log stays cheap."""
     st = os.stat(path)
     with _line_count_lock:
-        offset, count, ino = _line_count_cache.get(path, (0, 0, 0.0))
-        identity = getattr(st, "st_ino", 0) or st.st_ctime
+        offset, count, ino = _line_count_cache.get(path, (0, 0, 0))
+        identity = _file_identity(st)
         if st.st_size < offset or identity != ino:
             offset, count = 0, 0
         with open(path, "rb") as f:
@@ -201,10 +206,8 @@ def _count_lines(path: str) -> int:
         return count
 
 
-def _tail_lines(path: str, n: int) -> List[str]:
+def _tail_lines_upto(path: str, n: int, end: int) -> List[str]:
     with open(path, "rb") as f:
-        f.seek(0, os.SEEK_END)
-        end = f.tell()
         block, data, pos = 64 * 1024, b"", end
         while pos > 0 and data.count(b"\n") <= n:
             step = min(block, pos)
@@ -213,6 +216,10 @@ def _tail_lines(path: str, n: int) -> List[str]:
             data = f.read(step) + data
     lines = data.decode("utf-8", errors="replace").splitlines()
     return [l.rstrip() for l in lines[-n:]]
+
+
+def _tail_lines(path: str, n: int) -> List[str]:
+    return _tail_lines_upto(path, n, os.path.getsize(path))
 
 
 def read_tail(path: str, n: int) -> Tuple[List[str], int]:
@@ -256,37 +263,71 @@ def info():
     }
 
 
+_STOPPED = {"running": False, "pid": None, "uptime": None, "memory": None, "cpu": None,
+            "memory_bytes": None, "cpu_percent": None}
+
+# psutil measures CPU between two calls on the same Process object. Keeping the
+# objects between polls gives a reading over the whole poll interval with no
+# sleep in the request; only a process seen for the first time needs a short sample.
+_cpu_samplers: Dict[Tuple[int, float], psutil.Process] = {}
+_cpu_lock = threading.Lock()
+
+
+def _cpu_total(procs: List[psutil.Process]) -> float:
+    with _cpu_lock:
+        live, fresh = {}, []
+        for p in procs:
+            try:
+                key = (p.pid, p.create_time())
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+            sampler = _cpu_samplers.get(key)
+            if sampler is None:
+                sampler = p
+                try:
+                    sampler.cpu_percent(None)
+                    fresh.append(key)
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+            live[key] = sampler
+        if fresh:
+            time.sleep(0.2)
+        total = 0.0
+        for sampler in live.values():
+            try:
+                total += sampler.cpu_percent(None)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        _cpu_samplers.clear()
+        _cpu_samplers.update(live)
+        return total
+
+
+@app.get("/running")
+def running():
+    """Cheap liveness probe for fleet overviews: no CPU or memory sampling."""
+    proc = find_proc()
+    return {"running": proc is not None, "pid": proc.pid if proc else None}
+
+
 @app.get("/status")
 def status():
     proc = find_proc()
     if not proc:
-        return {"running": False, "pid": None, "uptime": None, "memory": None, "cpu": None,
-                "memory_bytes": None, "cpu_percent": None}
+        return dict(_STOPPED)
     try:
         with proc.oneshot():
             procs = [proc] + proc.children(recursive=True)
-            rss = 0
-            for p in procs:
-                try:
-                    rss += p.memory_info().rss
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    pass
             created = proc.create_time()
-        cpu = 0.0
+        rss = 0
         for p in procs:
             try:
-                p.cpu_percent(None)
+                rss += p.memory_info().rss
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 pass
-        time.sleep(0.2)
-        for p in procs:
-            try:
-                cpu += p.cpu_percent(None)
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                pass
+        cpu = _cpu_total(procs)
     except (psutil.NoSuchProcess, psutil.AccessDenied):
-        return {"running": False, "pid": None, "uptime": None, "memory": None, "cpu": None,
-                "memory_bytes": None, "cpu_percent": None}
+        return dict(_STOPPED)
     return {
         "running": True,
         "pid": proc.pid,
@@ -312,16 +353,48 @@ def get_terminal(n: int = Query(50, ge=1, le=MAX_LINES)):
     return {"lines": lines, "total": total, "path": TERMINAL_LOG}
 
 
-def _sse(line: str) -> str:
-    return "".join(f"data: {part}\n" for part in (line.split("\n") or [""])) + "\n"
+def _backlog(path: str, n: int, size: int) -> Tuple[List[str], int]:
+    """Last n complete lines and the offset just after them. A trailing partial
+    line is left for the live loop so it is never sent in two pieces."""
+    with open(path, "rb") as f:
+        start = max(0, size - (1 << 20))
+        f.seek(start)
+        tail = f.read(size - start)
+    end = start + tail.rfind(b"\n") + 1 if b"\n" in tail else start
+    if not n or end == 0:
+        return [], end
+    return _tail_lines_upto(path, n, end), end
+
+
+def _parse_resume(token: Optional[str]) -> Optional[Tuple[int, int]]:
+    try:
+        identity, offset = token.split(":")
+        return int(identity), int(offset)
+    except (AttributeError, ValueError):
+        return None
+
+
+def _sse(line: str, cursor: Optional[str] = None, event: Optional[str] = None) -> str:
+    head = (f"event: {event}\n" if event else "") + (f"id: {cursor}\n" if cursor is not None else "")
+    return head + "".join(f"data: {part}\n" for part in (line.split("\n") or [""])) + "\n"
 
 
 @app.get("/terminal/stream")
-async def stream_terminal(request: Request):
+async def stream_terminal(
+    request: Request,
+    n: int = Query(STREAM_BACKLOG, ge=0, le=STREAM_BACKLOG_MAX),
+    from_: Optional[str] = Query(None, alias="from", max_length=64),
+):
+    """Server-sent events of the terminal log. Each line carries `id:
+    <file identity>:<byte offset after it>`; a client reconnecting with
+    ?from=<last id> resumes exactly where it stopped instead of replaying a
+    backlog. `event: reset` marks a new or truncated log (a new run, or the
+    log was cleared)."""
     async def generator():
         pos: Optional[int] = None
         identity = None
         buffer = b""
+        resume = _parse_resume(from_)
         last_send = time.monotonic()
         announced_missing = False
         while not await request.is_disconnected():
@@ -332,27 +405,40 @@ async def stream_terminal(request: Request):
                     announced_missing = True
                     yield _sse("[Terminal log not found — start the script first]")
                     last_send = time.monotonic()
-                pos = None
+                pos, resume = None, None
                 await asyncio.sleep(1)
                 continue
-            current = getattr(st, "st_ino", 0) or st.st_ctime
+            current = _file_identity(st)
             if pos is None:
                 announced_missing = False
-                for line in await asyncio.to_thread(_tail_lines, TERMINAL_LOG, STREAM_BACKLOG):
-                    yield _sse(line)
-                pos, identity, buffer = st.st_size, current, b""
+                identity, buffer = current, b""
+                if resume is not None and resume[0] == current and resume[1] <= st.st_size:
+                    pos = resume[1]
+                else:
+                    if resume is not None:
+                        yield _sse("", event="reset")
+                    backlog, pos = await asyncio.to_thread(_backlog, TERMINAL_LOG, n, st.st_size)
+                    cursor = f"{current}:{pos}"
+                    for i, line in enumerate(backlog):
+                        yield _sse(line, cursor if i == len(backlog) - 1 else None)
+                    if not backlog:
+                        yield f"id: {cursor}\n\n"
+                resume = None
                 last_send = time.monotonic()
             elif st.st_size < pos or current != identity:
                 pos, identity, buffer = 0, current, b""
+                yield _sse("", event="reset")
             if st.st_size > pos:
                 with open(TERMINAL_LOG, "rb") as f:
                     f.seek(pos)
                     chunk = f.read(min(st.st_size - pos, 4 << 20))
+                offset = pos - len(buffer)
                 pos += len(chunk)
                 buffer += chunk
                 *complete, buffer = buffer.split(b"\n")
                 for raw in complete:
-                    yield _sse(raw.decode("utf-8", errors="replace").rstrip("\r"))
+                    offset += len(raw) + 1
+                    yield _sse(raw.decode("utf-8", errors="replace").rstrip("\r"), f"{identity}:{offset}")
                 if complete:
                     last_send = time.monotonic()
             if time.monotonic() - last_send >= STREAM_KEEPALIVE_SECS:
@@ -373,8 +459,17 @@ def start_script():
         if log_dir:
             os.makedirs(log_dir, exist_ok=True)
         stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        with open(TERMINAL_LOG, "w", encoding="utf-8") as f:
+        # A brand-new file per run (not a truncate) gives the stream a new
+        # identity, so a client resuming from the previous run starts clean.
+        fresh = f"{TERMINAL_LOG}.new"
+        with open(fresh, "w", encoding="utf-8") as f:
             f.write(f"{'=' * 60}\n  Started: {stamp}\n{'=' * 60}\n")
+        try:
+            os.replace(fresh, TERMINAL_LOG)
+        except OSError:  # Windows: a reader still holds the old file open
+            with open(TERMINAL_LOG, "w", encoding="utf-8") as f, open(fresh, encoding="utf-8") as src:
+                f.write(src.read())
+            os.unlink(fresh)
         env = os.environ.copy()
         env["PYTHONIOENCODING"] = "utf-8"
         env["PYTHONUNBUFFERED"] = "1"

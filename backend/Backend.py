@@ -8,7 +8,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 from dotenv import load_dotenv
 
@@ -71,16 +71,24 @@ AGENTS: Dict[str, Dict] = {
     for prefix, (v, c) in _AGENT_PERMS.items()
 }
 
-_AGENT_READ_PATHS = {"/status", "/info", "/logs", "/terminal", "/terminal/stream", "/health"}
+_AGENT_READ_PATHS = {"/status", "/running", "/info", "/logs", "/terminal", "/terminal/stream", "/health"}
+_AGENT_QUERY_KEYS = {"n", "from"}
 _AGENT_WRITE_PATHS = {"/start", "/stop", "/clear-terminal"}
 _AGENT_TLS_VERIFY = os.getenv("AGENT_TLS_VERIFY", "true").strip().lower() not in ("false", "0", "no")
 
-_agent_client = httpx.AsyncClient(
+# Reads reuse connections (status polls every few seconds would otherwise pay
+# a TCP/TLS handshake each time); a socket a firewall dropped while idle just
+# fails the attempt and the GET retry opens a fresh one. Control calls are not
+# retried, so they always use a fresh connection and can't hit a dead socket.
+_agent_read_client = httpx.AsyncClient(
     verify=_AGENT_TLS_VERIFY,
     timeout=httpx.Timeout(15.0, connect=5.0),
-    # Agents sit behind firewalls that silently drop idle sockets; reusing a
-    # pooled connection after that just fails. Fresh connection per call.
-    limits=httpx.Limits(max_keepalive_connections=0, max_connections=100),
+    limits=httpx.Limits(max_keepalive_connections=40, max_connections=100, keepalive_expiry=20.0),
+)
+_agent_client = httpx.AsyncClient(
+    verify=_AGENT_TLS_VERIFY,
+    timeout=httpx.Timeout(60.0, connect=5.0),
+    limits=httpx.Limits(max_keepalive_connections=0, max_connections=50),
 )
 _agent_stream_client = httpx.AsyncClient(
     verify=_AGENT_TLS_VERIFY,
@@ -102,6 +110,7 @@ async def lifespan(_: FastAPI):
         if not AGENTS[p]["token"]:
             logger.warning("Agent %s has a URL but no token; calls to it will be rejected by the agent", p)
     yield
+    await _agent_read_client.aclose()
     await _agent_client.aclose()
     await _agent_stream_client.aclose()
     auth.graph_client.close()
@@ -299,7 +308,7 @@ async def _proxy_agent(request: Request, prefix: str, path: str):
         raise HTTPException(status_code=503, detail="Agent not configured for this environment")
 
     target = agent["url"] + sub
-    params = {k: v for k, v in request.query_params.items() if k == "n"}
+    params = {k: v for k, v in request.query_params.items() if k in _AGENT_QUERY_KEYS}
     headers = {"Accept": request.headers.get("accept", "application/json")}
     if agent["token"]:
         headers["Authorization"] = f"Bearer {agent['token']}"
@@ -312,7 +321,7 @@ async def _proxy_agent(request: Request, prefix: str, path: str):
     resp = None
     for attempt in range(attempts):
         try:
-            resp = await _agent_client.request(method, target, params=params, headers=headers)
+            resp = await (_agent_read_client if method == "GET" else _agent_client).request(method, target, params=params, headers=headers)
             break
         except httpx.TransportError as exc:
             last_exc = exc
@@ -378,6 +387,49 @@ def _register_agent_proxy(prefix: str) -> None:
 
 for _prefix in AGENTS:
     _register_agent_proxy(_prefix)
+
+
+_agent_names: Dict[str, Tuple[str, float]] = {}
+_AGENT_NAME_TTL = 600.0
+
+
+async def _agent_get(prefix: str, sub: str, timeout: float) -> Optional[httpx.Response]:
+    agent = AGENTS[prefix]
+    headers = {"Authorization": f"Bearer {agent['token']}"} if agent["token"] else {}
+    try:
+        return await _agent_read_client.get(agent["url"] + sub, headers=headers, timeout=timeout)
+    except httpx.TransportError:
+        return None
+
+
+async def _agent_state(prefix: str) -> Dict:
+    """Running / stopped / unreachable plus display name, for one agent."""
+    resp = await _agent_get(prefix, "/running", 4.0)
+    if resp is not None and resp.status_code == 404:  # agent older than /running
+        resp = await _agent_get(prefix, "/status", 6.0)
+    try:
+        state = ("running" if resp.json().get("running") else "stopped") if resp is not None and resp.is_success else "unreachable"
+    except ValueError:
+        state = "unreachable"
+    name, fetched = _agent_names.get(prefix, (None, 0.0))
+    if state != "unreachable" and (name is None or time.monotonic() - fetched > _AGENT_NAME_TTL):
+        info = await _agent_get(prefix, "/info", 4.0)
+        try:
+            if info is not None and info.is_success:
+                name = info.json().get("server_name") or None
+                _agent_names[prefix] = (name, time.monotonic())
+        except ValueError:
+            pass
+    return {"id": prefix, "state": state, "name": name}
+
+
+@app.get("/api/agents/status", tags=["Agent Proxy"])
+async def agents_status(request: Request):
+    """State of every configured agent the caller may view, probed in parallel."""
+    user = await run_in_threadpool(resolve_user, request.headers.get("authorization"))
+    perms = rbac.permissions_for(user["role"])
+    visible = [p for p, a in AGENTS.items() if a["url"] and perms.get(a["view"], False)]
+    return {"agents": list(await asyncio.gather(*(_agent_state(p) for p in visible)))}
 
 
 @app.get("/api/agents", tags=["Agent Proxy"])

@@ -2,7 +2,7 @@ import React, { useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import { useAuth } from '../context/AuthContext';
 import { logAuditEvent } from '../utils/auditLog';
 import {
-  Badge, Button, Dot, Drawer, EmptyState, Icon, Panel, ProgressBar, SearchInput, Tabs, Toggle, cx, fmtNum, useDebouncedValue,
+  Badge, Button, Dot, Drawer, EmptyState, Panel, ProgressBar, SearchInput, Tabs, cx, fmtNum, useDebouncedValue,
 } from '../components/ui';
 
 // Log-line patterns emitted by the extraction pipeline.
@@ -55,22 +55,28 @@ const META_LABELS = {
 const idleStages = () => Object.fromEntries(NODES.map((n) => [n.id, { status: 'idle', meta: {}, pct: 0 }]));
 const num = (s) => parseInt(String(s || '0').replace(/,/g, ''), 10) || 0;
 const nowTs = () => new Date().toLocaleTimeString('en-US', { hour12: false });
+const HISTORY_MAX = 200;
 
 const initialState = () => ({
   stages: idleStages(),
   doc: { name: null, sizeMb: null, modified: false },
-  queue: { done: 0, total: 0, pct: null, rate: null, eta: null, finished: false, skipped: 0 },
+  queue: { done: 0, total: 0, rate: null, eta: null, finished: false, skipped: 0 },
   history: [],
-  raw: [],
+  seq: 0,
   rateLimit: null,
-  rates: [],
 });
 
 const set = (state, id, patch) => ({ ...state, stages: { ...state.stages, [id]: { ...state.stages[id], ...patch } } });
 
-function reducer(state, line) {
-  if (line === '__reset__') return initialState();
-  let s = { ...state, raw: [...state.raw, { text: line, ts: nowTs() }].slice(-300) };
+const addHistory = (s, status, detail) => ({
+  ...s,
+  seq: s.seq + 1,
+  history: [{ id: s.seq + 1, name: s.doc.name || 'Document started before this view', status, detail, ts: nowTs() }, ...s.history].slice(0, HISTORY_MAX),
+});
+
+/** Applies one terminal line to the run state. */
+function step(state, line) {
+  let s = state;
   let m;
   if (RE.pipelineStart.test(line) && !RE.summaryHeader.test(line)) return set(s, 'start', { status: 'active', meta: {}, pct: 0 });
   if ((m = line.match(RE.startIngestion))) {
@@ -87,7 +93,8 @@ function reducer(state, line) {
   if ((m = line.match(RE.summaryElapsed))) return set(s, 'end', { status: 'done', pct: 100, meta: { ...s.stages.end.meta, elapsed: m[1] } });
   if ((m = line.match(RE.processing))) {
     const stages = idleStages();
-    stages.start = s.stages.start;
+    // A document being processed means initialisation finished, even if its log lines are out of view.
+    stages.start = s.stages.start.status === 'idle' ? { status: 'done', meta: {}, pct: 100 } : s.stages.start;
     return { ...s, stages, doc: { name: m[1], sizeMb: parseFloat(m[2]), modified: false }, rateLimit: null };
   }
   if (RE.modified.test(line)) return { ...s, doc: { ...s.doc, modified: true } };
@@ -120,24 +127,29 @@ function reducer(state, line) {
   if ((m = line.match(RE.success))) {
     for (const id of ['pdf', 'ocr', 'tables', 'chunk', 'embed']) s = set(s, id, { status: 'done', pct: 100 });
     s = set(s, 'db', { status: 'done', pct: 100, meta: { chunks: m[1], pages: m[2], elapsed: m[3] } });
-    const entry = { name: s.doc.name || '(unknown)', status: 'SUCCESS', detail: `${m[1]} chunks · ${m[2]} pages · ${m[3]}s`, ts: nowTs() };
-    return { ...s, rateLimit: null, history: [entry, ...s.history].slice(0, 200) };
+    return addHistory({ ...s, rateLimit: null }, 'SUCCESS', `${m[1]} chunks · ${m[2]} pages · ${m[3]}s`);
   }
   if ((m = line.match(RE.failed))) {
     const activeId = ['db', 'embed', 'chunk', 'tables', 'ocr', 'pdf'].find((id) => s.stages[id].status === 'active');
     if (activeId) s = set(s, activeId, { status: 'error', meta: { ...s.stages[activeId].meta, error: m[1] } });
-    const entry = { name: s.doc.name || '(unknown)', status: 'ERROR', detail: m[1], ts: nowTs() };
-    return { ...s, history: [entry, ...s.history].slice(0, 200) };
+    return addHistory(s, 'ERROR', m[1]);
   }
   if ((m = line.match(RE.progress))) {
-    const rate = parseFloat(m[4]);
-    return {
-      ...s,
-      queue: { ...s.queue, done: num(m[1]), total: m[2].includes('?') ? s.queue.total : num(m[2]), pct: m[3] || null, rate: m[4], eta: m[5], finished: false },
-      rates: Number.isFinite(rate) ? [...s.rates, rate].slice(-40) : s.rates,
-    };
+    return { ...s, queue: { ...s.queue, done: num(m[1]), total: m[2].includes('?') ? s.queue.total : num(m[2]), rate: m[4], eta: m[5], finished: false } };
   }
   if ((m = line.match(RE.done))) return { ...s, queue: { ...s.queue, done: num(m[1]), eta: '0s', finished: true } };
+  return s;
+}
+
+/**
+ * Actions: 'reset' (clear the view) or a batch of streamed lines, where a null
+ * entry means the agent started a new terminal log (new run or cleared):
+ * the run state starts over but the session's processed list is kept.
+ */
+function reducer(state, action) {
+  if (action === 'reset') return initialState();
+  let s = state;
+  for (const line of action) s = line === null ? { ...initialState(), history: s.history, seq: s.seq } : step(s, line);
   return s;
 }
 
@@ -188,26 +200,19 @@ function ProgressRing({ pct, done, total }) {
   );
 }
 
-export default function EPodPipelineViz({ title, agentId, handlerRef, streamState, running, onStages }) {
+export default function EPodPipelineViz({ title, agentId, dispatchRef, streamState, running, onStages }) {
   const { user } = useAuth();
   const [state, dispatch] = useReducer(reducer, undefined, initialState);
   const [selected, setSelected] = useState(null);
   const [query, setQuery] = useState('');
   const [filter, setFilter] = useState('ALL');
-  const [showConsole, setShowConsole] = useState(false);
-  const [tail, setTail] = useState(true);
-  const consoleRef = useRef(null);
   const debouncedQuery = useDebouncedValue(query, 400);
   const audit = (details) => logAuditEvent('in-page-extraction-pipelines', user?.email, agentId, `${details} on ${title}`);
 
   useEffect(() => {
-    handlerRef.current = dispatch;
-    return () => { handlerRef.current = null; };
-  }, [handlerRef]);
-
-  useEffect(() => {
-    if (tail && consoleRef.current) consoleRef.current.scrollTop = consoleRef.current.scrollHeight;
-  }, [state.raw, tail, showConsole]);
+    dispatchRef.current = dispatch;
+    return () => { dispatchRef.current = null; };
+  }, [dispatchRef]);
 
   const firstQuery = useRef(true);
   useEffect(() => {
@@ -237,35 +242,15 @@ export default function EPodPipelineViz({ title, agentId, handlerRef, streamStat
     <div className="p-4 sm:p-6 flex flex-col gap-4 sm:gap-5">
       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
         <div className="flex items-center gap-2 font-johnson-text text-sm text-jj-gray-06">
-          <Dot color={running === false ? '#857a73' : streamState === 'live' ? '#328714' : '#c4a000'} pulse={running !== false && streamState === 'live'} className="w-2 h-2" />
-          {running === false ? 'Pipeline stopped · showing the last run' : streamState === 'live' ? 'Following the live terminal stream' : 'Connecting to the live stream…'}
+          <Dot color={streamState === 'denied' ? '#eb1700' : running === false ? '#857a73' : streamState === 'live' ? '#328714' : '#c4a000'} pulse={running !== false && streamState === 'live'} className="w-2 h-2" />
+          {streamState === 'denied' ? 'The live stream is not available for this agent'
+            : running === false ? 'Pipeline stopped · showing the last run'
+              : streamState === 'live' ? 'Following the live terminal stream' : 'Connecting to the live stream…'}
         </div>
-        <div className="flex items-center gap-2">
-          <Button size="sm" variant={showConsole ? 'dark' : 'secondary'} onClick={() => { setShowConsole(!showConsole); audit(`${showConsole ? 'Hid' : 'Opened'} stream console`); }}>
-            {showConsole ? 'Hide stream' : 'Show stream'}
-          </Button>
-          <Button size="sm" variant="ghost" onClick={() => { dispatch('__reset__'); audit('Reset pipeline view'); }}>Reset view</Button>
-        </div>
+        <Button size="sm" variant="ghost" onClick={() => { dispatch('reset'); audit('Reset pipeline view'); }}>Reset view</Button>
       </div>
 
       {state.rateLimit && <div role="status" className="rounded-2xl border border-amber-300/50 bg-[#fffaf0] px-4 py-3 font-johnson-text text-sm text-amber-900">{state.rateLimit}</div>}
-
-      {showConsole && (
-        <div className="rounded-2xl overflow-hidden border border-jj-gray-08 bg-terminal shadow-lift">
-          <div className="flex items-center justify-between px-4 py-2 border-b border-white/10">
-            <span className="font-mono text-xs text-[#8b949e]">terminal stream · last {state.raw.length} lines</span>
-            <Toggle checked={tail} onChange={setTail} label={<span className="text-[#c9d1d9] text-xs">Follow</span>} />
-          </div>
-          <div ref={consoleRef} className="h-56 overflow-y-auto terminal-scroll px-4 py-2 font-mono text-xs leading-5">
-            {state.raw.length === 0 ? <p className="text-[#8b949e]">Waiting for output…</p> : state.raw.map((l, i) => (
-              <div key={i} className="flex gap-3">
-                <span className="text-[#6e7681] select-none tabular-nums flex-shrink-0">{l.ts}</span>
-                <span className={cx('whitespace-pre-wrap break-words min-w-0', /FAILED|❌|error/i.test(l.text) ? 'text-[#ff7b72]' : /SUCCESS|✅/.test(l.text) ? 'text-[#7ee787]' : /Step \d/.test(l.text) ? 'text-[#79c0ff]' : 'text-[#c9d1d9]')}>{l.text}</span>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         <Panel title="Current document" bodyClassName="pt-3">
@@ -311,8 +296,8 @@ export default function EPodPipelineViz({ title, agentId, handlerRef, streamStat
             description={state.history.length ? 'Try a different filter.' : 'Documents appear here as the live stream reports them.'} className="py-10" />
         ) : (
           <ul className="max-h-80 overflow-y-auto scroll-thin divide-y divide-jj-gray-02 border-t border-jj-gray-02">
-            {history.map((h, i) => (
-              <li key={`${h.ts}-${i}`} className="flex flex-col sm:flex-row sm:items-center gap-1 sm:gap-4 px-4 sm:px-5 py-2.5 font-johnson-text text-sm">
+            {history.map((h) => (
+              <li key={h.id} className="flex flex-col sm:flex-row sm:items-center gap-1 sm:gap-4 px-4 sm:px-5 py-2.5 font-johnson-text text-sm">
                 <span className="flex items-center gap-2 min-w-0 flex-1">
                   <Dot color={h.status === 'SUCCESS' ? '#328714' : '#eb1700'} className="w-2 h-2" />
                   <span className="truncate text-jj-gray-08" title={h.name}>{h.name}</span>

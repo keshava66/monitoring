@@ -34,3 +34,11 @@ export const PAGE_TITLES = {
   '/audit-edit-force': 'Audit Log (Edit Mode)',
   '/user-management': 'User Management',
 };
+
+/** Pipeline agent states shared by the environment tabs and the agent page. */
+export const AGENT_STATE = {
+  running: { label: 'Running', color: '#328714' },
+  stopped: { label: 'Stopped', color: '#857a73' },
+  unreachable: { label: 'Unreachable', color: '#eb1700' },
+  checking: { label: 'Checking…', color: '#cbc4bc' },
+};

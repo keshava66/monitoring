@@ -100,8 +100,10 @@ def _agent_handler(request: httpx.Request) -> httpx.Response:
     AGENT_CALLS.append(request)
     if request.headers.get("authorization") != "Bearer agent-secret":
         return httpx.Response(401, json={"detail": "Invalid token"})
-    if request.url.path == "/status":
+    if request.url.path in ("/status", "/running"):
         return httpx.Response(200, json={"running": True, "pid": 42})
+    if request.url.path == "/info":
+        return httpx.Response(200, json={"server_name": "EPOD Box"})
     if request.url.path == "/stop":
         return httpx.Response(200, json={"success": True})
     if request.url.path == "/terminal/stream":
@@ -110,6 +112,7 @@ def _agent_handler(request: httpx.Request) -> httpx.Response:
 
 
 Backend._agent_client = httpx.AsyncClient(transport=httpx.MockTransport(_agent_handler))
+Backend._agent_read_client = httpx.AsyncClient(transport=httpx.MockTransport(_agent_handler))
 Backend._agent_stream_client = httpx.AsyncClient(transport=httpx.MockTransport(_agent_handler))
 
 client = TestClient(Backend.app)
@@ -428,8 +431,8 @@ def test_agent_proxy_read_and_token_injection():
 
 
 def test_agent_proxy_query_filtered():
-    resp = client.get("/epod-dev/logs?n=25&evil=1", headers=ADMIN).json()
-    assert resp["query"] == {"n": "25"}
+    resp = client.get("/epod-dev/logs?n=25&evil=1&from=10", headers=ADMIN).json()
+    assert resp["query"] == {"n": "25", "from": "10"}
 
 
 def test_agent_proxy_control_requires_permission():
@@ -450,6 +453,65 @@ def test_agent_proxy_stream():
         assert resp.status_code == 200
         body = b"".join(resp.iter_bytes())
     assert b"data: hello" in body
+
+
+def test_agents_status_fans_out_and_respects_permissions():
+    agents = client.get("/api/agents/status", headers=OPS).json()["agents"]
+    assert agents == [{"id": "epod-dev", "state": "running", "name": "EPOD Box"}]
+    assert client.get("/api/agents/status").status_code == 401
+    assert client.get("/api/agents/status", headers=VIEWER).json()["agents"] == []
+
+
+def test_agents_status_marks_unreachable(monkeypatch):
+    async def down(*_a, **_k):
+        raise httpx.ConnectError("down")
+    monkeypatch.setattr(Backend._agent_read_client, "get", down)
+    assert client.get("/api/agents/status", headers=OPS).json()["agents"][0]["state"] == "unreachable"
+
+
+def test_agent_copies_are_identical():
+    root = Path(__file__).resolve().parent.parent
+    master = (root / "windows_manage" / "epod_agent.py").read_bytes()
+    for copy in ("rimdocs_agent/linux/RIMDocs_agent.py", "rimdocs_agent/windows/RIMDocs_agent.py"):
+        assert (root / copy).read_bytes() == master, f"{copy} drifted from windows_manage/epod_agent.py"
+
+
+def _load_agent(tmp_path):
+    import importlib.util
+    script = tmp_path / "main.py"
+    script.write_text("print('hi')\n")
+    cfg = tmp_path / "config.ini"
+    cfg.write_text(
+        "[app]\n"
+        f"SCRIPT_PATH = {script}\nPYTHON_EXE = {sys.executable}\n"
+        f"LOG_PATH = {tmp_path / 'run.log'}\nTERMINAL_LOG = {tmp_path / 'terminal.log'}\n"
+        "AGENT_TOKEN = agent-token-0123456789abcdefghij\n"
+    )
+    os.environ["AGENT_CONFIG"] = str(cfg)
+    path = Path(__file__).resolve().parent.parent / "windows_manage" / "epod_agent.py"
+    spec = importlib.util.spec_from_file_location(f"agent_{uuid.uuid4().hex}", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_agent_auth_probe_and_backlog(tmp_path):
+    agent = _load_agent(tmp_path)
+    ac = TestClient(agent.app)
+    tok = {"Authorization": "Bearer agent-token-0123456789abcdefghij"}
+    assert ac.get("/health").status_code == 200
+    assert ac.get("/running").status_code == 401
+    assert ac.get("/running", headers=tok).json() == {"running": False, "pid": None}
+    assert ac.get("/status", headers=tok).json()["running"] is False
+    log = tmp_path / "terminal.log"
+    log.write_bytes(b"one\ntwo\nthree\npart")
+    lines, end = agent._backlog(str(log), 2, log.stat().st_size)
+    # The trailing partial line is held back so it is never streamed in two pieces.
+    assert lines == ["two", "three"] and end == len(b"one\ntwo\nthree\n")
+    assert agent._backlog(str(log), 0, log.stat().st_size) == ([], end)
+    assert agent._sse("x", "7:5") == "id: 7:5\ndata: x\n\n"
+    assert agent._parse_resume("7:5") == (7, 5) and agent._parse_resume("junk") is None and agent._parse_resume(None) is None
+    assert agent._sse("", event="reset") == "event: reset\ndata: \n\n"
 
 
 def test_agent_list():

@@ -1,13 +1,13 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { Navigate, useSearchParams } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
-import { apiJson } from '../utils/apiClient';
+import { apiJson, isAbort } from '../utils/apiClient';
 import { logAuditEvent } from '../utils/auditLog';
 import { Alert, Button, LoadingBlock, Page, PageHeader, Tabs, usePolling } from '../components/ui';
+import { AGENT_STATE } from '../navigation';
 import EPodAgentPage from './EPodAgentPage';
 
-const STATUS_POLL_MS = 10_000;
-const DOT = { online: '#328714', offline: '#857a73', unknown: '#eb1700' };
+const FLEET_POLL_MS = 15_000;
 
 const ENVIRONMENTS = [
   { id: 'rimdocs-dev', product: 'rimdocs', label: 'DEV' },
@@ -22,14 +22,16 @@ const ENVIRONMENTS = [
   { id: 'epod-prod', product: 'epod', label: 'PROD' },
 ];
 const PRODUCTS = [{ id: 'rimdocs', label: 'RIMDOCS' }, { id: 'epod', label: 'EPOD' }];
+const envVar = (id) => id.toUpperCase().replace('-', '_AGENT_');
 
 export default function ServerMonitor() {
   const { user } = useAuth();
   const [params, setParams] = useSearchParams();
   const [agents, setAgents] = useState(null);
   const [loadError, setLoadError] = useState(null);
-  const [status, setStatus] = useState({});
-  const [names, setNames] = useState({});
+  const [fleet, setFleet] = useState({});
+  // The open agent reports its own (fresher, 5 s) state; it wins over the fleet poll.
+  const [local, setLocal] = useState({});
 
   const loadAgents = useCallback(() => {
     setLoadError(null);
@@ -37,37 +39,42 @@ export default function ServerMonitor() {
   }, []);
   useEffect(() => { loadAgents(); }, [loadAgents]);
 
+  const anyConfigured = !!agents?.some((a) => a.configured);
+  const pollFleet = useCallback(async () => {
+    try {
+      const d = await apiJson('/api/agents/status', { timeoutMs: 12_000 });
+      setFleet(Object.fromEntries(d.agents.map((a) => [a.id, a])));
+    } catch (e) {
+      if (!isAbort(e)) setFleet((f) => Object.fromEntries(Object.keys(f).map((id) => [id, { ...f[id], state: 'unreachable' }])));
+    }
+  }, []);
+  usePolling(pollFleet, FLEET_POLL_MS, { enabled: anyConfigured });
+
   const envs = useMemo(() => {
     if (!agents) return [];
     const byId = Object.fromEntries(agents.map((a) => [a.id, a]));
     return ENVIRONMENTS.filter((e) => byId[e.id]).map((e) => ({ ...e, ...byId[e.id], title: `${e.product.toUpperCase()} ${e.label}` }));
   }, [agents]);
 
-  const poll = useCallback(() => {
-    envs.filter((e) => e.configured).forEach((e) => {
-      apiJson(`/${e.id}/status`, { timeoutMs: 8000 })
-        .then((d) => setStatus((s) => ({ ...s, [e.id]: d.running ? 'online' : 'offline' })))
-        .catch(() => setStatus((s) => ({ ...s, [e.id]: 'unknown' })));
-    });
-  }, [envs]);
-  usePolling(poll, STATUS_POLL_MS, { enabled: envs.length > 0 });
-
-  useEffect(() => {
-    envs.filter((e) => e.configured && !names[e.id]).forEach((e) => {
-      apiJson(`/${e.id}/info`, { timeoutMs: 8000 }).then((d) => d?.server_name && setNames((n) => ({ ...n, [e.id]: d.server_name }))).catch(() => {});
-    });
-  }, [envs]); // eslint-disable-line react-hooks/exhaustive-deps
+  const onAgentState = useCallback((id, state) => setLocal((l) => {
+    if ((l[id] ?? null) === state) return l;
+    const next = { ...l };
+    if (state) next[id] = state; else delete next[id];
+    return next;
+  }), []);
 
   if (loadError) {
     return (
-      <div className="p-4 sm:p-6 lg:p-8">
+      <Page>
         <Alert tone="error" title="Couldn’t load pipeline agents" action={<Button size="sm" onClick={loadAgents}>Retry</Button>}>{loadError}</Alert>
-      </div>
+      </Page>
     );
   }
   if (!agents) return <LoadingBlock label="Loading pipelines…" />;
   if (!envs.length) return <Navigate to="/dashboard" replace />;
 
+  const stateOf = (e) => (e.configured ? local[e.id] || fleet[e.id]?.state || 'checking' : null);
+  const nameOf = (e) => fleet[e.id]?.name || null;
   const firstOf = (product) => envs.find((e) => e.configured && (!product || e.product === product)) || envs.find((e) => !product || e.product === product);
   const active = envs.find((e) => e.id === params.get('tab')) || firstOf();
   const products = PRODUCTS.filter((p) => envs.some((e) => e.product === p.id));
@@ -81,12 +88,15 @@ export default function ServerMonitor() {
   // Unconfigured environments only get a tab when the product has nothing else to show.
   const productEnvs = envs.filter((e) => e.product === active.product);
   const shown = productEnvs.some((e) => e.configured) ? productEnvs.filter((e) => e.configured || e.id === active.id) : productEnvs;
-  const envTabs = shown.map((e) => ({
-    id: e.id,
-    label: e.configured ? (names[e.id] || e.label) : `${e.label} (not configured)`,
-    title: `${e.title}: ${e.configured ? status[e.id] || 'checking' : 'not configured'}`,
-    dot: e.configured ? DOT[status[e.id] || 'unknown'] : DOT.unknown,
-  }));
+  const envTabs = shown.map((e) => {
+    const st = AGENT_STATE[stateOf(e)];
+    return {
+      id: e.id,
+      label: e.configured ? (nameOf(e) || e.label) : `${e.label} (not configured)`,
+      title: `${e.title}: ${st ? st.label : 'not configured'}`,
+      dot: st ? st.color : AGENT_STATE.checking.color,
+    };
+  });
 
   const switcher = (
     <>
@@ -104,10 +114,13 @@ export default function ServerMonitor() {
         <PageHeader title="Extraction" accent="pipelines." chips={switcher}
           description="Start, stop and follow every extraction agent stage by stage, straight from its live terminal stream." />
         <Alert tone="info" title={`${active.title} has no agent configured`}>
-          Set {active.id.toUpperCase().replace('-', '_AGENT_')}_URL and _TOKEN on the backend to enable this environment.
+          Set {envVar(active.id)}_URL and {envVar(active.id)}_TOKEN on the backend to enable this environment.
         </Alert>
       </Page>
     );
   }
-  return <EPodAgentPage key={active.id} agentId={active.id} title={names[active.id] || active.title} canControl={active.can_control} chips={switcher} />;
+  return (
+    <EPodAgentPage key={active.id} agentId={active.id} title={nameOf(active) || active.title}
+      canControl={active.can_control} chips={switcher} onState={onAgentState} />
+  );
 }

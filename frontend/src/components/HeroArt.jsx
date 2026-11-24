@@ -286,7 +286,7 @@ export function ClockDial({ count, label, loading }) {
  */
 export function PipelineFlow({ nodes, stages, running }) {
   const wrap = useRef(null);
-  const small = useNarrow(wrap, 420);
+  const small = useNarrow(wrap, 300);
   const n = nodes.length;
   // Two rows snake left-to-right then right-to-left so labels stay readable.
   const perRow = Math.ceil(n / 2);
@@ -343,7 +343,7 @@ export function PipelineFlow({ nodes, stages, running }) {
             </span>
             {!small && (
               <span className="absolute top-full mt-2 text-center whitespace-nowrap">
-                <span className={cx('block font-johnson-text font-medium text-[12px]', st === 'idle' ? 'text-jj-gray-05' : 'text-jj-gray-08')}>{node.label}</span>
+                <span className={cx('block font-johnson-text font-medium text-[11px]', st === 'idle' ? 'text-jj-gray-05' : 'text-jj-gray-08')}>{node.label}</span>
                 <span className="block font-johnson-text text-[11px]" style={{ color: st === 'idle' ? '#a39992' : c }}>
                   {{ idle: 'Waiting', active: 'Running', done: 'Done', error: 'Failed', halted: 'Halted' }[st]}
                 </span>

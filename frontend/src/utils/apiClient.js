@@ -139,20 +139,31 @@ export async function streamNdjson(path, { signal, onMessage }) {
  * Server-sent events over fetch (so the bearer token travels in a header,
  * never in a URL). Resolves when the stream ends; rejects on HTTP errors.
  */
+/**
+ * Server-sent events over fetch (so the bearer token stays in a header).
+ * onEvent(data, { event, id, hasData }) fires per event block; blocks that
+ * only carry an `id:` still fire so callers can track the resume point.
+ */
 export async function streamSse(path, { signal, onOpen, onEvent }) {
   const res = await apiFetch(path, { signal, timeoutMs: 0, headers: { Accept: 'text/event-stream' }, cache: 'no-store' });
   if (!res.ok) throw new ApiError(await errorMessage(res), res.status);
   onOpen?.();
   let data = [];
+  let event = 'message';
+  let id = null;
+  const flush = () => {
+    if (data.length || id !== null || event !== 'message') onEvent(data.join('\n'), { event, id, hasData: data.length > 0 });
+    data = [];
+    event = 'message';
+    id = null;
+  };
   for await (const line of readLines(res)) {
-    if (line === '') {
-      if (data.length) onEvent(data.join('\n'));
-      data = [];
-    } else if (line.startsWith('data:')) {
-      data.push(line.slice(line.startsWith('data: ') ? 6 : 5));
-    }
+    if (line === '') flush();
+    else if (line.startsWith('data:')) data.push(line.slice(line.startsWith('data: ') ? 6 : 5));
+    else if (line.startsWith('event:')) event = line.slice(6).trim();
+    else if (line.startsWith('id:')) id = line.slice(3).trim();
   }
-  if (data.length) onEvent(data.join('\n'));
+  flush();
 }
 
 export function downloadBlob(blob, filename) {
