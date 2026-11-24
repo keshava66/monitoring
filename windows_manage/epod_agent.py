@@ -1,98 +1,247 @@
+"""Pipeline agent: start / stop / observe one extraction script on this host.
+
+The monitoring backend is the only client. Every route except /health
+requires `Authorization: Bearer <AGENT_TOKEN>`.
+
+config.ini ([app] section, next to this file or at $AGENT_CONFIG):
+    SCRIPT_PATH     absolute path of the pipeline entry script (required)
+    SCRIPT_ARGS     arguments passed to the script
+    PYTHON_EXE      interpreter used to run it (required)
+    LOG_PATH        the pipeline's own log file (required)
+    TERMINAL_LOG    file that captures the script's stdout/stderr (required)
+    SERVER_NAME     display name shown in the UI
+    PORT / HOST     listen address (default 0.0.0.0:8090)
+    AGENT_TOKEN     shared secret, must match the backend's *_AGENT_*_TOKEN (required)
+    RUN_AS_MODULE   run as `python -m <script>` from the script directory (default False)
+    STOP_TIMEOUT    seconds to wait for a graceful stop before killing (default 20)
+    SSL_CERTFILE / SSL_KEYFILE   serve HTTPS when both are set
+"""
+from __future__ import annotations
+
+import asyncio
 import configparser
-import secrets
+import logging
 import os
+import secrets
+import shlex
 import subprocess
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Dict, List, Optional, Tuple
 
 import psutil
 import uvicorn
-from fastapi import FastAPI, HTTPException, Header, Depends, Request
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
-# ── Config ────────────────────────────────────────────────────────────────────
-_cfg_path = Path(__file__).parent / "config.ini"
-if not _cfg_path.exists():
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+logger = logging.getLogger("agent")
+
+BASE_DIR = Path(__file__).resolve().parent
+_cfg_path = Path(os.environ.get("AGENT_CONFIG", BASE_DIR / "config.ini"))
+if not _cfg_path.is_file():
     raise RuntimeError(f"config.ini not found at {_cfg_path}")
 
-_cfg = configparser.ConfigParser()
-_cfg.read(str(_cfg_path))
+_cfg = configparser.ConfigParser(interpolation=None)
+_cfg.read(_cfg_path, encoding="utf-8")
+if not _cfg.has_section("app"):
+    raise RuntimeError(f"[app] section missing in {_cfg_path}")
 _app_cfg = _cfg["app"]
 
-SCRIPT_PATH  = _app_cfg["SCRIPT_PATH"]
-SCRIPT_ARGS  = _app_cfg.get("SCRIPT_ARGS", "", raw=True).split()
-LOG_PATH     = _app_cfg["LOG_PATH"]
-TERMINAL_LOG = _app_cfg["TERMINAL_LOG"]
-PYTHON_EXE   = _app_cfg["PYTHON_EXE"]
-SERVER_NAME  = _app_cfg.get("SERVER_NAME", "EPOD Server")
-PORT         = int(_app_cfg.get("PORT", "8090"))
-SCRIPT_NAME  = os.path.basename(SCRIPT_PATH)
 
-AGENT_TOKEN  = _app_cfg.get("AGENT_TOKEN", "").strip()
-if not AGENT_TOKEN:
-    raise RuntimeError(
-        "AGENT_TOKEN not set in config.ini [app]. Generate one (e.g. `python -c \"import secrets; print(secrets.token_urlsafe(32))\"`) and put it in both this agent's config.ini and the matching *_AGENT_*_TOKEN env var on the backend."
-    )
+def _required(key: str) -> str:
+    value = (_app_cfg.get(key) or "").strip()
+    if not value:
+        raise RuntimeError(f"{key} must be set in {_cfg_path} [app]")
+    return value
 
-# ── App ───────────────────────────────────────────────────────────────────────
-def _require_token(request: Request, authorization: str = Header(None)):
-    """Every route needs the shared secret — this replaced running
-    wide open with no auth at all. /health is exempt: start.sh's own
-    readiness probe hits it with no token, and it returns nothing
-    sensitive (see the handler below)."""
+
+def _flag(key: str, default: bool) -> bool:
+    return (_app_cfg.get(key) or str(default)).strip().lower() in ("1", "true", "yes", "on")
+
+
+SCRIPT_PATH = os.path.abspath(_required("SCRIPT_PATH"))
+SCRIPT_ARGS = shlex.split(_app_cfg.get("SCRIPT_ARGS", ""), posix=os.name != "nt")
+LOG_PATH = _required("LOG_PATH")
+TERMINAL_LOG = _required("TERMINAL_LOG")
+PYTHON_EXE = _required("PYTHON_EXE")
+SERVER_NAME = (_app_cfg.get("SERVER_NAME") or "Pipeline Server").strip()
+HOST = (_app_cfg.get("HOST") or "0.0.0.0").strip()
+PORT = int(_app_cfg.get("PORT", "8090"))
+AGENT_TOKEN = _required("AGENT_TOKEN")
+RUN_AS_MODULE = _flag("RUN_AS_MODULE", False)
+STOP_TIMEOUT = float(_app_cfg.get("STOP_TIMEOUT", "20"))
+SSL_CERTFILE = (_app_cfg.get("SSL_CERTFILE") or "").strip()
+SSL_KEYFILE = (_app_cfg.get("SSL_KEYFILE") or "").strip()
+
+if len(AGENT_TOKEN) < 24:
+    raise RuntimeError("AGENT_TOKEN is too short; generate one with: python -c \"import secrets; print(secrets.token_urlsafe(32))\"")
+
+SCRIPT_NAME = os.path.basename(SCRIPT_PATH)
+SCRIPT_DIR = os.path.dirname(SCRIPT_PATH)
+MODULE_NAME = os.path.splitext(SCRIPT_NAME)[0]
+PID_FILE = BASE_DIR / f".{MODULE_NAME}.pid"
+MAX_LINES = 10_000
+STREAM_BACKLOG = 50
+STREAM_POLL_SECS = 0.25
+STREAM_KEEPALIVE_SECS = 15
+
+_control_lock = threading.Lock()
+
+
+def _norm(path: str) -> str:
+    return os.path.normcase(os.path.realpath(os.path.abspath(path)))
+
+
+_SCRIPT_REAL = _norm(SCRIPT_PATH)
+_SCRIPT_DIR_REAL = _norm(SCRIPT_DIR)
+
+
+# ── Auth ──────────────────────────────────────────────────────────────────────
+
+def _require_token(request: Request, authorization: Optional[str] = Header(None)):
     if request.url.path == "/health":
         return
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing bearer token")
-    token = authorization[7:]
-    if not secrets.compare_digest(token, AGENT_TOKEN):
+    if not secrets.compare_digest(authorization[7:].encode(), AGENT_TOKEN.encode()):
         raise HTTPException(status_code=401, detail="Invalid token")
 
-app = FastAPI(title="EPOD Agent", version="1.0.0", dependencies=[Depends(_require_token)])
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET", "POST"], allow_headers=["*"])
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+app = FastAPI(title="Pipeline Agent", version="2.0.0", dependencies=[Depends(_require_token)],
+              docs_url=None, redoc_url=None, openapi_url=None)
+
+
+# ── Process discovery ─────────────────────────────────────────────────────────
+
+def _matches(proc: psutil.Process) -> bool:
+    try:
+        cmdline = [c for c in proc.cmdline() if c]
+    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+        return False
+    if len(cmdline) < 2 or "python" not in os.path.basename(cmdline[0]).lower():
+        return False
+    args = cmdline[1:]
+    for arg in args:
+        if arg.lower().endswith(".py") or os.sep in arg or "/" in arg:
+            try:
+                candidate = arg if os.path.isabs(arg) else os.path.join(proc.cwd(), arg)
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                candidate = arg
+            if _norm(candidate) == _SCRIPT_REAL:
+                return True
+    if "-m" in args:
+        i = args.index("-m")
+        if i + 1 < len(args) and args[i + 1] == MODULE_NAME:
+            try:
+                return _norm(proc.cwd()) == _SCRIPT_DIR_REAL
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                return False
+    return False
+
+
+def _read_pidfile() -> Optional[int]:
+    try:
+        return int(PID_FILE.read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
 def find_proc() -> Optional[psutil.Process]:
-    script_name = os.path.normcase(SCRIPT_NAME)
-    script_dir  = os.path.normcase(os.path.normpath(os.path.dirname(SCRIPT_PATH)))
-    for p in psutil.process_iter(["pid", "name", "cmdline", "create_time"]):
+    pid = _read_pidfile()
+    if pid:
         try:
-            if "python" in (p.info["name"] or "").lower():
-                cmdline = [os.path.normcase(c) for c in (p.info["cmdline"] or []) if c]
-                has_script = any(script_name == os.path.basename(c) for c in cmdline)
-                has_dir    = any(script_dir in c for c in cmdline)
-                if has_script and has_dir:
-                    return p
+            proc = psutil.Process(pid)
+            if proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE and _matches(proc):
+                return proc
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             pass
-    return None
+    me = os.getpid()
+    # Prefer the outermost match (on Windows a venv python.exe launcher and
+    # the real interpreter both carry the script on their command line).
+    found = [p for p in psutil.process_iter(["pid"]) if p.info["pid"] != me and _matches(p)]
+    if not found:
+        return None
+    pids = {p.pid for p in found}
+    for p in found:
+        try:
+            if p.ppid() not in pids:
+                return p
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    return found[0]
 
-def read_tail(path: str, n: int = 50):
+
+# ── Log reading ───────────────────────────────────────────────────────────────
+
+_line_count_cache: Dict[str, Tuple[int, int, float]] = {}
+_line_count_lock = threading.Lock()
+
+
+def _count_lines(path: str) -> int:
+    """Incremental newline count: only bytes appended since the last call are
+    scanned, so polling a multi-GB log stays cheap."""
+    st = os.stat(path)
+    with _line_count_lock:
+        offset, count, ino = _line_count_cache.get(path, (0, 0, 0.0))
+        identity = getattr(st, "st_ino", 0) or st.st_ctime
+        if st.st_size < offset or identity != ino:
+            offset, count = 0, 0
+        with open(path, "rb") as f:
+            f.seek(offset)
+            while True:
+                chunk = f.read(1 << 20)
+                if not chunk:
+                    break
+                count += chunk.count(b"\n")
+                offset += len(chunk)
+        _line_count_cache[path] = (offset, count, identity)
+        return count
+
+
+def _tail_lines(path: str, n: int) -> List[str]:
+    with open(path, "rb") as f:
+        f.seek(0, os.SEEK_END)
+        end = f.tell()
+        block, data, pos = 64 * 1024, b"", end
+        while pos > 0 and data.count(b"\n") <= n:
+            step = min(block, pos)
+            pos -= step
+            f.seek(pos)
+            data = f.read(step) + data
+    lines = data.decode("utf-8", errors="replace").splitlines()
+    return [l.rstrip() for l in lines[-n:]]
+
+
+def read_tail(path: str, n: int) -> Tuple[List[str], int]:
     try:
-        with open(path, encoding="utf-8", errors="replace") as f:
-            lines = f.readlines()
-        return [l.rstrip() for l in lines[-n:]], len(lines)
+        return _tail_lines(path, n), _count_lines(path)
     except FileNotFoundError:
         return [], 0
 
+
 def fmt_uptime(create_time: float) -> str:
-    secs = int(time.time() - create_time)
-    h, r = divmod(secs, 3600)
+    secs = max(0, int(time.time() - create_time))
+    d, r = divmod(secs, 86400)
+    h, r = divmod(r, 3600)
     m, s = divmod(r, 60)
-    if h: return f"{h}h {m}m {s}s"
-    if m: return f"{m}m {s}s"
+    if d:
+        return f"{d}d {h}h {m}m"
+    if h:
+        return f"{h}h {m}m {s}s"
+    if m:
+        return f"{m}m {s}s"
     return f"{s}s"
 
-def fmt_mem(b: int) -> str:
-    return f"{b / (1024 * 1024):.1f} MB"
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
 
 @app.get("/info")
 def info():
@@ -101,84 +250,199 @@ def info():
         "script_name": SCRIPT_NAME,
         "script_args": " ".join(SCRIPT_ARGS) or "—",
         "script_path": SCRIPT_PATH,
+        "run_as_module": RUN_AS_MODULE,
+        "cpu_count": psutil.cpu_count() or 1,
+        "total_memory": psutil.virtual_memory().total,
     }
+
 
 @app.get("/status")
 def status():
     proc = find_proc()
     if not proc:
-        return {"running": False, "pid": None, "uptime": None, "memory": None, "cpu": None}
-    try:    mem = fmt_mem(proc.memory_info().rss)
-    except: mem = None
-    try:    cpu = f"{proc.cpu_percent(interval=0.1):.1f}%"
-    except: cpu = None
-    return {"running": True, "pid": proc.pid, "uptime": fmt_uptime(proc.create_time()), "memory": mem, "cpu": cpu}
+        return {"running": False, "pid": None, "uptime": None, "memory": None, "cpu": None,
+                "memory_bytes": None, "cpu_percent": None}
+    try:
+        with proc.oneshot():
+            procs = [proc] + proc.children(recursive=True)
+            rss = 0
+            for p in procs:
+                try:
+                    rss += p.memory_info().rss
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+            created = proc.create_time()
+        cpu = 0.0
+        for p in procs:
+            try:
+                p.cpu_percent(None)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        time.sleep(0.2)
+        for p in procs:
+            try:
+                cpu += p.cpu_percent(None)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        return {"running": False, "pid": None, "uptime": None, "memory": None, "cpu": None,
+                "memory_bytes": None, "cpu_percent": None}
+    return {
+        "running": True,
+        "pid": proc.pid,
+        "uptime": fmt_uptime(created),
+        "started_at": datetime.fromtimestamp(created).astimezone().isoformat(),
+        "memory": f"{rss / (1024 * 1024):.1f} MB",
+        "memory_bytes": rss,
+        "cpu": f"{cpu:.1f}%",
+        "cpu_percent": round(cpu, 1),
+        "processes": len(procs),
+    }
+
 
 @app.get("/logs")
-def get_logs(n: int = 20):
+def get_logs(n: int = Query(20, ge=1, le=MAX_LINES)):
     lines, total = read_tail(LOG_PATH, n)
     return {"lines": lines, "total": total, "path": LOG_PATH}
 
+
 @app.get("/terminal")
-def get_terminal(n: int = 50):
+def get_terminal(n: int = Query(50, ge=1, le=MAX_LINES)):
     lines, total = read_tail(TERMINAL_LOG, n)
     return {"lines": lines, "total": total, "path": TERMINAL_LOG}
 
+
+def _sse(line: str) -> str:
+    return "".join(f"data: {part}\n" for part in (line.split("\n") or [""])) + "\n"
+
+
 @app.get("/terminal/stream")
-def stream_terminal():
-    def generator():
-        try:
-            with open(TERMINAL_LOG, encoding="utf-8", errors="replace") as f:
-                for line in f.readlines()[-50:]:
-                    yield f"data: {line.rstrip()}\n\n"
-                f.seek(0, 2)
-                while True:
-                    line = f.readline()
-                    if line:
-                        yield f"data: {line.rstrip()}\n\n"
-                    else:
-                        yield "data: \n\n"
-                        time.sleep(0.3)
-        except FileNotFoundError:
-            yield "data: [Terminal log not found — start the script first]\n\n"
-    return StreamingResponse(generator(), media_type="text/event-stream")
+async def stream_terminal(request: Request):
+    async def generator():
+        pos: Optional[int] = None
+        identity = None
+        buffer = b""
+        last_send = time.monotonic()
+        announced_missing = False
+        while not await request.is_disconnected():
+            try:
+                st = os.stat(TERMINAL_LOG)
+            except FileNotFoundError:
+                if not announced_missing:
+                    announced_missing = True
+                    yield _sse("[Terminal log not found — start the script first]")
+                    last_send = time.monotonic()
+                pos = None
+                await asyncio.sleep(1)
+                continue
+            current = getattr(st, "st_ino", 0) or st.st_ctime
+            if pos is None:
+                announced_missing = False
+                for line in await asyncio.to_thread(_tail_lines, TERMINAL_LOG, STREAM_BACKLOG):
+                    yield _sse(line)
+                pos, identity, buffer = st.st_size, current, b""
+                last_send = time.monotonic()
+            elif st.st_size < pos or current != identity:
+                pos, identity, buffer = 0, current, b""
+            if st.st_size > pos:
+                with open(TERMINAL_LOG, "rb") as f:
+                    f.seek(pos)
+                    chunk = f.read(min(st.st_size - pos, 4 << 20))
+                pos += len(chunk)
+                buffer += chunk
+                *complete, buffer = buffer.split(b"\n")
+                for raw in complete:
+                    yield _sse(raw.decode("utf-8", errors="replace").rstrip("\r"))
+                if complete:
+                    last_send = time.monotonic()
+            if time.monotonic() - last_send >= STREAM_KEEPALIVE_SECS:
+                yield ": keepalive\n\n"
+                last_send = time.monotonic()
+            await asyncio.sleep(STREAM_POLL_SECS)
+
+    return StreamingResponse(generator(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
+
 
 @app.post("/start")
 def start_script():
-    if find_proc():
-        raise HTTPException(status_code=409, detail="Script is already running")
-    log_dir = os.path.dirname(TERMINAL_LOG)
-    if log_dir:
-        os.makedirs(log_dir, exist_ok=True)
-    with open(TERMINAL_LOG, "w", encoding="utf-8") as f:
-        f.write(f"{'='*60}\n  Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n{'='*60}\n")
-    env = os.environ.copy()
-    env["PYTHONIOENCODING"] = "utf-8"
-    script_dir = os.path.dirname(os.path.abspath(SCRIPT_PATH))
-    with open(TERMINAL_LOG, "ab") as out:
-        kwargs = {}
-        if os.name == "nt":  # Windows — suppress console window
-            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-        subprocess.Popen([PYTHON_EXE, "-u", SCRIPT_PATH] + SCRIPT_ARGS,
-            stdout=out, stderr=out, env=env, cwd=script_dir, **kwargs)
-    return {"success": True}
+    with _control_lock:
+        if find_proc():
+            raise HTTPException(status_code=409, detail="Script is already running")
+        log_dir = os.path.dirname(TERMINAL_LOG)
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
+        stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(TERMINAL_LOG, "w", encoding="utf-8") as f:
+            f.write(f"{'=' * 60}\n  Started: {stamp}\n{'=' * 60}\n")
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "utf-8"
+        env["PYTHONUNBUFFERED"] = "1"
+        cmd = [PYTHON_EXE, "-u"] + (["-m", MODULE_NAME] if RUN_AS_MODULE else [SCRIPT_PATH]) + SCRIPT_ARGS
+        kwargs: Dict = {}
+        if os.name == "nt":
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            kwargs["start_new_session"] = True
+        try:
+            with open(TERMINAL_LOG, "ab") as out:
+                proc = subprocess.Popen(cmd, stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                        env=env, cwd=SCRIPT_DIR, **kwargs)
+        except OSError as exc:
+            logger.error("Failed to start %s: %s", SCRIPT_NAME, exc)
+            raise HTTPException(status_code=500, detail=f"Failed to start script: {exc.strerror or exc}")
+        PID_FILE.write_text(str(proc.pid))
+        try:
+            code = proc.wait(timeout=1.5)
+        except subprocess.TimeoutExpired:
+            logger.info("Started %s (pid %s)", SCRIPT_NAME, proc.pid)
+            return {"success": True, "pid": proc.pid}
+        PID_FILE.unlink(missing_ok=True)
+        raise HTTPException(status_code=500, detail=f"Script exited immediately with code {code}; see terminal output")
+
 
 @app.post("/stop")
 def stop_script():
-    proc = find_proc()
-    if not proc:
-        raise HTTPException(status_code=404, detail="Script is not running")
-    proc.terminate()
-    return {"success": True}
+    with _control_lock:
+        proc = find_proc()
+        if not proc:
+            raise HTTPException(status_code=404, detail="Script is not running")
+        try:
+            procs = [proc] + proc.children(recursive=True)
+        except psutil.NoSuchProcess:
+            procs = [proc]
+        for p in procs:
+            try:
+                p.terminate()
+            except psutil.NoSuchProcess:
+                pass
+        _, alive = psutil.wait_procs(procs, timeout=STOP_TIMEOUT)
+        for p in alive:
+            try:
+                p.kill()
+            except psutil.NoSuchProcess:
+                pass
+        if alive:
+            psutil.wait_procs(alive, timeout=5)
+        PID_FILE.unlink(missing_ok=True)
+        logger.info("Stopped %s (pid %s, %d forced)", SCRIPT_NAME, proc.pid, len(alive))
+        return {"success": True, "forced": len(alive)}
+
 
 @app.post("/clear-terminal")
 def clear_terminal():
     try:
-        open(TERMINAL_LOG, "w").close()
+        with open(TERMINAL_LOG, "w", encoding="utf-8"):
+            pass
+    except FileNotFoundError:
         return {"success": True}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except OSError as exc:
+        raise HTTPException(status_code=409, detail=f"Terminal log is locked: {exc.strerror or exc}")
+    with _line_count_lock:
+        _line_count_cache.pop(TERMINAL_LOG, None)
+    return {"success": True}
 
-# ── Entry point ───────────────────────────────────────────────────────────────
+
 if __name__ == "__main__":
-    uvicorn.run("epod_agent:app", host="0.0.0.0", port=PORT, reload=False)
+    ssl = {"ssl_certfile": SSL_CERTFILE, "ssl_keyfile": SSL_KEYFILE} if SSL_CERTFILE and SSL_KEYFILE else {}
+    uvicorn.run(app, host=HOST, port=PORT, reload=False, log_level="info", **ssl)

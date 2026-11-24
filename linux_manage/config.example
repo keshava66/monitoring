@@ -4,27 +4,27 @@ port = 8001
 
 [backend]
 name = Backend API
-dir = /home/sa-prd-rdi-react-<>/dqe/backend
-port = 8000
+dir = /home/sa-prd-rdi-react-<>/monitoring/backend
+port = 8501
 entry = Backend:app
 
 [frontend]
 name = Frontend App
-dir = /home/sa-prd-rdi-react-<>/dqe
-port = 8080
+dir = /home/sa-prd-rdi-react-<>/monitoring/frontend
+port = 8502
 
 [ssl]
-certfile = /home/sa-prd-rdi-react-<>/SSL2026/awsbjvnval002_jnj_com_cert.pem
-keyfile = /home/sa-prd-rdi-react-<>/SSL2026/awsbjvnval002_jnj_com_key.pem
+certfile = /home/sa-prd-rdi-react-<>/SSL2026/server_cert.pem
+keyfile = /home/sa-prd-rdi-react-<>/SSL2026/server_key.pem
 
 [scripts]
 backend = /home/sa-prd-rdi-react-<>/monitoring/linux_manage/backend.sh
 frontend = /home/sa-prd-rdi-react-<>/monitoring/linux_manage/frontend.sh
 
 [repo]
-dir = /home/sa-prd-rdi-react-<>/dqe
+dir = /home/sa-prd-rdi-react-<>/monitoring
 username = SA-PRD-RDI-REACT-<>
 password =
 
 [search_paths]
-<> = /home/sa-prd-rdi-react-<>
+home = /home/sa-prd-rdi-react-<>

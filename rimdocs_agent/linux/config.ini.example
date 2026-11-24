@@ -1,13 +1,18 @@
 [app]
-SCRIPT_PATH = /home/sa-prd-rdi-react-prd/rimdocs_s3_pg/main.py
-SCRIPT_ARGS = --source s3 --no-embed --doc-workers 16 --workers 1
-LOG_PATH    = /home/sa-prd-rdi-react-prd/rimdocs_s3_pg/logs/epod_pipeline.log
-TERMINAL_LOG   = /home/sa-prd-rdi-react-prd/rimdocs_s3_pg/pipeline_safety.log
-PYTHON_EXE  = /home/sa-prd-rdi-react-prd/rimdocs_s3_pg/venv/bin/python
-SERVER_NAME  = RIMDocs Folder_Name
-PORT         = 8443
+SCRIPT_PATH   = /home/sa-prd-rdi-react-prd/rimdocs_s3_pg/main.py
+SCRIPT_ARGS   = --source s3 --no-embed --doc-workers 16 --workers 1
+PYTHON_EXE    = /home/sa-prd-rdi-react-prd/rimdocs_s3_pg/venv/bin/python
+LOG_PATH      = /home/sa-prd-rdi-react-prd/rimdocs_s3_pg/logs/epod_pipeline.log
+TERMINAL_LOG  = /home/sa-prd-rdi-react-prd/rimdocs_s3_pg/pipeline_safety.log
+SERVER_NAME   = RIMDocs Folder_Name
+HOST          = 0.0.0.0
+PORT          = 8443
 RUN_AS_MODULE = True
-# Shared secret this agent requires on every request (Authorization: Bearer <token>).
-# Generate with: python -c "import secrets; print(secrets.token_urlsafe(32))"
-# Must match the matching *_AGENT_*_TOKEN env var set on the Backend.py side.
-AGENT_TOKEN  =
+STOP_TIMEOUT  = 20
+; Optional HTTPS for this agent:
+; SSL_CERTFILE =
+; SSL_KEYFILE  =
+; Shared secret required on every request (Authorization: Bearer <token>).
+; Generate: python -c "import secrets; print(secrets.token_urlsafe(32))"
+; Must equal the matching *_AGENT_*_TOKEN set on the backend.
+AGENT_TOKEN   =

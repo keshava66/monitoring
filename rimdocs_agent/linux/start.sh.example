@@ -1,44 +1,52 @@
 #!/usr/bin/env bash
-set -e
+set -euo pipefail
 
 AGENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV_DIR="$AGENT_DIR/venv"
 PY="$VENV_DIR/bin/python"
-PIP="$VENV_DIR/bin/pip"
 REQUIREMENTS="$AGENT_DIR/requirements.txt"
 LOG="$AGENT_DIR/agent.log"
-PORT="$(grep -i '^PORT' "$AGENT_DIR/config.ini" | head -1 | cut -d'=' -f2 | tr -d ' ')"
-PORT="${PORT:-8090}"
+PID_FILE="$AGENT_DIR/agent.pid"
+CONFIG="$AGENT_DIR/config.ini"
 
-# ── 1. Create venv if missing ─────────────────────────────────────
+[ -f "$CONFIG" ] || { echo "FAILED: $CONFIG not found"; exit 1; }
+
+cfg() { grep -iE "^[[:space:]]*$1[[:space:]]*=" "$CONFIG" | head -1 | cut -d'=' -f2- | tr -d '[:space:]'; }
+PORT="$(cfg PORT)"; PORT="${PORT:-8090}"
+SCHEME=http; [ -n "$(cfg SSL_CERTFILE)" ] && SCHEME=https
+HEALTH="$SCHEME://localhost:$PORT/health"
+
+if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+    echo "Agent already running (PID $(cat "$PID_FILE")) on :$PORT"
+    exit 0
+fi
+
 if [ ! -x "$PY" ]; then
     echo "Creating virtual environment..."
     python3 -m venv "$VENV_DIR"
 fi
 
-# ── 2. Install requirements ───────────────────────────────────────
-if [ -f "$REQUIREMENTS" ]; then
-    echo "Installing requirements..."
-    "$PIP" install -q -r "$REQUIREMENTS"
-else
-    echo "WARNING: requirements.txt not found - skipping."
-fi
+echo "Installing requirements..."
+"$PY" -m pip install -q --disable-pip-version-check -r "$REQUIREMENTS"
 
-# ── 3. Start the agent (detached, survives terminal close) ────────
-echo "Starting RIMDocs agent..."
+echo "Starting agent on :$PORT..."
 nohup "$PY" "$AGENT_DIR/RIMDocs_agent.py" >> "$LOG" 2>&1 &
-disown
+echo $! > "$PID_FILE"
+disown || true
 
-# ── 4. Wait and verify ─────────────────────────────────────────────
-echo "Waiting for agent to start on :$PORT..."
-for i in $(seq 1 12); do
+for _ in $(seq 1 20); do
     sleep 1
-    if curl -sf "http://localhost:$PORT/health" > /dev/null 2>&1; then
-        echo "SUCCESS: RIMDocs agent is running on :$PORT"
+    if curl -skf "$HEALTH" > /dev/null 2>&1; then
+        echo "SUCCESS: agent is running on :$PORT (PID $(cat "$PID_FILE"))"
         exit 0
+    fi
+    if ! kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+        echo "FAILED: agent exited during startup. Last log lines:"
+        tail -20 "$LOG"
+        rm -f "$PID_FILE"
+        exit 1
     fi
 done
 
-echo "FAILED: Agent did not respond on :$PORT within 12s."
-echo "Check $LOG for errors."
+echo "FAILED: agent did not respond on :$PORT within 20s. Check $LOG"
 exit 1

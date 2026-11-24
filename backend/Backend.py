@@ -1,87 +1,208 @@
-import os
+"""RDI-AI Monitoring API."""
+from __future__ import annotations
+
 import asyncio
-from fastapi import FastAPI, HTTPException, Header, Body, Query, Depends
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
-import requests
-import json
 import logging
-from io import BytesIO
+import os
+import time
+import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Optional
-from pydantic import BaseModel
+from typing import Dict, Optional
+
 from dotenv import load_dotenv
 
-# Load .env from the same directory as this file
 load_dotenv(Path(__file__).parent / ".env")
 
-import rbac
-from auth import get_current_user, require_permission, require_admin, _get_access_token
-from audit import audit_router, write_audit_event
-from epod  import epod_router
-from nas_scanner import nas_router
-from rimdocs import rimdocs_router
+import httpx  # noqa: E402
+from fastapi import Body, Depends, FastAPI, Header, HTTPException, Query, Request  # noqa: E402
+from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
+from fastapi.responses import JSONResponse, Response, StreamingResponse  # noqa: E402
+from pydantic import BaseModel, Field  # noqa: E402
+from starlette.concurrency import run_in_threadpool  # noqa: E402
+from starlette.datastructures import MutableHeaders  # noqa: E402
+
+import audit  # noqa: E402
+import auth  # noqa: E402
+import db_common  # noqa: E402
+import rbac  # noqa: E402
+from audit import audit_router, client_ip, write_audit_event  # noqa: E402
+from auth import get_current_user, require_permission, resolve_user  # noqa: E402
+from epod import epod_router  # noqa: E402
+from nas_scanner import nas_router  # noqa: E402
+from rimdocs import rimdocs_router  # noqa: E402
 
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("monitoring")
 
-# ── Tag order controls section order in /docs ──────────────────────────────────
+APP_VERSION = "2.0.0"
+
+# ============================================================================
+# AGENT REGISTRY
+# Each pipeline box runs one agent per product/environment. The browser never
+# talks to an agent directly (they're plain HTTP on internal hosts); every
+# call goes through here, gets authorised, and is re-signed with that
+# agent's shared token.
+# ============================================================================
+
+_AGENT_PERMS = {
+    "epod-dev": ("viewEPodDev", "stopScriptDev"),
+    "epod-qa": ("viewEPodQA", "stopScriptQA"),
+    "epod-prod": ("viewEPodProd", "stopScriptProd"),
+    "rimdocs-dev": ("viewRimdocsDev", "stopScriptRimdocsDev"),
+    "rimdocs-qa": ("viewRimdocsQA", "stopScriptRimdocsQA"),
+    "rimdocs-prod": ("viewRimdocsProd", "stopScriptRimdocsProd"),
+    "rimdocs-dev1": ("viewRimdocsDev1", "stopScriptRimdocsDev1"),
+    "rimdocs-dev2": ("viewRimdocsDev2", "stopScriptRimdocsDev2"),
+    "rimdocs-qa2": ("viewRimdocsQA2", "stopScriptRimdocsQA2"),
+    "rimdocs-prod2": ("viewRimdocsProd2", "stopScriptRimdocsProd2"),
+}
+
+
+def _agent_env(prefix: str, kind: str) -> str:
+    return os.getenv(f"{prefix.upper().replace('-', '_AGENT_', 1)}_{kind}", "").strip()
+
+
+AGENTS: Dict[str, Dict] = {
+    prefix: {"url": _agent_env(prefix, "URL").rstrip("/"), "token": _agent_env(prefix, "TOKEN"), "view": v, "control": c}
+    for prefix, (v, c) in _AGENT_PERMS.items()
+}
+
+_AGENT_READ_PATHS = {"/status", "/info", "/logs", "/terminal", "/terminal/stream", "/health"}
+_AGENT_WRITE_PATHS = {"/start", "/stop", "/clear-terminal"}
+_AGENT_TLS_VERIFY = os.getenv("AGENT_TLS_VERIFY", "true").strip().lower() not in ("false", "0", "no")
+
+_agent_client = httpx.AsyncClient(
+    verify=_AGENT_TLS_VERIFY,
+    timeout=httpx.Timeout(15.0, connect=5.0),
+    # Agents sit behind firewalls that silently drop idle sockets; reusing a
+    # pooled connection after that just fails. Fresh connection per call.
+    limits=httpx.Limits(max_keepalive_connections=0, max_connections=100),
+)
+_agent_stream_client = httpx.AsyncClient(
+    verify=_AGENT_TLS_VERIFY,
+    timeout=httpx.Timeout(connect=5.0, read=None, write=10.0, pool=5.0),
+    limits=httpx.Limits(max_keepalive_connections=0, max_connections=200),
+)
+
+
+# ============================================================================
+# APP
+# ============================================================================
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    audit.init_db()
+    configured = [p for p, a in AGENTS.items() if a["url"]]
+    logger.info("Monitoring API %s starting; agents configured: %s", APP_VERSION, ", ".join(configured) or "none")
+    for p in configured:
+        if not AGENTS[p]["token"]:
+            logger.warning("Agent %s has a URL but no token; calls to it will be rejected by the agent", p)
+    yield
+    await _agent_client.aclose()
+    await _agent_stream_client.aclose()
+    auth.graph_client.close()
+    db_common.close_pool()
+
+
 TAGS_METADATA = [
-    {
-        "name": "Audit",
-        "description": "Audit log — read, filter, export, and track active users.",
-    },
-    {
-        "name": "EPOD",
-        "description": "EPOD NAS ingestion stats — dashboard, per-table metrics, and diagnostics.",
-    },
-    {
-        "name": "Graph API",
-        "description": "Microsoft Graph proxy — user profile, photo, and extended details.",
-    },
-    {
-        "name": "RBAC",
-        "description": "Role-based access control — roles, permissions, and user assignments.",
-    },
-    {
-        "name": "System",
-        "description": "Health check and server status.",
-    },
+    {"name": "Audit", "description": "Audit log — read, filter, export, and track active users."},
+    {"name": "EPOD", "description": "EPOD ingestion stats."},
+    {"name": "RIMDOCS", "description": "RIMDOCS ingestion stats."},
+    {"name": "NAS Scanner", "description": "EPOD NAS archive analysis."},
+    {"name": "Graph API", "description": "Microsoft Graph proxy — profile and photo."},
+    {"name": "RBAC", "description": "Roles, permissions, and user assignments."},
+    {"name": "Agent Proxy", "description": "Authorised proxy to pipeline agents."},
+    {"name": "System", "description": "Health checks."},
 ]
 
 app = FastAPI(
-    title="RDI-AI Backened",
-    version="0.1.0",
+    title="RDI-AI Monitoring API",
+    version=APP_VERSION,
     openapi_tags=TAGS_METADATA,
+    lifespan=lifespan,
+    docs_url=None if os.getenv("DISABLE_DOCS", "").lower() in ("1", "true", "yes") else "/docs",
+    redoc_url=None,
 )
 
-_allowed_origins = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()]
+_SECURITY_HEADERS = {
+    b"x-content-type-options": b"nosniff",
+    b"x-frame-options": b"DENY",
+    b"referrer-policy": b"no-referrer",
+    b"strict-transport-security": b"max-age=31536000; includeSubDomains",
+}
+
+
+class RequestContextMiddleware:
+    """Request id, security headers and one access-log line per request.
+    Pure ASGI so streaming responses are never buffered. Logs the path only,
+    never the query string."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        incoming = dict(scope.get("headers") or []).get(b"x-request-id", b"").decode("latin-1")
+        rid = incoming if incoming and len(incoming) <= 64 and incoming.isalnum() else uuid.uuid4().hex
+        scope.setdefault("state", {})["request_id"] = rid
+        started = time.perf_counter()
+        status = {"code": 500}
+
+        async def send_wrapper(message):
+            if message["type"] == "http.response.start":
+                status["code"] = message["status"]
+                headers = MutableHeaders(scope=message)
+                headers["X-Request-ID"] = rid
+                for k, v in _SECURITY_HEADERS.items():
+                    if k.decode() not in headers:
+                        headers[k.decode()] = v.decode()
+            await send(message)
+
+        try:
+            await self.app(scope, receive, send_wrapper)
+        finally:
+            path = scope.get("path", "")
+            if path not in ("/health", "/health/ready"):
+                logger.info(
+                    "%s %s %s %.1fms rid=%s",
+                    scope.get("method"), path, status["code"], (time.perf_counter() - started) * 1000, rid,
+                )
+
+
+_allowed_origins = [o.strip().rstrip("/") for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()]
 if not _allowed_origins:
-    logger.warning("[CORS] ALLOWED_ORIGINS not set — defaulting to http://localhost:5173 for local dev only.")
-    _allowed_origins = ["http://localhost:5173"]
+    logger.warning("[CORS] ALLOWED_ORIGINS not set — allowing http://localhost:3000 and :5173 for local development only.")
+    _allowed_origins = ["http://localhost:3000", "http://localhost:5173"]
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_allowed_origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-Request-ID"],
+    expose_headers=["X-Request-ID", "Content-Disposition"],
+    max_age=600,
 )
+app.add_middleware(RequestContextMiddleware)
+
+
+@app.exception_handler(Exception)
+async def _unhandled(request: Request, exc: Exception):
+    rid = request.scope.get("state", {}).get("request_id", "")
+    logger.exception("Unhandled error rid=%s on %s %s", rid, request.method, request.url.path)
+    return JSONResponse(status_code=500, content={"detail": "Internal server error", "request_id": rid})
+
 
 app.include_router(audit_router)
 app.include_router(epod_router)
 app.include_router(nas_router)
 app.include_router(rimdocs_router)
-
-# ============================================================================
-# HELPERS
-# ============================================================================
-
-def get_access_token(authorization: Optional[str]) -> str:
-    return _get_access_token(authorization)
 
 
 # ============================================================================
@@ -90,7 +211,19 @@ def get_access_token(authorization: Optional[str]) -> str:
 
 @app.get("/health", tags=["System"])
 def health_check():
-    return {"status": "healthy"}
+    return {"status": "healthy", "version": APP_VERSION}
+
+
+@app.get("/health/ready", tags=["System"])
+def readiness_check():
+    checks = {"audit_db": audit.db_healthy()}
+    try:
+        db_common.load_config()
+        checks["postgres"] = db_common.db_healthy()
+    except (FileNotFoundError, KeyError):
+        checks["postgres"] = False
+    ok = all(checks.values())
+    return JSONResponse(status_code=200 if ok else 503, content={"status": "ready" if ok else "degraded", "checks": checks})
 
 
 # ============================================================================
@@ -98,374 +231,354 @@ def health_check():
 # ============================================================================
 
 @app.get("/auth/user", tags=["Graph API"])
-def get_user(authorization: Optional[str] = Header(None)):
-    """Return basic user profile from Microsoft Graph."""
-    token = get_access_token(authorization)
-    response = requests.get(
-        "https://graph.microsoft.com/v1.0/me",
-        headers={"Authorization": f"Bearer {token}"},
-        timeout=10,
-    )
-    if response.status_code == 401:
-        raise HTTPException(status_code=401, detail="Invalid or expired token")
-    if not response.ok:
-        raise HTTPException(status_code=response.status_code, detail="Failed to validate token")
-    user_data = response.json()
+def get_user(user: dict = Depends(get_current_user)):
     return {
-        "id":                user_data.get("id"),
-        "displayName":       user_data.get("displayName"),
-        "mail":              user_data.get("mail"),
-        "userPrincipalName": user_data.get("userPrincipalName"),
-        "jobTitle":          user_data.get("jobTitle"),
-        "department":        user_data.get("department"),
+        "id": user["id"],
+        "displayName": user["displayName"],
+        "mail": user["email"],
+        "userPrincipalName": user["email"],
+        "role": user["role"],
     }
 
 
 @app.get("/auth/user/photo", tags=["Graph API"])
 def get_user_photo(authorization: Optional[str] = Header(None)):
-    """Proxy the user's profile photo from Microsoft Graph."""
-    token = get_access_token(authorization)
-    try:
-        photo_response = requests.get(
-            "https://graph.microsoft.com/v1.0/me/photo/$value",
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=10,
-        )
-        if photo_response.status_code == 200:
-            logger.info("Profile photo fetched successfully")
-            return StreamingResponse(BytesIO(photo_response.content), media_type="image/jpeg")
-        elif photo_response.status_code == 404:
-            raise HTTPException(status_code=404, detail="No profile photo found")
-        elif photo_response.status_code == 401:
-            raise HTTPException(status_code=401, detail="Unauthorized")
-        else:
-            raise HTTPException(status_code=photo_response.status_code, detail="Failed to fetch photo")
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Photo fetch error: {e}")
-        raise HTTPException(status_code=500, detail="Failed to fetch photo")
+    token = auth._get_access_token(authorization)
+    resp = auth.graph_get("/me/photos/96x96/$value", token)
+    if resp.status_code == 404:
+        resp = auth.graph_get("/me/photo/$value", token)
+    if resp.status_code == 404:
+        raise HTTPException(status_code=404, detail="No profile photo found")
+    if resp.status_code in (401, 403):
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    if not resp.is_success:
+        raise HTTPException(status_code=502, detail="Failed to fetch photo")
+    return Response(
+        content=resp.content,
+        media_type=resp.headers.get("content-type", "image/jpeg"),
+        headers={"Cache-Control": "private, max-age=3600"},
+    )
 
 
 @app.get("/auth/user/details", tags=["Graph API"])
 def get_user_details(authorization: Optional[str] = Header(None)):
-    """Return extended user profile fields from Microsoft Graph."""
-    token = get_access_token(authorization)
+    token = auth._get_access_token(authorization)
     fields = ",".join([
-        "id", "displayName", "mail", "userPrincipalName", "jobTitle",
-        "department", "officeLocation", "city", "country", "companyName",
-        "mobilePhone", "businessPhones", "employeeId", "employeeType",
-        "userType", "accountEnabled", "createdDateTime",
+        "id", "displayName", "mail", "userPrincipalName", "jobTitle", "department", "officeLocation", "city",
+        "country", "companyName", "mobilePhone", "businessPhones", "employeeId", "employeeType", "userType",
+        "accountEnabled", "createdDateTime",
     ])
-    response = requests.get(
-        f"https://graph.microsoft.com/v1.0/me?$select={fields}",
-        headers={"Authorization": f"Bearer {token}"},
-        timeout=10,
-    )
-    if response.status_code == 401:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    if not response.ok:
-        raise HTTPException(status_code=response.status_code, detail="Failed to fetch user details")
-    return response.json()
+    resp = auth.graph_get("/me", token, {"$select": fields})
+    if resp.status_code in (401, 403):
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    if not resp.is_success:
+        raise HTTPException(status_code=502, detail="Failed to fetch user details")
+    return resp.json()
 
 
 # ============================================================================
-# AGENT PROXY — forwards API calls from HTTPS frontend to HTTP agents
-# Prevents mixed-content errors when UI is on HTTPS but agents are on HTTP.
-#
-# Covers both EPOD and RIMDOCS agents. Each environment is a separate
-# epod_agent.py process (same agent code, own config.ini/port), even when
-# co-located with its EPOD counterpart on the same physical box — one agent
-# process can only ever run one script, so EPOD and RIMDOCS each need their
-# own instance per environment.
-#
-# Set in environment:
-#   EPOD_AGENT_DEV_URL,    EPOD_AGENT_QA_URL,    EPOD_AGENT_PROD_URL
-#   RIMDOCS_AGENT_DEV_URL, RIMDOCS_AGENT_QA_URL, RIMDOCS_AGENT_PROD_URL
-#   RIMDOCS_AGENT_DEV1_URL, RIMDOCS_AGENT_DEV2_URL,
-#   RIMDOCS_AGENT_QA2_URL,  RIMDOCS_AGENT_PROD2_URL   (Linux pipeline boxes)
+# AGENT PROXY
 # ============================================================================
 
-import os
-from fastapi import Request
-from fastapi.responses import Response as FastAPIResponse, StreamingResponse as FastAPIStreamingResponse
-import httpx
+async def _proxy_agent(request: Request, prefix: str, path: str):
+    agent = AGENTS[prefix]
+    user = await run_in_threadpool(resolve_user, request.headers.get("authorization"))
+    sub = "/" + path.strip("/")
+    method = request.method
 
-_AGENT_TLS_VERIFY = os.getenv("AGENT_TLS_VERIFY", "true").strip().lower() not in ("false", "0", "no")
-
-_agent_client = httpx.AsyncClient(
-    verify=_AGENT_TLS_VERIFY,
-    follow_redirects=True,
-    timeout=10,
-    limits=httpx.Limits(max_keepalive_connections=0),
-)
-
-# Actions that stop/restart a running extraction pipeline — gated behind a
-# permission, not just "any authenticated user". Mapped from the proxy
-# prefix (e.g. "epod-prod") to the permission key in rbac.py.
-_STOP_PERMISSIONS = {
-    "epod-dev": "stopScriptDev", "epod-qa": "stopScriptQA", "epod-prod": "stopScriptProd",
-    "rimdocs-dev": "stopScriptRimdocsDev", "rimdocs-qa": "stopScriptRimdocsQA",
-    "rimdocs-prod": "stopScriptRimdocsProd",
-    "rimdocs-dev1": "stopScriptRimdocsDev1", "rimdocs-dev2": "stopScriptRimdocsDev2",
-    "rimdocs-qa2": "stopScriptRimdocsQA2", "rimdocs-prod2": "stopScriptRimdocsProd2",
-}
-_MUTATING_AGENT_PATHS = ("/start", "/stop", "/clear-terminal")
-_AGENT_TOKENS = {
-    "epod-dev":      os.getenv("EPOD_AGENT_DEV_TOKEN",      ""),
-    "epod-qa":       os.getenv("EPOD_AGENT_QA_TOKEN",       ""),
-    "epod-prod":     os.getenv("EPOD_AGENT_PROD_TOKEN",     ""),
-    "rimdocs-dev":   os.getenv("RIMDOCS_AGENT_DEV_TOKEN",   ""),
-    "rimdocs-qa":    os.getenv("RIMDOCS_AGENT_QA_TOKEN",    ""),
-    "rimdocs-prod":  os.getenv("RIMDOCS_AGENT_PROD_TOKEN",  ""),
-    "rimdocs-dev1":  os.getenv("RIMDOCS_AGENT_DEV1_TOKEN",  ""),
-    "rimdocs-dev2":  os.getenv("RIMDOCS_AGENT_DEV2_TOKEN",  ""),
-    "rimdocs-qa2":   os.getenv("RIMDOCS_AGENT_QA2_TOKEN",   ""),
-    "rimdocs-prod2": os.getenv("RIMDOCS_AGENT_PROD2_TOKEN", ""),
-}
-
-
-def _authenticate_proxy_request(request: Request, prefix: str) -> dict:
-    authorization = request.headers.get("authorization")
-    if not authorization:
-        qs_token = request.query_params.get("access_token")
-        if qs_token:
-            authorization = f"Bearer {qs_token}"
-    user = get_current_user(authorization=authorization)
-
-    sub_path = "/" + "/".join(request.url.path.lstrip("/").split("/")[1:])
-    if request.method == "POST" and any(sub_path.startswith(p) for p in _MUTATING_AGENT_PATHS):
-        perm = _STOP_PERMISSIONS.get(prefix)
-        if perm and not rbac.has_permission(user["role"], perm):
-            raise HTTPException(status_code=403, detail=f"Missing permission: {perm}")
-    return user
-
-@app.on_event("shutdown")
-async def _close_agent_client():
-    await _agent_client.aclose()
-
-# route prefix → backing agent URL (env var resolved at import time)
-_AGENT_PROXIES = {
-    "epod-dev":      os.getenv("EPOD_AGENT_DEV_URL",      ""),
-    "epod-qa":       os.getenv("EPOD_AGENT_QA_URL",       ""),
-    "epod-prod":     os.getenv("EPOD_AGENT_PROD_URL",     ""),
-    "rimdocs-dev":   os.getenv("RIMDOCS_AGENT_DEV_URL",   ""),
-    "rimdocs-qa":    os.getenv("RIMDOCS_AGENT_QA_URL",    ""),
-    "rimdocs-prod":  os.getenv("RIMDOCS_AGENT_PROD_URL",  ""),
-    "rimdocs-dev1":  os.getenv("RIMDOCS_AGENT_DEV1_URL",  ""),
-    "rimdocs-dev2":  os.getenv("RIMDOCS_AGENT_DEV2_URL",  ""),
-    "rimdocs-qa2":   os.getenv("RIMDOCS_AGENT_QA2_URL",   ""),
-    "rimdocs-prod2": os.getenv("RIMDOCS_AGENT_PROD2_URL", ""),
-}
-
-_HOP_BY_HOP = {"host", "connection", "transfer-encoding", "te", "trailer", "upgrade", "keep-alive"}
-
-
-async def _proxy_request_with_retry(method: str, target: str, headers: dict, body: bytes):
-    """
-    GET requests to agents get up to 3 attempts with short backoff between
-    them (0.3s, 0.8s) instead of one instant retry. An instant retry doesn't
-    help when the underlying blip is a network-level burst rather than a
-    single stale connection — measured in practice: failures here weren't
-    independent random events, they were clustering together, so a retry
-    fired milliseconds later just failed again for the same reason.
-    POST (/start, /stop) never retries — can't tell whether the agent
-    already received and acted on the request before the connection failed.
-    """
-    delays = (0, 0.3, 0.8)
-    last_exc = None
-    for attempt, delay in enumerate(delays):
-        if delay:
-            await asyncio.sleep(delay)
-        try:
-            resp = await _agent_client.request(method=method, url=target, headers=headers, content=body)
-            if attempt > 0:
-                logger.info(f"[AgentProxy] {target} recovered on attempt {attempt + 1}")
-            return resp
-        except httpx.TransportError as e:
-            last_exc = e
-            if method != "GET":
-                logger.warning(f"[AgentProxy] {target} {e.__class__.__name__} on {method}, not retrying")
-                raise HTTPException(status_code=502, detail=f"Agent did not respond: {e.__class__.__name__}")
-            logger.info(f"[AgentProxy] {target} {e.__class__.__name__} on GET, attempt {attempt + 1}/{len(delays)}")
-
-    logger.warning(f"[AgentProxy] {target} unreachable after {len(delays)} attempts: {last_exc}")
-    raise HTTPException(status_code=502, detail=f"Agent did not respond: {last_exc.__class__.__name__}")
-
-
-async def _proxy_agent(request: Request, base_url: str, prefix: str) -> FastAPIResponse:
-    # Authenticate before anything else — including before revealing
-    # whether this environment even has an agent configured.
-    _authenticate_proxy_request(request, prefix)
-
-    if not base_url:
-        raise HTTPException(status_code=503, detail="Agent URL not configured")
-
-    # Strip the /epod-qa, /rimdocs-prod, etc. prefix to get the actual agent path
-    path    = "/" + "/".join(request.url.path.lstrip("/").split("/")[1:])
-    target  = base_url.rstrip("/") + path
-    if request.url.query:
-        target += "?" + request.url.query
-
-    headers = {k: v for k, v in request.headers.items() if k.lower() not in _HOP_BY_HOP}
-    headers["host"] = httpx.URL(base_url).host
-    agent_token = _AGENT_TOKENS.get(prefix)
-    if agent_token:
-        headers["authorization"] = f"Bearer {agent_token}"
+    if method == "GET" and sub in _AGENT_READ_PATHS:
+        needed = agent["view"]
+    elif method == "POST" and sub in _AGENT_WRITE_PATHS:
+        needed = agent["control"]
     else:
-        headers.pop("authorization", None)
-        logger.warning(f"[AgentProxy] No shared token configured for '{prefix}' — "
-                        f"agent must be configured to allow unauthenticated calls, which is not recommended.")
+        raise HTTPException(status_code=404, detail="Not found")
+    if not rbac.has_permission(user["role"], needed):
+        raise HTTPException(status_code=403, detail=f"Missing permission: {needed}")
+    if not agent["url"]:
+        raise HTTPException(status_code=503, detail="Agent not configured for this environment")
 
-    # SSE streaming — use a streaming response
-    if "text/event-stream" in request.headers.get("accept", ""):
-        async def sse_generator():
-            async with httpx.AsyncClient(verify=_AGENT_TLS_VERIFY, timeout=None) as client:
-                async with client.stream("GET", target, headers=headers) as resp:
-                    async for chunk in resp.aiter_bytes():
-                        yield chunk
-        return FastAPIStreamingResponse(sse_generator(), media_type="text/event-stream")
+    target = agent["url"] + sub
+    params = {k: v for k, v in request.query_params.items() if k == "n"}
+    headers = {"Accept": request.headers.get("accept", "application/json")}
+    if agent["token"]:
+        headers["Authorization"] = f"Bearer {agent['token']}"
 
-    # Regular request
-    body = await request.body()
-    resp = await _proxy_request_with_retry(request.method, target, headers, body)
+    if sub == "/terminal/stream":
+        return await _proxy_stream(target, params, headers, prefix)
 
-    resp_headers = {k: v for k, v in resp.headers.items() if k.lower() not in _HOP_BY_HOP}
-    return FastAPIResponse(
+    attempts = 3 if method == "GET" else 1
+    last_exc: Optional[Exception] = None
+    resp = None
+    for attempt in range(attempts):
+        try:
+            resp = await _agent_client.request(method, target, params=params, headers=headers)
+            break
+        except httpx.TransportError as exc:
+            last_exc = exc
+            if attempt + 1 < attempts:
+                await asyncio.sleep((0.3, 0.8)[attempt])
+    if resp is None:
+        logger.warning("[AgentProxy] %s %s unreachable: %s", prefix, sub, last_exc.__class__.__name__)
+        raise HTTPException(status_code=502, detail="Agent did not respond")
+
+    if method == "POST":
+        outcome = "succeeded" if resp.is_success else f"failed ({resp.status_code})"
+        await run_in_threadpool(
+            write_audit_event, "pipeline_action", user["email"], prefix,
+            f"{sub.lstrip('/').replace('-', ' ').capitalize()} on {prefix.upper()} {outcome}", client_ip(request),
+        )
+
+    return Response(
         content=resp.content,
         status_code=resp.status_code,
-        headers=resp_headers,
-        media_type=resp.headers.get("content-type"),
+        media_type=resp.headers.get("content-type", "application/json"),
+        headers={"Cache-Control": "no-store"},
     )
 
 
-def _register_agent_proxy(prefix: str, base_url: str) -> None:
-    """Registers one /{prefix}/{path:path} route forwarding to base_url."""
+async def _proxy_stream(target: str, params: Dict, headers: Dict, prefix: str):
+    headers = {**headers, "Accept": "text/event-stream"}
+    try:
+        upstream = await _agent_stream_client.send(
+            _agent_stream_client.build_request("GET", target, params=params, headers=headers), stream=True
+        )
+    except httpx.TransportError as exc:
+        logger.warning("[AgentProxy] %s stream unreachable: %s", prefix, exc.__class__.__name__)
+        raise HTTPException(status_code=502, detail="Agent did not respond")
+    if upstream.status_code != 200:
+        body = await upstream.aread()
+        await upstream.aclose()
+        return Response(content=body, status_code=upstream.status_code,
+                        media_type=upstream.headers.get("content-type", "application/json"))
+
+    async def relay():
+        try:
+            async for chunk in upstream.aiter_raw():
+                yield chunk
+        except httpx.HTTPError:
+            return
+        finally:
+            await upstream.aclose()
+
+    return StreamingResponse(
+        relay(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
+    )
+
+
+def _register_agent_proxy(prefix: str) -> None:
     async def _handler(request: Request, path: str):
-        return await _proxy_agent(request, base_url, prefix)
+        return await _proxy_agent(request, prefix, path)
+
     _handler.__name__ = f"proxy_{prefix.replace('-', '_')}"
-    app.add_api_route(
-        f"/{prefix}/{{path:path}}",
-        _handler,
-        methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD"],
-        tags=["Agent Proxy"],
-    )
+    app.add_api_route(f"/{prefix}/{{path:path}}", _handler, methods=["GET", "POST"], tags=["Agent Proxy"])
 
 
-for _prefix, _url in _AGENT_PROXIES.items():
-    _register_agent_proxy(_prefix, _url)
+for _prefix in AGENTS:
+    _register_agent_proxy(_prefix)
 
+
+@app.get("/api/agents", tags=["Agent Proxy"])
+def list_agents(user: dict = Depends(get_current_user)):
+    perms = rbac.permissions_for(user["role"])
+    return {
+        "agents": [
+            {"id": p, "configured": bool(a["url"]), "can_view": perms.get(a["view"], False),
+             "can_control": perms.get(a["control"], False)}
+            for p, a in AGENTS.items() if perms.get(a["view"], False)
+        ]
+    }
+
+
+# ============================================================================
+# RBAC
+# ============================================================================
 
 class RoleDefinition(BaseModel):
-    name: str
-    description: Optional[str] = ""
-    color: Optional[str] = "#0f68b2"
-    permissions: dict
+    name: str = Field(..., max_length=64)
+    description: Optional[str] = Field("", max_length=256)
+    color: Optional[str] = Field("#0f68b2", max_length=7)
+    permissions: Dict[str, bool] = Field(default_factory=dict)
 
 
 class UserAssignment(BaseModel):
-    user_email: str
-    role_name: str
+    user_email: str = Field(..., max_length=254)
+    role_name: str = Field(..., max_length=48)
 
 
-@app.get("/api/rbac/config", tags=["RBAC"], dependencies=[Depends(get_current_user)])
-def get_rbac_config():
-    """Return current RBAC config — custom roles and per-user overrides."""
-    config = rbac.load_rbac_config()
-    return {"success": True, "config": config}
+def _bad_request(exc: rbac.RBACValidationError):
+    return HTTPException(status_code=422, detail=str(exc))
+
+
+def _role_diff(before: Optional[Dict], after: Dict, verb: str) -> str:
+    if not before:
+        return f"{verb} role '{after['name']}'"
+    changes = []
+    if before.get("name") != after.get("name"):
+        changes.append(f'name "{before.get("name")}" → "{after.get("name")}"')
+    if (before.get("description") or "") != (after.get("description") or ""):
+        changes.append("description changed")
+    if (before.get("color") or "").lower() != (after.get("color") or "").lower():
+        changes.append(f"color {before.get('color')} → {after.get('color')}")
+    labels = rbac.PERMISSION_LABELS
+    perm_changes = [
+        f"{labels[k]} {'enabled' if after['permissions'].get(k) else 'disabled'}"
+        for k in rbac.ALL_PERMISSIONS
+        if bool(before.get("permissions", {}).get(k)) != bool(after["permissions"].get(k))
+    ]
+    if perm_changes:
+        changes.append("permissions: " + ", ".join(perm_changes))
+    return f"{verb} role '{after['name']}'" + (f" — {'; '.join(changes)}" if changes else " (no changes)")
+
+
+@app.get("/api/rbac/me", tags=["RBAC"])
+def rbac_me(user: dict = Depends(get_current_user)):
+    roles = rbac.get_all_roles()
+    role_def = roles.get(user["role"], rbac.ROLE_DEFINITIONS["viewer"])
+    return {
+        "email": user["email"],
+        "displayName": user["displayName"],
+        "role": user["role"],
+        "role_name": role_def["name"],
+        "role_color": role_def["color"],
+        "permissions": role_def["permissions"],
+    }
+
+
+@app.get("/api/rbac/config", tags=["RBAC"])
+def get_rbac_config(user: dict = Depends(require_permission("viewUserManagement"))):
+    config = rbac.store.load()
+    return {
+        "success": True,
+        "config": {
+            "roles": rbac.get_all_roles(config),
+            "builtin_roles": rbac.ROLE_DEFINITIONS,
+            "builtin_role_ids": list(rbac.BUILTIN_ROLE_IDS),
+            "custom_roles": config["custom_roles"],
+            "user_role_overrides": config["user_role_overrides"],
+            "ad_group_roles": rbac.AD_GROUP_ROLES,
+            "permission_catalog": rbac.PERMISSION_CATALOG,
+            "admin_locked_permissions": list(rbac.ADMIN_LOCKED_PERMISSIONS),
+        },
+    }
 
 
 @app.post("/api/rbac/roles", tags=["RBAC"])
 def create_role(
-    role_id: str = Body(...),
+    request: Request,
+    role_id: str = Body(..., max_length=48),
     role_definition: RoleDefinition = Body(...),
     user: dict = Depends(require_permission("manageRoles")),
 ):
-    """Create a new custom role. Requires manageRoles permission."""
-    config = rbac.load_rbac_config()
-    if role_id in config.get("custom_roles", {}):
-        raise HTTPException(status_code=400, detail=f"Role '{role_id}' already exists")
-    config.setdefault("custom_roles", {})[role_id] = role_definition.dict()
-    rbac.save_rbac_config(config)
+    if role_id in rbac.BUILTIN_ROLE_IDS:
+        raise HTTPException(status_code=409, detail=f"Role '{role_id}' already exists")
+    try:
+        rbac.validate_role_id(role_id)
+        role = rbac.validate_role_definition(role_id, role_definition.model_dump())
+    except rbac.RBACValidationError as exc:
+        raise _bad_request(exc)
+
+    def apply(config):
+        if role_id in config["custom_roles"] or role_id in rbac.BUILTIN_ROLE_IDS:
+            raise HTTPException(status_code=409, detail=f"Role '{role_id}' already exists")
+        config["custom_roles"][role_id] = role
+
+    rbac.store.mutate(apply)
     write_audit_event("role_created", user["email"], target=role_id,
-                      details=f"Created custom role '{role_definition.name}'")
-    return {"success": True, "role_id": role_id}
+                      details=f"Created custom role '{role['name']}'", ip_address=client_ip(request))
+    return {"success": True, "role_id": role_id, "role": role}
 
 
 @app.put("/api/rbac/roles/{role_id}", tags=["RBAC"])
 def update_role(
     role_id: str,
-    role_definition: RoleDefinition = Body(...),
-    changes_summary: Optional[str] = Body(None),
+    request: Request,
+    role_definition: RoleDefinition = Body(..., embed=True),
     user: dict = Depends(require_permission("manageRoles")),
 ):
-    """Update an existing custom role. Requires manageRoles permission."""
-    config = rbac.load_rbac_config()
-    config.setdefault("custom_roles", {})[role_id] = role_definition.dict()
-    rbac.save_rbac_config(config)
-    details = changes_summary or f"Updated role '{role_definition.name}'"
-    write_audit_event("role_updated", user["email"], target=role_id, details=details)
-    return {"success": True, "role_id": role_id}
+    try:
+        role = rbac.validate_role_definition(role_id, role_definition.model_dump())
+    except rbac.RBACValidationError as exc:
+        raise _bad_request(exc)
+
+    def apply(config):
+        if role_id not in config["custom_roles"] and role_id not in rbac.BUILTIN_ROLE_IDS:
+            raise HTTPException(status_code=404, detail=f"Role '{role_id}' not found")
+        before = rbac.get_all_roles(config).get(role_id)
+        config["custom_roles"][role_id] = role
+        return before
+
+    before = rbac.store.mutate(apply)
+    write_audit_event("role_updated", user["email"], target=role_id,
+                      details=_role_diff(before, role, "Updated"), ip_address=client_ip(request))
+    return {"success": True, "role_id": role_id, "role": role}
 
 
 @app.delete("/api/rbac/roles/{role_id}", tags=["RBAC"])
 def delete_role(
     role_id: str,
+    request: Request,
     reset: bool = Query(False),
-    changes_summary: Optional[str] = Query(None),
     user: dict = Depends(require_permission("manageRoles")),
 ):
-    """Delete a custom role and remove any user overrides pointing to it.
+    is_builtin = role_id in rbac.BUILTIN_ROLE_IDS
 
-    When `reset=true`, this is a "reset to default" action (removing the
-    custom override so the role reverts to its built-in definition), so it
-    is audit-logged as `role_reset` instead of `role_deleted`.
-    """
-    config = rbac.load_rbac_config()
-    custom_roles = config.get("custom_roles", {})
-    if role_id not in custom_roles:
-        raise HTTPException(status_code=404, detail=f"Custom role '{role_id}' not found")
-    del custom_roles[role_id]
-    overrides = config.get("user_role_overrides", {})
-    config["user_role_overrides"] = {k: v for k, v in overrides.items() if v != role_id}
-    rbac.save_rbac_config(config)
-    if reset:
-        details = changes_summary or f"Reset role '{role_id}' to default settings"
-        write_audit_event("role_reset", user["email"], target=role_id, details=details)
+    def apply(config):
+        if role_id not in config["custom_roles"]:
+            raise HTTPException(status_code=404, detail=f"No custom definition for role '{role_id}'")
+        before = config["custom_roles"].pop(role_id)
+        removed = []
+        if not is_builtin:
+            removed = [e for e, r in config["user_role_overrides"].items() if r == role_id]
+            for e in removed:
+                del config["user_role_overrides"][e]
+        return before, removed
+
+    before, removed = rbac.store.mutate(apply)
+    if is_builtin:
+        write_audit_event("role_reset", user["email"], target=role_id,
+                          details=_role_diff(before, rbac.ROLE_DEFINITIONS[role_id], "Reset"),
+                          ip_address=client_ip(request))
     else:
-        write_audit_event("role_deleted", user["email"], target=role_id,
-                          details=f"Deleted custom role '{role_id}'")
-    return {"success": True}
+        detail = f"Deleted custom role '{before['name']}'"
+        if removed:
+            detail += f"; removed from {len(removed)} user(s)"
+        write_audit_event("role_deleted", user["email"], target=role_id, details=detail, ip_address=client_ip(request))
+    return {"success": True, "reset": is_builtin or reset, "removed_assignments": removed}
 
 
 @app.post("/api/rbac/user-assignments", tags=["RBAC"])
-def assign_role(
-    assignment: UserAssignment,
-    user: dict = Depends(require_permission("manageUsers")),
-):
-    """Assign a role override to a specific user. Requires manageUsers permission."""
-    config = rbac.load_rbac_config()
-    config.setdefault("user_role_overrides", {})[assignment.user_email.lower()] = assignment.role_name
-    rbac.save_rbac_config(config)
-    write_audit_event("role_assigned", user["email"],
-                      target=assignment.user_email,
-                      details=f"Assigned role '{assignment.role_name}'")
-    return {"success": True}
+def assign_role(assignment: UserAssignment, request: Request, user: dict = Depends(require_permission("manageUsers"))):
+    try:
+        email = rbac.validate_email(assignment.user_email)
+    except rbac.RBACValidationError as exc:
+        raise _bad_request(exc)
+    role_id = assignment.role_name
+
+    def apply(config):
+        if role_id not in rbac.get_all_roles(config):
+            raise HTTPException(status_code=422, detail=f"Unknown role '{role_id}'")
+        previous = config["user_role_overrides"].get(email)
+        config["user_role_overrides"][email] = role_id
+        return previous
+
+    previous = rbac.store.mutate(apply)
+    detail = f"Assigned role '{role_id}'" + (f" (was '{previous}')" if previous and previous != role_id else "")
+    write_audit_event("role_assigned", user["email"], target=email, details=detail, ip_address=client_ip(request))
+    return {"success": True, "user_email": email, "role_name": role_id}
 
 
 @app.delete("/api/rbac/user-assignments/{user_email}", tags=["RBAC"])
-def remove_role_assignment(
-    user_email: str,
-    user: dict = Depends(require_permission("manageUsers")),
-):
-    """Remove a manual role override from a user. Requires manageUsers permission."""
-    config = rbac.load_rbac_config()
-    overrides = config.get("user_role_overrides", {})
-    if user_email.lower() not in overrides:
-        raise HTTPException(status_code=404, detail="No role override found for this user")
-    del overrides[user_email.lower()]
-    rbac.save_rbac_config(config)
-    write_audit_event("role_removed", user["email"],
-                      target=user_email,
-                      details="Removed manual role override")
+def remove_role_assignment(user_email: str, request: Request, user: dict = Depends(require_permission("manageUsers"))):
+    email = user_email.strip().lower()
+
+    def apply(config):
+        if email not in config["user_role_overrides"]:
+            raise HTTPException(status_code=404, detail="No role override found for this user")
+        return config["user_role_overrides"].pop(email)
+
+    previous = rbac.store.mutate(apply)
+    write_audit_event("role_removed", user["email"], target=email,
+                      details=f"Removed manual role override '{previous}'", ip_address=client_ip(request))
     return {"success": True}

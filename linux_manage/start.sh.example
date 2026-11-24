@@ -1,79 +1,56 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -euo pipefail
 
-USER="sa-prd-rdi-react-<>"
-PY_SYSTEM="python3.13"
-VENV_DIR="/home/$USER/monitoring/backend/venv"
-DIR="/home/$USER/monitoring/linux_manage"
-REQUIREMENTS="$DIR/requirements.txt"
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PY_SYSTEM="${PYTHON_BIN:-python3}"
+VENV_DIR="$DIR/venv"
+PY="$VENV_DIR/bin/python"
 LOG="$DIR/manager.log"
 PID_FILE="$DIR/manager.pid"
-PORT=8001
-STARTUP_TIMEOUT=12
+CONFIG="$DIR/config.ini"
+STARTUP_TIMEOUT=20
 
-# ── 1. Ensure venv exists ─────────────────────────────────────────────────────
-if [ ! -f "$VENV_DIR/bin/python" ]; then
-    echo "Virtual environment not found at $VENV_DIR — creating..."
-    $PY_SYSTEM -m venv "$VENV_DIR"
-    if [ $? -ne 0 ]; then
-        echo "FAILED: Could not create virtual environment."
-        exit 1
-    fi
-    echo "Virtual environment created."
+[ -f "$CONFIG" ] || { echo "FAILED: $CONFIG not found"; exit 1; }
+PORT="$(awk -F= '/^\[manager\]/{s=1;next} /^\[/{s=0} s && $1 ~ /^[[:space:]]*port[[:space:]]*$/ {gsub(/[[:space:]]/,"",$2); print $2; exit}' "$CONFIG")"
+PORT="${PORT:-8001}"
+SCHEME=http
+grep -qE '^[[:space:]]*certfile[[:space:]]*=[[:space:]]*[^[:space:]]' "$CONFIG" && SCHEME=https
+
+if [ ! -x "$PY" ]; then
+    echo "Creating virtual environment..."
+    "$PY_SYSTEM" -m venv "$VENV_DIR"
 fi
+echo "Installing requirements..."
+"$PY" -m pip install -q --disable-pip-version-check -r "$DIR/requirements.txt"
 
-PY="$VENV_DIR/bin/python"
-PIP="$VENV_DIR/bin/pip"
-
-# ── 2. Install / sync requirements ───────────────────────────────────────────
-if [ -f "$REQUIREMENTS" ]; then
-    echo "Installing requirements..."
-    "$PIP" install -q -r "$REQUIREMENTS"
-    if [ $? -ne 0 ]; then
-        echo "FAILED: pip install failed. Check $REQUIREMENTS."
-        exit 1
-    fi
-    echo "Requirements installed."
-else
-    echo "WARNING: $REQUIREMENTS not found — skipping pip install."
+if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+    echo "Stopping existing manager (PID $(cat "$PID_FILE"))..."
+    kill "$(cat "$PID_FILE")" || true
+    for _ in $(seq 1 10); do kill -0 "$(cat "$PID_FILE")" 2>/dev/null || break; sleep 1; done
 fi
+rm -f "$PID_FILE"
 
-# ── 3. Kill any existing instance ─────────────────────────────────────────────
-if [ -f "$PID_FILE" ]; then
-    OLD_PID=$(cat "$PID_FILE")
-    if kill -0 "$OLD_PID" 2>/dev/null; then
-        echo "Stopping existing manager (PID $OLD_PID)..."
-        kill "$OLD_PID"
-        sleep 1
-    fi
-    rm -f "$PID_FILE"
-fi
-
-# ── 4. Start manage.py ────────────────────────────────────────────────────────
-echo "Starting manager..."
-nohup "$PY" "$DIR/manage.py" > "$LOG" 2>&1 &
+echo "Starting manager on :$PORT..."
+nohup "$PY" "$DIR/manage.py" >> "$LOG" 2>&1 &
 MANAGER_PID=$!
-echo $MANAGER_PID > "$PID_FILE"
+echo "$MANAGER_PID" > "$PID_FILE"
 
-# ── 5. Verify startup ─────────────────────────────────────────────────────────
-echo "Waiting for manager to start on :$PORT..."
-for i in $(seq 1 $STARTUP_TIMEOUT); do
+for _ in $(seq 1 "$STARTUP_TIMEOUT"); do
     sleep 1
-    if curl -sfk "https://localhost:$PORT/health" > /dev/null 2>&1; then
-        echo "SUCCESS: Manager started on :$PORT (PID $MANAGER_PID)"
+    if curl -sfk "$SCHEME://localhost:$PORT/health" > /dev/null 2>&1; then
+        echo "SUCCESS: manager running on :$PORT (PID $MANAGER_PID)"
         exit 0
     fi
     if ! kill -0 "$MANAGER_PID" 2>/dev/null; then
-        echo "FAILED: Manager process exited unexpectedly."
-        echo "--- Last 20 lines of $LOG ---"
+        echo "FAILED: manager exited. Last log lines:"
         tail -20 "$LOG"
         rm -f "$PID_FILE"
         exit 1
     fi
 done
 
-echo "FAILED: Manager did not respond on :$PORT within ${STARTUP_TIMEOUT}s."
-echo "--- Last 20 lines of $LOG ---"
+echo "FAILED: manager did not respond on :$PORT within ${STARTUP_TIMEOUT}s."
 tail -20 "$LOG"
-kill "$MANAGER_PID" 2>/dev/null
+kill "$MANAGER_PID" 2>/dev/null || true
 rm -f "$PID_FILE"
 exit 1

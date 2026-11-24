@@ -1,723 +1,342 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { Suspense, lazy, useCallback, useEffect, useRef, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { useRBAC } from '../context/RBACContext';
-import playIcon from '/icons/JJ_Icon_Video_Play_RGB.svg';
-import closeIcon        from '/icons/JJ_Icon_Close.svg';
-import refreshIcon        from '/icons/JJ_Icon_Refresh_RGB.svg';
-import restartIcon        from '/icons/JJ_Icon_Refresh_Sync_RGB.svg';
-import gearIcon         from '/icons/JJ_Icon_Alert_RGB.svg';
-import terminalIcon           from '/icons/JJ_Icon_Application_On_Computer_RGB.svg';
-import backendIcon      from '/icons/JJ_Icon_Application_On_Computer_RGB.svg';
-import frontendIcon     from '/icons/JJ_Icon_Globe_RGB.svg';
-import chevronDownIcon  from '/icons/JJ_Icon_Chevron_Down.svg';
-import Terminal from './Terminal';
-import { absoluteApiFetch } from '../utils/apiClient';
+import { useAuth } from '../context/AuthContext';
+import { ApiError, requestJson } from '../utils/apiClient';
+import { logAuditEvent } from '../utils/auditLog';
+import {
+  Alert, Badge, Button, Dot, EmptyState, Icon, Menu, MenuItem, Page, PageHeader, ProgressBar, Tabs, cx, useFeedback, usePolling,
+} from '../components/ui';
 
-const LEGACY_URL = import.meta.env.VITE_MANAGE_API_URL ?? '';
+const Terminal = lazy(() => import('./Terminal'));
 
+const LEGACY_URL = import.meta.env.VITE_MANAGE_API_URL || '';
 const SERVERS = [
-  { id: 'dev',  label: 'DEV',  alias: 'SmartHub DEV',  permission: 'viewServerManagerDev',  terminalPermission: 'adminAccessDev',  url: import.meta.env.VITE_MANAGE_API_DEV_URL  || LEGACY_URL },
-  { id: 'qa',   label: 'QA',   alias: 'SmartHub QA',   permission: 'viewServerManagerQA',   terminalPermission: 'adminAccessQA',   url: import.meta.env.VITE_MANAGE_API_QA_URL   || LEGACY_URL },
-  { id: 'prod', label: 'PROD', alias: 'SmartHub PROD', permission: 'viewServerManagerProd', terminalPermission: 'adminAccessProd', url: import.meta.env.VITE_MANAGE_API_PROD_URL || LEGACY_URL },
-  { id: 'poc',  label: 'POC',  alias: 'SmartHub POC',  permission: 'viewServerManagerPOC',  terminalPermission: 'adminAccessPOC',  url: import.meta.env.VITE_MANAGE_API_POC_URL  || LEGACY_URL },
-].filter(s => s.url); // hide tabs whose URL isn't configured
+  { id: 'dev', label: 'DEV', alias: 'SmartHub DEV', permission: 'viewServerManagerDev', admin: 'adminAccessDev', url: import.meta.env.VITE_MANAGE_API_DEV_URL || LEGACY_URL },
+  { id: 'qa', label: 'QA', alias: 'SmartHub QA', permission: 'viewServerManagerQA', admin: 'adminAccessQA', url: import.meta.env.VITE_MANAGE_API_QA_URL || LEGACY_URL },
+  { id: 'prod', label: 'PROD', alias: 'SmartHub PROD', permission: 'viewServerManagerProd', admin: 'adminAccessProd', url: import.meta.env.VITE_MANAGE_API_PROD_URL || LEGACY_URL },
+  { id: 'poc', label: 'POC', alias: 'SmartHub POC', permission: 'viewServerManagerPOC', admin: 'adminAccessPOC', url: import.meta.env.VITE_MANAGE_API_POC_URL || LEGACY_URL },
+].filter((s) => s.url).map((s) => ({ ...s, url: s.url.replace(/\/$/, '') }));
 
-const SERVICES   = ['backend', 'frontend'];
+const SERVICES = [
+  { id: 'backend', label: 'Backend API', icon: 'server' },
+  { id: 'frontend', label: 'Frontend app', icon: 'globe' },
+];
 const REFRESH_MS = 30_000;
-
-const cx = (...args) => args.filter(Boolean).join(' ');
-
-const F_WHITE = 'brightness(0) invert(1)';
-const F_GRAY  = 'brightness(0) saturate(100%) invert(65%) sepia(6%) saturate(556%) hue-rotate(346deg) brightness(92%) contrast(88%)';
-const F_RED   = 'brightness(0) saturate(100%) invert(17%) sepia(100%) saturate(7426%) hue-rotate(3deg) brightness(92%) contrast(118%)';
-
-const lineClass = (line, ok) => {
-  const l = line.toLowerCase();
-  if (l.includes('error')) return 'text-jj-red';
-  if (l.includes('warn'))  return 'text-jj-orange-03';
-  return ok ? 'text-jj-green-03' : 'text-jj-red';
+const STATE = {
+  running: { label: 'Running', color: '#328714', tone: 'success' },
+  stopped: { label: 'Stopped', color: '#857a73', tone: 'neutral' },
+  partial: { label: 'Partially running', color: '#c4a000', tone: 'warning' },
+  error: { label: 'Unreachable', color: '#eb1700', tone: 'danger' },
+  forbidden: { label: 'No access', color: '#eb1700', tone: 'danger' },
+  loading: { label: 'Checking…', color: '#cbc4bc', tone: 'neutral' },
 };
 
-// Note: 'stopped' now reads as neutral (intentionally off) rather than an
-// alarm color — only 'error' (crashed/unreachable) is red. Ring/glow drive
-// the circular status indicator on each service card.
-const statusColors = {
-  running: { card: 'border-l-4 border-l-jj-green-03', badge: 'bg-jj-gray-01 text-jj-green-03 border-jj-green-03', dot: 'bg-jj-green-03 animate-pulse', ring: 'border-jj-green-03', text: 'text-jj-green-03', glow: '#328714' },
-  stopped: { card: 'border-l-4 border-l-jj-gray-04',  badge: 'bg-jj-gray-01 text-jj-gray-05 border-jj-gray-04',  dot: 'bg-jj-gray-05',                ring: 'border-jj-gray-04', text: 'text-jj-gray-05', glow: '#a39992' },
-  error:   { card: 'border-l-4 border-l-jj-red',      badge: 'bg-jj-gray-01 text-jj-red border-jj-red',           dot: 'bg-jj-red',                    ring: 'border-jj-red',     text: 'text-jj-red',     glow: '#eb1700' },
-  loading: { card: 'border-l-4 border-l-jj-gray-04',  badge: 'bg-jj-gray-01 text-jj-gray-05 border-jj-gray-03',   dot: 'bg-jj-gray-04',                ring: 'border-jj-gray-03', text: 'text-jj-gray-05', glow: '#cbc4bc' },
-};
+const describeError = (e) => (e instanceof ApiError && e.status === 403
+  ? 'This server only accepts members of its admin AD group.'
+  : e?.message || 'Request failed');
 
-const svcMeta = {
-  backend:  { label: 'Backend API',  icon: backendIcon  },
-  frontend: { label: 'Frontend App', icon: frontendIcon },
-};
-
-const extractPid = (out = '') => { const m = out.match(/\(PID\s+(\d+)\)/i); return m ? m[1] : '—'; };
-
-
-// ─────────────────────────────────────────────────────────────────────────────
-// TAB WRAPPER — default export
-// ─────────────────────────────────────────────────────────────────────────────
-export default function ServerManagerTabs() {
-  const [searchParams, setSearchParams] = useSearchParams();
-  const { hasPermission } = useRBAC();
-
-  // Only show tabs the user has permission for AND whose URL is configured
-  const visibleServers = SERVERS.filter(s => hasPermission(s.permission));
-  const serverKey = visibleServers.map(s => `${s.id}:${s.url}`).join('|');
-
-  const validIds = visibleServers.map(s => s.id);
-  const activeId = validIds.includes(searchParams.get('server'))
-    ? searchParams.get('server')
-    : visibleServers[0]?.id ?? '';
-
-  const handleTabChange = (id) => {
-    if (id === activeId) return;
-    setSearchParams(p => { const n = new URLSearchParams(p); n.set('server', id); return n; });
-  };
-
-  // Background health check across ALL configured environments (not just the
-  // active one) so the tab pills can show a live status dot. Best-effort —
-  // an unreachable environment just reads as its 'error' color.
-  const [envHealth, setEnvHealth] = useState({});
-  useEffect(() => {
-    if (!serverKey) return;
-    let cancelled = false;
-    const checkAll = async () => {
-      const entries = await Promise.all(visibleServers.map(async s => {
-        try {
-          const results = await Promise.all(
-            SERVICES.map(svc => absoluteApiFetch(`${s.url}/api/status/${svc}`).then(r => r.json()))
-          );
-          const runningCount = results.filter(d => d.running).length;
-          return [s.id, runningCount === results.length ? 'running' : runningCount === 0 ? 'stopped' : 'partial'];
-        } catch {
-          return [s.id, 'error'];
-        }
-      }));
-      if (!cancelled) setEnvHealth(Object.fromEntries(entries));
-    };
-    checkAll();
-    const t = setInterval(checkAll, REFRESH_MS);
-    return () => { cancelled = true; clearInterval(t); };
-  }, [serverKey]); // eslint-disable-line
-
-  if (visibleServers.length === 0) return (
-    <div className="flex items-center justify-center h-full text-jj-gray-05 font-johnson-text">
-      No manage servers configured or you don't have access. Contact your administrator.
-    </div>
-  );
-
-  const activeServer = visibleServers.find(s => s.id === activeId) ?? visibleServers[0];
-
-  const tabs = visibleServers.map(s => ({
-    id: s.id,
-    label: s.label,
-    active: s.id === activeId,
-    dotCls: envHealth[s.id] === 'running' ? 'bg-jj-green-03' : envHealth[s.id] === 'error' ? 'bg-jj-red' : 'bg-jj-gray-05',
-    onClick: () => handleTabChange(s.id),
-  }));
-
+function ServiceCard({ svc, config, status, stats, busy, canAdmin, onAction, dirOptions, onChangeDir }) {
+  const st = STATE[status] || STATE.loading;
+  const [menuOpen, setMenuOpen] = useState(false);
   return (
-    <div className="h-full overflow-hidden">
-      {/* key forces full remount when server changes so state resets */}
-      <ServerManagePanel
-        key={activeServer.id}
-        manageUrl={activeServer.url}
-        serverId={activeServer.id}
-        terminalPermission={activeServer.terminalPermission}
-        alias={activeServer.alias}
-        tabs={tabs}
-      />
+    <div className="bg-white rounded-xl border border-jj-gray-02 shadow-card flex flex-col">
+      <div className="flex items-start gap-3 p-4 sm:p-5">
+        <span className="w-11 h-11 rounded-xl bg-jj-gray-01 border border-jj-gray-02 text-jj-gray-07 flex items-center justify-center flex-shrink-0">
+          <Icon name={svc.icon} className="w-5 h-5" />
+        </span>
+        <div className="flex-1 min-w-0">
+          <div className="flex flex-wrap items-center gap-2">
+            <p className="font-johnson-display text-lg text-jj-gray-08 truncate">{config.name || svc.label}</p>
+            <Badge tone={st.tone}><Dot color={st.color} pulse={status === 'running'} className="w-1.5 h-1.5" />{st.label}</Badge>
+          </div>
+          {canAdmin && dirOptions.length > 0 ? (
+            <Menu open={menuOpen} onOpenChange={setMenuOpen} align="left" className="w-[min(22rem,calc(100vw-3rem))] max-h-72 overflow-y-auto scroll-thin" trigger={(
+              <button type="button" onClick={() => setMenuOpen((v) => !v)} aria-haspopup="menu" aria-expanded={menuOpen}
+                className="mt-1 max-w-full flex items-center gap-1 font-mono text-xs text-jj-gray-06 hover:text-jj-gray-08 rounded focus-ring" title={config.dir}>
+                <span className="truncate">{config.dir || 'No directory set'}</span>
+                <Icon name="chevronDown" className="w-2.5 h-2.5" />
+              </button>
+            )}>
+              {dirOptions.map((o) => (
+                <MenuItem key={o.path} active={o.path === config.dir} title={o.notes || o.path}
+                  onClick={() => { setMenuOpen(false); if (o.exists) onChangeDir(svc.id, o); }}>
+                  <span className={cx('block', !o.exists && 'opacity-50')}>{o.label}{!o.exists && ' (missing)'}</span>
+                  <span className="block font-mono text-[11px] text-jj-gray-05 truncate">{o.path}</span>
+                </MenuItem>
+              ))}
+            </Menu>
+          ) : (
+            <p className="mt-1 font-mono text-xs text-jj-gray-06 truncate" title={config.dir}>{config.dir || '—'}</p>
+          )}
+        </div>
+      </div>
+      <dl className="grid grid-cols-3 gap-3 px-4 sm:px-5 font-johnson-text">
+        {[['Port', config.port], ['PID', stats.pid], ['Uptime', stats.uptime]].map(([k, v]) => (
+          <div key={k} className="min-w-0"><dt className="text-xs text-jj-gray-06">{k}</dt><dd className="mt-0.5 text-sm font-semibold text-jj-gray-08 tabular-nums truncate">{v || '—'}</dd></div>
+        ))}
+      </dl>
+      <div className="grid grid-cols-2 gap-4 px-4 sm:px-5 mt-4">
+        {[['CPU', stats.cpu, '#0f68b2'], ['Memory', stats.mem, '#8c3bbb']].map(([k, v, c]) => (
+          <div key={k}>
+            <div className="flex justify-between font-johnson-text text-xs"><span className="text-jj-gray-06">{k}</span><span className="text-jj-gray-08 tabular-nums">{v != null ? `${v}%` : '—'}</span></div>
+            <ProgressBar value={v || 0} color={c} className="h-1 mt-1.5" label={`${svc.label} ${k}`} />
+          </div>
+        ))}
+      </div>
+      <div className="mt-auto flex flex-wrap gap-2 p-4 sm:p-5">
+        {canAdmin && (status === 'running' ? (
+          <>
+            <Button size="sm" icon="sync" onClick={() => onAction(svc.id, 'restart')} loading={busy === 'restart'} disabled={!!busy}>Restart</Button>
+            <Button size="sm" variant="dangerOutline" onClick={() => onAction(svc.id, 'stop')} loading={busy === 'stop'} disabled={!!busy}>Stop</Button>
+          </>
+        ) : (
+          <Button size="sm" variant="primary" icon="play" onClick={() => onAction(svc.id, 'start')} loading={busy === 'start'} disabled={!!busy || status === 'error' || status === 'forbidden'}>Start</Button>
+        ))}
+        <Button size="sm" variant="ghost" icon="refresh" onClick={() => onAction(svc.id, 'status')} disabled={!!busy}>Check status</Button>
+      </div>
     </div>
   );
 }
 
-
-// ─────────────────────────────────────────────────────────────────────────────
-// MAIN PANEL (previously ServerManagePage)
-// ─────────────────────────────────────────────────────────────────────────────
-function ServerManagePanel({ manageUrl, serverId, terminalPermission, alias, tabs }) {
-  const MANAGE_API = manageUrl;
+function ServerPanel({ server, tabs }) {
   const { hasPermission } = useRBAC();
-  const canUseTerminal = hasPermission(terminalPermission);
+  const { user } = useAuth();
+  const { toast, confirm } = useFeedback();
+  const canAdmin = hasPermission(server.admin);
+  const [params, setParams] = useSearchParams();
+  const api = useCallback((path, opts) => requestJson(`${server.url}${path}`, opts), [server.url]);
 
-  // Must be declared before the useEffect that reads it
-  const [searchParams, setSearchParams] = useSearchParams();
+  const [config, setConfig] = useState({});
+  const [statuses, setStatuses] = useState({ backend: 'loading', frontend: 'loading' });
+  const [stats, setStats] = useState({ backend: {}, frontend: {} });
+  const [busy, setBusy] = useState({});
+  const [panelError, setPanelError] = useState(null);
+  const [lastSync, setLastSync] = useState(null);
+  const [activity, setActivity] = useState('console');
+  const [consoleLines, setConsoleLines] = useState([]);
+  const [logText, setLogText] = useState({});
+  const [repos, setRepos] = useState([]);
+  const [repo, setRepo] = useState('');
+  const [repoMenu, setRepoMenu] = useState(false);
+  const [dirs, setDirs] = useState({ backend: [], frontend: [] });
+  const [pulling, setPulling] = useState(false);
+  const outRef = useRef(null);
+  const termOpen = canAdmin && params.get('terminal') === 'true';
 
-  // Clear stale ?terminal=true from URL if user lacks permission
-  useEffect(() => {
-    if (!canUseTerminal && searchParams.get('terminal') === 'true') {
-      setSearchParams(p => { const n = new URLSearchParams(p); n.delete('terminal'); return n; });
-    }
-  }, [canUseTerminal, searchParams, setSearchParams]);
-  const [config,      setConfig]      = useState({});
-  const [statuses,    setStatuses]    = useState({ backend: 'loading', frontend: 'loading' });
-  const [stats,       setStats]       = useState({ backend: { pid: '—', cpu: null, mem: null, uptime: '—' }, frontend: { pid: '—', cpu: null, mem: null, uptime: '—' } });
-  const [busy,        setBusy]        = useState({ backend: false, frontend: false });
-  const [lastSync,    setLastSync]    = useState('—');
-  const [refreshing,  setRefreshing]  = useState(false);
-  const [barWidth,    setBarWidth]    = useState(0);
-  const [consoleLogs, setConsoleLogs] = useState([{ cls: 'font-johnson-text text-jj-gray-05 italic', text: '  Waiting for command output…' }]);
-  const [activityTab, setActivityTab] = useState('console'); // 'console' | 'backend' | 'frontend'
-  const [logContents, setLogContents] = useState({ backend: 'Fetching logs…', frontend: 'Fetching logs…' }); // per-service, so a background refresh for one svc can't clobber the other tab's view
-  const [toast,       setToast]       = useState(null);
-  const [repos,       setRepos]       = useState([]);
-  const [selectedRepo, setSelectedRepo] = useState('');
-  const [showRepoMenu, setShowRepoMenu] = useState(false);
-  const [dirMenuOpen, setDirMenuOpen] = useState(null); // svc key whose directory picker is open, or null
-  const [serviceDirs, setServiceDirs] = useState({ backend: [], frontend: [] }); // from service_directories.json
+  const append = useCallback((text, tone = 'out') => setConsoleLines((l) => [...l, { text, tone, id: l.length + Math.random() }].slice(-1000)), []);
 
-  const termOpen  = searchParams.get('terminal') === 'true';
-  const openTerm  = () => setSearchParams(p => { const n = new URLSearchParams(p); n.set('terminal', 'true'); return n; });
-  const closeTerm = () => setSearchParams(p => { const n = new URLSearchParams(p); n.delete('terminal');      return n; });
-  const consoleRef          = useRef(null);
-  const logRef              = useRef(null);
-  const toastTimer          = useRef(null);
-  const barTimer            = useRef(null);
-  // true while the user has manually scrolled away from the bottom
-  const consoleUserScrolled = useRef(false);
-  const logUserScrolled     = useRef(false);
-  const statusReqId         = useRef({}); // per-service counter, drops stale/out-of-order responses
-
-  const showToast = useCallback((msg, type = 'ok') => {
-    setToast({ msg, type });
-    clearTimeout(toastTimer.current);
-    toastTimer.current = setTimeout(() => setToast(null), 3200);
-  }, []);
-
-  const appendConsole = useCallback((textCls, text) => {
-    setConsoleLogs(prev => [...prev, { cls: textCls, text }]);
-    // Scrolling is handled by the useEffect below
-  }, []);
-
-  const loadConfig = useCallback(async () => {
-    try { const r = await absoluteApiFetch(`${MANAGE_API}/api/services`); setConfig(await r.json()); } catch { /* non-critical */ }
-  }, [MANAGE_API]);
-
-  const fetchStatus = useCallback(async (svc) => {
-    const myId = (statusReqId.current[svc] || 0) + 1;
-    statusReqId.current[svc] = myId;
+  const refreshService = useCallback(async (svc) => {
     try {
-      const d = await (await absoluteApiFetch(`${MANAGE_API}/api/status/${svc}`)).json();
-      // a newer request already started (or finished) for this service — this
-      // response is stale/out-of-order, drop it instead of overwriting fresher state
-      if (statusReqId.current[svc] !== myId) return;
-      setStatuses(prev => ({ ...prev, [svc]: d.running ? 'running' : 'stopped' }));
-      setStats(prev => ({
-        ...prev,
-        [svc]: {
-          pid:    d.pid ?? extractPid(d.output),
-          cpu:    d.cpu    ?? null,
-          mem:    d.mem    ?? null,
-          uptime: d.uptime ?? '—',
-        },
-      }));
-    } catch {
-      if (statusReqId.current[svc] !== myId) return;
-      setStatuses(prev => ({ ...prev, [svc]: 'error' }));
+      const d = await api(`/api/status/${svc}`, { timeoutMs: 15_000 });
+      const next = d.running ? 'running' : 'stopped';
+      setStatuses((s) => ({ ...s, [svc]: next }));
+      setStats((s) => ({ ...s, [svc]: { pid: d.pid, cpu: d.cpu, mem: d.mem, uptime: d.uptime } }));
+      setPanelError(null);
+      return next;
+    } catch (e) {
+      const next = e instanceof ApiError && e.status === 403 ? 'forbidden' : 'error';
+      setStatuses((s) => ({ ...s, [svc]: next }));
+      setPanelError(describeError(e));
+      return next;
     }
-  }, []);
-
-  const fetchLog = useCallback(async (svc, { quiet = false } = {}) => {
-    // quiet=true is used for background refreshes (e.g. after a directory
-    // change) that shouldn't disturb scroll position or flash "Loading…"
-    // for a tab the user isn't even looking at.
-    if (!quiet) {
-      logUserScrolled.current = false; // new log selected — reset to auto-scroll
-      setLogContents(prev => ({ ...prev, [svc]: 'Loading…' }));
-    }
-    try {
-      const d = await (await absoluteApiFetch(`${MANAGE_API}/api/logs/${svc}`)).json();
-      setLogContents(prev => ({ ...prev, [svc]: d.logs || '(empty)' }));
-      // Scrolling is handled by the useEffect below
-    } catch (e) { setLogContents(prev => ({ ...prev, [svc]: 'Error: ' + e.message })); }
-  }, [MANAGE_API]);
+  }, [api]);
 
   const refreshAll = useCallback(async () => {
-    setRefreshing(true);
-    await loadConfig();
-    await Promise.all(SERVICES.map(fetchStatus));
-    setLastSync(new Date().toLocaleTimeString());
-    setRefreshing(false);
-    // Fix 5: setTimeout(50) gives React a guaranteed paint cycle before the
-    // CSS transition starts, replacing the unreliable requestAnimationFrame.
-    setBarWidth(0);
-    setTimeout(() => setBarWidth(100), 50);
-  }, [loadConfig, fetchStatus]);
+    api('/api/services').then(setConfig).catch(() => {});
+    await Promise.all(SERVICES.map((s) => refreshService(s.id)));
+    setLastSync(new Date());
+  }, [api, refreshService]);
 
-  const loadRepos = useCallback(async () => {
+  const loadLog = useCallback(async (svc) => {
+    setLogText((t) => ({ ...t, [svc]: t[svc] ?? 'Loading…' }));
     try {
-      const d = await (await absoluteApiFetch(`${MANAGE_API}/api/repos`)).json();
-      setRepos(d.repos || []);
-    } catch { /* non-critical */ }
-  }, [MANAGE_API]);
+      const d = await api(`/api/logs/${svc}?lines=500`);
+      setLogText((t) => ({ ...t, [svc]: d.logs || '(empty)' }));
+    } catch (e) {
+      setLogText((t) => ({ ...t, [svc]: `Unable to load log: ${describeError(e)}` }));
+    }
+  }, [api]);
 
-  const loadServiceDirectories = useCallback(async () => {
-    try {
-      const d = await (await absoluteApiFetch(`${MANAGE_API}/api/service-directories`)).json();
-      setServiceDirs({ backend: d.backend || [], frontend: d.frontend || [] });
-    } catch { /* non-critical */ }
-  }, [MANAGE_API]);
-
-  const changeServiceDir = useCallback(async (svc, dir, port, entry) => {
-    setDirMenuOpen(null);
-    try {
-      const res = await absoluteApiFetch(`${MANAGE_API}/api/service/${svc}/dir`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ dir, port, entry }),
-      });
-      const d = await res.json();
-      if (!res.ok) { showToast(d.detail || 'Failed to update directory', 'err'); return; }
-      await loadConfig();
-      await fetchStatus(svc);
-      fetchLog(svc, { quiet: true }); // background refresh — doesn't touch scroll or whichever tab is currently shown
-      showToast(`${svc} directory updated`, 'ok');
-    } catch { showToast('Failed to update directory', 'err'); }
-  }, [MANAGE_API, loadConfig, fetchStatus, fetchLog, showToast]);
-
+  usePolling(refreshAll, REFRESH_MS);
   useEffect(() => {
-    refreshAll();
-    fetchLog('backend');
-    loadRepos();
-    loadServiceDirectories();
-    barTimer.current = setInterval(refreshAll, REFRESH_MS);
-    return () => clearInterval(barTimer.current);
-  }, []); // eslint-disable-line
+    if (!canAdmin) return;
+    api('/api/repos').then((d) => setRepos(d.repos || [])).catch(() => {});
+    api('/api/service-directories').then((d) => setDirs({ backend: d.backend || [], frontend: d.frontend || [] })).catch(() => {});
+  }, [api, canAdmin]);
+  useEffect(() => { if (activity !== 'console') loadLog(activity); }, [activity, loadLog]);
+  useEffect(() => { if (outRef.current) outRef.current.scrollTop = outRef.current.scrollHeight; }, [consoleLines, logText, activity]);
 
-  const doAction = useCallback(async (svc, action) => {
-    if (action === 'stop' && !window.confirm(`Stop ${svcMeta[svc]?.label || svc}?\n\nThis will terminate the running process.`)) return;
-    setBusy(prev => ({ ...prev, [svc]: true }));
-    appendConsole('font-johnson-text text-jj-blue-03 font-semibold', `\n❯ ${action.toUpperCase()} ${svc}`);
-    appendConsole('font-johnson-text text-jj-gray-05', `  ${new Date().toISOString()}`);
+  const runAction = async (svc, action) => {
+    const label = SERVICES.find((s) => s.id === svc).label;
+    if (action === 'status') { const now = await refreshService(svc); toast.info(`${label}: ${STATE[now].label}`); return; }
+    if (action !== 'start') {
+      const ok = await confirm({ title: `${action === 'stop' ? 'Stop' : 'Restart'} ${label}?`,
+        message: action === 'stop' ? 'The service will be unavailable until it is started again.' : 'The service restarts and is briefly unavailable. The frontend is rebuilt on restart.',
+        confirmLabel: action === 'stop' ? 'Stop service' : 'Restart service', tone: 'danger' });
+      if (!ok) return;
+    }
+    setBusy((b) => ({ ...b, [svc]: action }));
+    setActivity('console');
+    append(`$ ${action} ${svc}  ·  ${new Date().toLocaleString('en-US')}`, 'cmd');
     try {
-      const d   = await (await absoluteApiFetch(`${MANAGE_API}/api/${action}/${svc}`, { method: action === 'status' ? 'GET' : 'POST' })).json();
-      const out = d.output || d.logs || '';
-      const ok  = (d.returncode ?? 0) === 0;
-      out.split('\n').forEach(line => {
-        if (!line.trim()) return;
-        appendConsole(`font-johnson-text ${lineClass(line, ok)}`, '  ' + line);
-      });
-      showToast(`${svc} ${action} ${ok ? 'succeeded' : 'failed'}`, ok ? 'ok' : 'err');
-      if (action !== 'status') { await new Promise(res => setTimeout(res, 700)); await fetchStatus(svc); }
-      else {
-        setStatuses(prev => ({ ...prev, [svc]: d.running ? 'running' : 'stopped' }));
-        setStats(prev => ({ ...prev, [svc]: { pid: d.pid ?? extractPid(d.output), cpu: d.cpu ?? null, mem: d.mem ?? null, uptime: d.uptime ?? '—' } }));
-      }
-    } catch (e) { appendConsole('font-johnson-text text-jj-red', '  ' + e.message); showToast('Request failed', 'err'); }
-    setBusy(prev => ({ ...prev, [svc]: false }));
-  }, [appendConsole, fetchStatus, showToast]);
-
-  const runGitPull = useCallback(async () => {
-    appendConsole('font-johnson-text text-jj-blue-03 font-semibold', '\n❯ GIT PULL');
-    appendConsole('font-johnson-text text-jj-gray-05', `  ${new Date().toISOString()}`);
-    try {
-      const res = await absoluteApiFetch(`${MANAGE_API}/api/gitpull`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(selectedRepo ? { dir: selectedRepo } : {}),
-      });
-      const d = await res.json();
-
-      if (!res.ok) {
-        appendConsole('font-johnson-text text-jj-red', '  ' + (d.detail || `HTTP ${res.status}`));
-        showToast('Git pull failed', 'err');
-        return;
-      }
-
+      const d = await api(`/api/${action}/${svc}`, { method: 'POST', timeoutMs: 15 * 60_000 });
       const ok = (d.returncode ?? 0) === 0;
-      (d.output || '').split('\n').forEach(line => {
-        if (!line.trim()) return;
-        appendConsole(`font-johnson-text ${lineClass(line, ok)}`, '  ' + line);
-      });
-      showToast(ok ? 'Git pull succeeded' : 'Git pull failed', ok ? 'ok' : 'err');
-    } catch (e) { appendConsole('font-johnson-text text-jj-red', '  ' + e.message); showToast('Git pull failed', 'err'); }
-  }, [appendConsole, showToast, selectedRepo]);
-
-  // ── Auto-scroll: scroll to bottom when content changes, unless the user
-  // has manually scrolled up to read history. Once they scroll back to the
-  // bottom (within 40px) auto-scroll resumes automatically.
-  useEffect(() => {
-    if (!consoleUserScrolled.current && consoleRef.current) {
-      consoleRef.current.scrollTop = consoleRef.current.scrollHeight;
+      (d.output || '').split('\n').filter((l) => l.trim()).forEach((l) => append(l, ok ? 'out' : 'err'));
+      append(ok ? `✓ ${action} ${svc} finished` : `✗ ${action} ${svc} failed (exit ${d.returncode})`, ok ? 'ok' : 'err');
+      ok ? toast.success(`${label} ${action} succeeded`) : toast.error(`${label} ${action} failed`);
+      logAuditEvent('server_manager_action', user?.email, `${server.id}:${svc}`, `${action} ${svc} on ${server.alias} ${ok ? 'succeeded' : 'failed'}`);
+    } catch (e) {
+      append(describeError(e), 'err');
+      toast.error(`${label} ${action} failed: ${describeError(e)}`);
+    } finally {
+      setBusy((b) => ({ ...b, [svc]: null }));
+      refreshService(svc);
     }
-  }, [consoleLogs]);
+  };
 
-  useEffect(() => {
-    if (!logUserScrolled.current && logRef.current) {
-      logRef.current.scrollTop = logRef.current.scrollHeight;
+  const gitPull = async () => {
+    const target = repo || 'the default repository';
+    const ok = await confirm({ title: 'Pull latest code?', message: `Runs git pull --ff-only in ${target} on ${server.alias}.`, confirmLabel: 'Git pull' });
+    if (!ok) return;
+    setPulling(true);
+    setActivity('console');
+    append(`$ git pull  ·  ${repo || 'default repo'}`, 'cmd');
+    try {
+      const d = await api('/api/gitpull', { body: repo ? { dir: repo } : {}, timeoutMs: 300_000 });
+      const good = (d.returncode ?? 0) === 0;
+      (d.output || '').split('\n').filter((l) => l.trim()).forEach((l) => append(l, good ? 'out' : 'err'));
+      good ? toast.success('Git pull succeeded') : toast.error('Git pull failed');
+      logAuditEvent('server_manager_action', user?.email, server.id, `git pull in ${target} on ${server.alias} ${good ? 'succeeded' : 'failed'}`);
+    } catch (e) {
+      append(describeError(e), 'err');
+      toast.error(`Git pull failed: ${describeError(e)}`);
+    } finally {
+      setPulling(false);
     }
-  }, [logContents, activityTab]);
+  };
 
-  const handleConsoleScroll = useCallback(() => {
-    const el = consoleRef.current;
-    if (!el) return;
-    consoleUserScrolled.current = el.scrollHeight - el.scrollTop - el.clientHeight > 40;
-  }, []);
+  const changeDir = async (svc, option) => {
+    try {
+      await api(`/api/service/${svc}/dir`, { body: { dir: option.path, port: option.port || undefined, entry: option.entry || undefined } });
+      toast.success(`${svc} now points to ${option.label}`);
+      logAuditEvent('server_manager_action', user?.email, `${server.id}:${svc}`, `Switched ${svc} directory to ${option.path} on ${server.alias}`);
+      refreshAll();
+      if (activity === svc) loadLog(svc);
+    } catch (e) {
+      toast.error(describeError(e));
+    }
+  };
 
-  const handleLogScroll = useCallback(() => {
-    const el = logRef.current;
-    if (!el) return;
-    logUserScrolled.current = el.scrollHeight - el.scrollTop - el.clientHeight > 40;
-  }, []);
+  const setTerminal = (open) => setParams((p) => { const n = new URLSearchParams(p); if (open) n.set('terminal', 'true'); else n.delete('terminal'); return n; });
 
   return (
-    // Outer shell: fills the slot given by AppLayoutInner, never scrolls itself
-    <div className="h-full flex flex-col overflow-hidden bg-jj-gray-01">
-
-      {/* ── Header — full-bleed white bar, matches 3a ───────────────────────────── */}
-      <div className="flex-shrink-0 grid grid-cols-3 items-center gap-4 bg-jj-white border-b border-jj-gray-02 px-4 py-3">
-          <div className="flex items-center gap-3 justify-self-start">
-            <span className="font-johnson-display font-bold text-jj-red" style={{ fontSize: '18px', letterSpacing: '-.02em' }}>&gt;_</span>
-            <div>
-              <h2 className="font-johnson-display text-jj-gray-08 font-bold" style={{ fontSize: '1.2rem' }}>
-                Server Control
-              </h2>
-              <p className="font-johnson-text text-jj-gray-05 text-xs mt-0.5">
-                {alias || '—'} · synced <strong className="text-jj-gray-07">{lastSync}</strong>
-              </p>
-            </div>
-          </div>
-
-          <div className="justify-self-center">
-            {tabs && tabs.length > 1 && (
-              <div className="inline-flex items-center gap-0.5 bg-jj-gray-02 rounded-full p-1">
-                {tabs.map(t => (
-                  <button
-                    key={t.id}
-                    onClick={t.onClick}
-                    className={cx('flex items-center gap-1.5 px-3.5 py-1.5 rounded-full font-johnson-text text-sm font-semibold transition-all',
-                      t.active ? 'bg-white text-jj-gray-08 shadow-sm' : 'text-jj-gray-06 hover:text-jj-gray-08')}
-                  >
-                    <span className={cx('w-1.5 h-1.5 rounded-full flex-shrink-0', t.dotCls)} />
-                    {t.label}
-                  </button>
-                ))}
-              </div>
-            )}
-          </div>
-
-          <div className="flex items-center gap-2 justify-self-end">
-            {canUseTerminal && (
-              <button
-                onClick={() => openTerm()}
-                className="flex items-center gap-2 px-3 py-1.5 rounded border border-jj-gray-03 bg-jj-white text-jj-gray-07 font-johnson-text font-semibold hover:border-jj-gray-05 hover:bg-jj-gray-01 transition-all shadow-sm text-xs"
-              >
-                <img src={terminalIcon} alt="" className="w-3.5 h-3.5" style={{ filter: F_GRAY }} />
-                Terminal
-              </button>
-            )}
-
-            {canUseTerminal && (
-              <div className="relative">
-                <div className="flex items-center rounded-full overflow-hidden shadow-sm">
-                  <button
-                    onClick={runGitPull}
-                    className="flex items-center gap-2 pl-4 pr-3 py-2 bg-jj-red text-jj-white font-johnson-text font-semibold hover:bg-jj-maroon-05 transition-colors text-xs"
-                  >
-                    <GitIcon /> Git Pull
-                  </button>
-                  {repos.length > 0 && (
-                    <button
-                      onClick={() => setShowRepoMenu(v => !v)}
-                      title="Choose repo"
-                      className="flex items-center px-2.5 py-2 bg-jj-maroon-05 hover:bg-jj-red transition-colors border-l border-white/30"
-                    >
-                      <img src={chevronDownIcon} alt="" className={cx('w-3 h-3 transition-transform', showRepoMenu && 'rotate-180')} style={{ filter: F_WHITE }} />
-                    </button>
-                  )}
-                </div>
-
-                {showRepoMenu && (
-                  <>
-                    <div className="fixed inset-0 z-20" onClick={() => setShowRepoMenu(false)} />
-                    <div className="absolute right-0 mt-1.5 w-48 bg-jj-white rounded-lg shadow-lg border border-jj-gray-03 py-1 z-30">
-                      <button
-                        onClick={() => { setSelectedRepo(''); setShowRepoMenu(false); }}
-                        className={cx('w-full text-left px-3 py-1.5 text-xs font-johnson-text hover:bg-jj-gray-01 transition-colors', !selectedRepo ? 'text-jj-red font-semibold' : 'text-jj-gray-07')}
-                      >
-                        Default repo
-                      </button>
-                      {repos.map(r => (
-                        <button
-                          key={r}
-                          onClick={() => { setSelectedRepo(r); setShowRepoMenu(false); }}
-                          className={cx('w-full text-left px-3 py-1.5 text-xs font-johnson-text hover:bg-jj-gray-01 transition-colors truncate', selectedRepo === r ? 'text-jj-red font-semibold' : 'text-jj-gray-07')}
-                          title={r}
-                        >
-                          {r.split('/').pop()}
-                        </button>
-                      ))}
-                    </div>
-                  </>
+    <Page>
+      <PageHeader icon="server" title="Server control" description={server.alias}
+        meta={lastSync ? `synced ${lastSync.toLocaleTimeString('en-US')}` : 'syncing…'}
+        actions={(
+          <>
+            {tabs}
+            {canAdmin && <Button icon="server" onClick={() => setTerminal(true)}>Terminal</Button>}
+            {canAdmin && (
+              <div className="flex">
+                <Button variant="primary" icon="sync" onClick={gitPull} loading={pulling} className={repos.length ? 'rounded-r-none' : ''}>
+                  Git pull{repo ? ` · ${repo.split('/').pop()}` : ''}
+                </Button>
+                {repos.length > 0 && (
+                  <Menu open={repoMenu} onOpenChange={setRepoMenu} className="max-h-72 overflow-y-auto scroll-thin" trigger={(
+                    <Button variant="primary" aria-label="Choose repository" onClick={() => setRepoMenu((v) => !v)} className="rounded-l-none border-l border-white/30 px-2.5">
+                      <Icon name="chevronDown" className="w-3 h-3" />
+                    </Button>
+                  )}>
+                    <MenuItem active={!repo} onClick={() => { setRepo(''); setRepoMenu(false); }}>Default repository</MenuItem>
+                    {repos.map((r) => (
+                      <MenuItem key={r} active={repo === r} title={r} onClick={() => { setRepo(r); setRepoMenu(false); }}>
+                        <span className="block">{r.split('/').pop()}</span>
+                        <span className="block font-mono text-[11px] text-jj-gray-05 truncate">{r}</span>
+                      </MenuItem>
+                    ))}
+                  </Menu>
                 )}
               </div>
             )}
+            <Button icon="refresh" onClick={refreshAll} aria-label="Refresh status">Refresh</Button>
+          </>
+        )}
+      />
 
-            <button
-              onClick={refreshAll}
-              disabled={refreshing}
-              className="w-9 h-9 flex items-center justify-center rounded border border-jj-gray-03 bg-jj-white hover:bg-jj-gray-01 text-jj-gray-06 hover:text-jj-gray-08 transition-colors shadow-sm disabled:opacity-40"
-              title="Refresh all"
-            >
-              <img src={refreshIcon} alt="" className={cx('w-4 h-4', refreshing && 'animate-spin')} style={{ filter: F_GRAY }} />
-            </button>
-          </div>
-        </div>
+      {panelError && <Alert tone="error" title={`Can’t reach ${server.alias} fully`}>{panelError}</Alert>}
 
-        {/* ── Service cards ────────────────────────────────────────────────── */}
-      <div className="flex-1 flex flex-col overflow-hidden gap-3 px-4 py-4 min-h-0">
-
-        <div className="flex-shrink-0">
-          <SectionLabel>Services</SectionLabel>
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-            {SERVICES.map(svc => (
-              <ServiceCard
-                key={svc} svc={svc} config={config[svc] || {}}
-                status={statuses[svc]} stats={stats[svc]}
-                isBusy={busy[svc]} onAction={doAction}
-                canUseTerminal={canUseTerminal}
-                dirOptions={serviceDirs[svc] || []} dirMenuOpen={dirMenuOpen} setDirMenuOpen={setDirMenuOpen} onChangeDir={changeServiceDir}
-              />
-            ))}
-          </div>
-        </div>
-
-        {/*
-          ── Console + Logs: share the remaining vertical space ──────────────
-          flex-1 + min-h-0 lets this section shrink/grow to fill what's left
-          after the header and service cards are painted.
-        */}
-        <div className="flex-1 flex flex-col overflow-hidden min-h-0">
-          <SectionLabel>Activity</SectionLabel>
-          <div className="flex-1 flex flex-col bg-jj-white rounded-xl border border-jj-gray-02 shadow-sm overflow-hidden min-h-0">
-            <div className="flex-shrink-0 flex items-center justify-between px-4 h-11 border-b border-jj-gray-02 bg-jj-gray-01">
-              <div className="flex items-center gap-1.5">
-                <button
-                  onClick={() => setActivityTab('console')}
-                  className={cx('font-johnson-text text-xs font-semibold px-3 py-1 rounded-full border transition-all',
-                    activityTab === 'console'
-                      ? 'bg-jj-red border-jj-red text-jj-white shadow-sm'
-                      : 'bg-jj-white border-jj-gray-03 text-jj-gray-06 hover:text-jj-gray-08 hover:border-jj-gray-04')}
-                >
-                  Console
-                </button>
-                {SERVICES.map(svc => (
-                  <button key={svc} onClick={() => { setActivityTab(svc); fetchLog(svc); }}
-                    className={cx('font-johnson-text text-xs font-semibold px-3 py-1 rounded-full border transition-all',
-                      activityTab === svc
-                        ? 'bg-jj-red border-jj-red text-jj-white shadow-sm'
-                        : 'bg-jj-white border-jj-gray-03 text-jj-gray-06 hover:text-jj-gray-08 hover:border-jj-gray-04')}>
-                    {svc}.log
-                  </button>
-                ))}
-              </div>
-              {activityTab === 'console' ? (
-                <button
-                  onClick={() => setConsoleLogs([{ cls: 'font-johnson-text text-jj-gray-05 italic', text: '  Console cleared.' }])}
-                  className="font-johnson-text text-xs text-jj-gray-05 hover:text-jj-gray-08 px-3 py-1 rounded-full border border-jj-gray-03 bg-jj-white hover:border-jj-gray-04 transition-colors"
-                >
-                  Clear
-                </button>
-              ) : (
-                <button
-                  onClick={() => fetchLog(activityTab)}
-                  className="font-johnson-text text-xs text-jj-gray-05 hover:text-jj-gray-08 px-3 py-1 rounded-full border border-jj-gray-03 bg-jj-white hover:border-jj-gray-04 transition-colors"
-                >
-                  ↻ Reload
-                </button>
-              )}
-            </div>
-
-            {activityTab === 'console' ? (
-              <div
-                ref={consoleRef}
-                onScroll={handleConsoleScroll}
-                className="flex-1 font-johnson-text text-xs leading-relaxed p-4 overflow-y-auto bg-jj-gray-08"
-                style={{ scrollbarWidth: 'thin' }}
-              >
-                {consoleLogs.map((line, i) => (
-                  <span key={i} className={cx('block', line.cls)}>{line.text}</span>
-                ))}
-              </div>
-            ) : (
-              <div
-                ref={logRef}
-                onScroll={handleLogScroll}
-                className="flex-1 font-johnson-text text-xs leading-relaxed p-4 overflow-y-auto text-jj-gray-01 bg-jj-gray-08"
-                style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-all', scrollbarWidth: 'thin' }}
-              >
-                {logContents[activityTab]}
-              </div>
-            )}
-          </div>
-        </div>{/* end activity panel */}
-
-        {/* ── Footer ───────────────────────────────────────────────────────── */}
-        <div className="flex-shrink-0 flex items-center justify-center py-1 border-t border-jj-gray-02">
-          <p className="font-johnson-text text-xs text-jj-gray-04">
-            © {new Date().getFullYear()} RDI · Johnson &amp; Johnson
-          </p>
-        </div>
-
-      </div>{/* end inner flex-1 */}
-
-      {/* Progress bar — animates from 0→100% over REFRESH_MS on each refresh */}
-      <div className="fixed bottom-0 left-0 right-0 h-0.5 bg-jj-gray-02 z-30">
-        <div
-          className="h-full bg-jj-red"
-          style={{
-            width: `${barWidth}%`,
-            transition: barWidth === 100 ? `width ${REFRESH_MS}ms linear` : 'none',
-          }}
-        />
-      </div>
-
-      {/* Toast */}
-      {toast && (
-        <div className={cx(
-          'fixed bottom-6 right-6 flex items-center gap-3 px-4 py-3 rounded-xl bg-jj-white border shadow-lg font-johnson-text text-sm text-jj-gray-08 z-40 animate-slide-in',
-          toast.type === 'ok' ? 'border-jj-green-03' : 'border-jj-red'
-        )}>
-          <span className={cx('w-2 h-2 rounded-full flex-shrink-0',
-            toast.type === 'ok' ? 'bg-jj-green-03' : 'bg-jj-red')} />
-          {toast.msg}
-        </div>
-      )}
-
-      {/* Terminal — only shown if user has terminal permission for this server */}
-      {canUseTerminal && <Terminal isOpen={termOpen} onClose={closeTerm} manageUrl={MANAGE_API} />}
-    </div>
-  );
-}
-
-
-// ─────────────────────────────────────────────────────────────────────────────
-// SERVICE CARD
-// ─────────────────────────────────────────────────────────────────────────────
-function ServiceCard({ svc, config, status, stats, isBusy, onAction, canUseTerminal, dirOptions, dirMenuOpen, setDirMenuOpen, onChangeDir }) {
-  const meta   = svcMeta[svc];
-  const colors = statusColors[status] || statusColors.loading;
-
-  const Btn = ({ action, label, icon, hoverCls }) => (
-    <button
-      onClick={() => onAction(svc, action)}
-      disabled={isBusy}
-      className={cx(
-        'flex items-center justify-center gap-1.5 py-2 px-1 rounded border border-jj-gray-03 bg-jj-white text-jj-gray-06 font-johnson-text font-semibold shadow-sm transition-all text-xs',
-        'hover:-translate-y-px hover:shadow-md disabled:opacity-40 disabled:cursor-not-allowed disabled:transform-none',
-        hoverCls
-      )}
-    >
-      {icon}{label}
-    </button>
-  );
-
-  return (
-    <div className={cx('bg-jj-white rounded-xl border border-jj-gray-02 shadow-sm overflow-hidden transition-shadow hover:shadow-md', colors.card)}>
-      <div className="flex items-center gap-3 p-5 pb-0">
-        <div
-          className={cx('w-[50px] h-[50px] rounded-full border-2 flex items-center justify-center flex-shrink-0 bg-jj-gray-01', colors.ring)}
-          style={{ boxShadow: `0 0 14px ${colors.glow}` }}
-        >
-          <img src={meta.icon} alt="" className="w-[19px] h-[19px]" style={{ filter: F_GRAY }} />
-        </div>
-        <div className="min-w-0">
-          <p className="font-johnson-display text-jj-gray-08 font-semibold leading-tight" style={{ fontSize: '1.05rem' }}>
-            {config.name || meta.label}
-          </p>
-          <div className="relative inline-block mt-0.5">
-            <button
-              onClick={() => setDirMenuOpen(open => open === svc ? null : svc)}
-              className="flex items-center gap-1 text-jj-gray-05 hover:text-jj-gray-07 transition-colors"
-              title={config.dir || ''}
-            >
-              <span className="font-johnson-text text-xs truncate max-w-48">{config.dir || '—'}</span>
-              {dirOptions.length > 0 && (
-                <img src={chevronDownIcon} alt="" className={cx('w-2.5 h-2.5 flex-shrink-0 transition-transform', dirMenuOpen === svc && 'rotate-180')} style={{ filter: F_GRAY }} />
-              )}
-            </button>
-
-            {dirMenuOpen === svc && dirOptions.length > 0 && (
-              <>
-                <div className="fixed inset-0 z-20" onClick={() => setDirMenuOpen(null)} />
-                <div className="absolute left-0 top-full mt-1 w-72 bg-jj-white rounded-lg shadow-lg border border-jj-gray-03 py-1 z-30 max-h-64 overflow-y-auto">
-                  {dirOptions.map(o => (
-                    <button
-                      key={o.path}
-                      onClick={() => o.exists !== false && onChangeDir(svc, o.path, o.port, o.entry)}
-                      title={o.notes || o.path}
-                      disabled={o.exists === false}
-                      className={cx('w-full text-left px-3 py-1.5 font-johnson-text transition-colors',
-                        o.exists === false ? 'opacity-40 cursor-not-allowed' : 'hover:bg-jj-gray-01',
-                        o.path === config.dir ? 'text-jj-red' : 'text-jj-gray-07')}
-                    >
-                      <div className={cx('text-xs', o.path === config.dir && 'font-semibold')}>{o.label}</div>
-                      <div className="text-[10px] text-jj-gray-05 truncate">{o.path}</div>
-                    </button>
-                  ))}
-                </div>
-              </>
-            )}
-          </div>
-          <p className={cx('font-johnson-text font-bold uppercase tracking-wide mt-1', colors.text)} style={{ fontSize: '11px' }}>
-            {status === 'running' ? 'Running' : status === 'loading' ? '…' : status === 'error' ? 'Error' : 'Stopped'}
-          </p>
-        </div>
-      </div>
-
-      <div className="grid grid-cols-3 gap-2 mx-5 mt-4">
-        {[{ label: 'Port', value: config.port || '—' }, { label: 'PID', value: stats?.pid || '—' }, { label: 'Uptime', value: stats?.uptime || '—' }].map((m, i) => (
-          <div key={i} className="flex flex-col gap-0.5">
-            <span className="font-johnson-text font-bold uppercase tracking-widest text-jj-gray-05" style={{ fontSize: '9px' }}>
-              {m.label}
-            </span>
-            <span className="font-johnson-text text-jj-gray-08 font-semibold text-sm">{m.value}</span>
-          </div>
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        {SERVICES.map((svc) => (
+          <ServiceCard key={svc.id} svc={svc} config={config[svc.id] || {}} status={statuses[svc.id]} stats={stats[svc.id] || {}}
+            busy={busy[svc.id]} canAdmin={canAdmin} onAction={runAction} dirOptions={dirs[svc.id] || []} onChangeDir={changeDir} />
         ))}
       </div>
 
-      <div className="grid grid-cols-2 gap-4 mx-5 mt-3">
-        {[{ label: 'CPU', value: stats?.cpu, barCls: 'bg-jj-blue-03' }, { label: 'MEM', value: stats?.mem, barCls: 'bg-jj-violet-03' }].map((m, i) => (
-          <div key={i}>
-            <div className="flex items-center justify-between">
-              <span className="font-johnson-text font-bold uppercase tracking-widest text-jj-gray-05" style={{ fontSize: '9px' }}>{m.label}</span>
-              <span className="font-johnson-text text-jj-gray-06" style={{ fontSize: '10px' }}>{m.value != null ? `${m.value}%` : '—'}</span>
-            </div>
-            <div className="h-1 rounded-full bg-jj-gray-02 mt-1.5 overflow-hidden">
-              <div className={cx('h-full rounded-full', m.barCls)} style={{ width: `${m.value ?? 0}%` }} />
-            </div>
+      <section className="bg-white rounded-xl border border-jj-gray-02 shadow-card overflow-hidden">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 px-2 sm:px-3 border-b border-jj-gray-02">
+          <Tabs label="Activity" value={activity} onChange={setActivity} className="border-b-0"
+            tabs={[{ id: 'console', label: 'Console' }, ...SERVICES.map((s) => ({ id: s.id, label: `${s.id}.log` }))]} />
+          <div className="px-2 pb-2 sm:pb-0">
+            {activity === 'console'
+              ? <Button size="sm" variant="ghost" onClick={() => setConsoleLines([])} disabled={!consoleLines.length}>Clear</Button>
+              : <Button size="sm" variant="ghost" icon="refresh" onClick={() => loadLog(activity)}>Reload</Button>}
           </div>
-        ))}
-      </div>
+        </div>
+        <div ref={outRef} tabIndex={0} aria-label="Activity output" className="h-80 sm:h-96 overflow-auto terminal-scroll bg-terminal px-4 py-3 font-mono text-xs leading-5 focus-ring-inset">
+          {activity === 'console' ? (
+            consoleLines.length === 0 ? <p className="text-[#8b949e]">Output from start, stop, restart and git pull appears here.</p>
+              : consoleLines.map((l) => (
+                <div key={l.id} className={cx('whitespace-pre-wrap break-words',
+                  { cmd: 'text-[#79c0ff] font-semibold mt-2 first:mt-0', ok: 'text-[#7ee787]', err: 'text-[#ff7b72]', out: 'text-[#c9d1d9]' }[l.tone])}>{l.text}</div>
+              ))
+          ) : <pre className="whitespace-pre-wrap break-words text-[#c9d1d9] m-0">{logText[activity]}</pre>}
+        </div>
+      </section>
 
-      <div className={`grid ${canUseTerminal ? 'grid-cols-4' : 'grid-cols-2'} gap-2 p-4 pt-3`}>
-        <Btn action="start"   label="Start"   icon={<StartIcon />}   hoverCls="hover:bg-jj-gray-01 hover:border-jj-green-03 hover:text-jj-green-03" />
-        {canUseTerminal && <Btn action="stop"    label="Stop"    icon={<StopIcon />}    hoverCls="hover:bg-jj-gray-01 hover:border-jj-red hover:text-jj-red" />}
-        {canUseTerminal && <Btn action="restart" label="Restart" icon={<RestartIcon />} hoverCls="hover:bg-jj-gray-01 hover:border-jj-orange-03 hover:text-jj-orange-03" />}
-        <Btn action="status"  label="Status"  icon={<StatusIcon />}  hoverCls="hover:bg-jj-gray-01 hover:border-jj-blue-03 hover:text-jj-blue-03" />
-      </div>
-    </div>
+      {termOpen && (
+        <Suspense fallback={null}>
+          <Terminal manageUrl={server.url} title={server.alias} onClose={() => setTerminal(false)} />
+        </Suspense>
+      )}
+    </Page>
   );
 }
 
+export default function ServerManagePage() {
+  const { hasPermission } = useRBAC();
+  const [params, setParams] = useSearchParams();
+  const visible = SERVERS.filter((s) => hasPermission(s.permission));
+  const visibleKey = visible.map((s) => s.id).join();
+  const [health, setHealth] = useState({});
 
-// ─────────────────────────────────────────────────────────────────────────────
-// SHARED ATOMS
-// ─────────────────────────────────────────────────────────────────────────────
-const SectionLabel = ({ children }) => (
-  <div className="flex items-center gap-3 mb-4">
-    <span className="font-johnson-text font-bold text-xs uppercase tracking-widest text-jj-gray-05 whitespace-nowrap">
-      {children}
-    </span>
-    <div className="flex-1 h-px bg-jj-gray-02" />
-  </div>
-);
+  const check = useCallback(() => {
+    visible.forEach(async (s) => {
+      try {
+        const results = await Promise.all(SERVICES.map((svc) => requestJson(`${s.url}/api/status/${svc.id}`, { timeoutMs: 10_000 })));
+        const up = results.filter((r) => r.running).length;
+        setHealth((h) => ({ ...h, [s.id]: up === results.length ? 'running' : up === 0 ? 'stopped' : 'partial' }));
+      } catch {
+        setHealth((h) => ({ ...h, [s.id]: 'error' }));
+      }
+    });
+  }, [visibleKey]); // eslint-disable-line react-hooks/exhaustive-deps
+  usePolling(check, REFRESH_MS, { enabled: visible.length > 1 });
 
-const StartIcon   = () => <img src={playIcon} alt="" className="w-3 h-3"    style={{ filter: F_GRAY }} />;
-const StopIcon    = () => <img src={closeIcon}        alt="" className="w-3 h-3"    style={{ filter: F_GRAY }} />;
-const RestartIcon = () => <img src={restartIcon}        alt="" className="w-3 h-3"    style={{ filter: F_GRAY }} />;
-const StatusIcon  = () => <img src={gearIcon}         alt="" className="w-3 h-3"    style={{ filter: F_GRAY }} />;
-const GitIcon     = () => <img src={restartIcon}   alt="" className="w-3.5 h-3.5" style={{ filter: F_WHITE }} />;
+  if (!visible.length) {
+    return (
+      <Page>
+        <EmptyState icon="server" title="No manage servers available"
+          description="No server is configured for this deployment, or your role doesn’t include any of them. Contact your administrator." />
+      </Page>
+    );
+  }
+  const active = visible.find((s) => s.id === params.get('server')) || visible[0];
+  const tabs = visible.length > 1 ? (
+    <Tabs variant="pill" label="Server" value={active.id}
+      onChange={(id) => setParams((p) => { const n = new URLSearchParams(p); n.set('server', id); n.delete('terminal'); return n; })}
+      tabs={visible.map((s) => ({ id: s.id, label: s.label, dot: STATE[health[s.id] || 'loading'].color, title: `${s.alias}: ${STATE[health[s.id] || 'loading'].label}` }))} />
+  ) : null;
+  return <ServerPanel key={active.id} server={active} tabs={tabs} />;
+}

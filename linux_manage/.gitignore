@@ -1,6 +1,9 @@
 .idea/
+__pycache__/
+*.pyc
+venv/
 /.env
 /config.ini
 /service_directories.json
-__pycache__/
-*.pyc
+/manager.pid
+/manager.log

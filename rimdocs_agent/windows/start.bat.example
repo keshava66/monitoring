@@ -1,57 +1,57 @@
 @echo off
-setlocal
+setlocal EnableDelayedExpansion
 
-set AGENT_DIR=%~dp0
-set VENV_DIR=%AGENT_DIR%\venv
-set PY=%VENV_DIR%\Scripts\python.exe
-set PIP=%VENV_DIR%\Scripts\pip.exe
-set REQUIREMENTS=%AGENT_DIR%requirements.txt
-set LOG=%AGENT_DIR%agent.log
+set "AGENT_DIR=%~dp0"
+set "VENV_DIR=%AGENT_DIR%venv"
+set "PY=%VENV_DIR%\Scripts\python.exe"
+set "REQUIREMENTS=%AGENT_DIR%requirements.txt"
+set "LOG=%AGENT_DIR%agent.log"
+set "AGENT=%AGENT_DIR%RIMDocs_agent.py"
+set "PORT=8090"
+set "SCHEME=http"
 
-:: ── 1. Create venv if missing ─────────────────────────────────────
+if not exist "%AGENT_DIR%config.ini" (
+    echo FAILED: config.ini not found in %AGENT_DIR%
+    exit /b 1
+)
+
+for /f "usebackq tokens=1,* delims==" %%A in ("%AGENT_DIR%config.ini") do (
+    set "KEY=%%A"
+    set "KEY=!KEY: =!"
+    set "VAL=%%B"
+    if defined VAL set "VAL=!VAL: =!"
+    if /i "!KEY!"=="PORT" if defined VAL set "PORT=!VAL!"
+    if /i "!KEY!"=="SSL_CERTFILE" if defined VAL set "SCHEME=https"
+)
+
+:: Already running? Nothing to do.
+curl -skf %SCHEME%://localhost:%PORT%/health >nul 2>&1
+if not errorlevel 1 (
+    echo Agent already running on :%PORT%
+    exit /b 0
+)
+
 if not exist "%PY%" (
     echo Creating virtual environment...
-    python -m venv "%VENV_DIR%"
-    if errorlevel 1 (
-        echo FAILED: Could not create virtual environment.
-        pause
-        exit /b 1
-    )
-    echo Virtual environment created.
+    python -m venv "%VENV_DIR%" || (echo FAILED: could not create virtual environment & exit /b 1)
 )
 
-:: ── 2. Install requirements ───────────────────────────────────────
-if exist "%REQUIREMENTS%" (
-    echo Installing requirements...
-    "%PIP%" install -q -r "%REQUIREMENTS%"
-    if errorlevel 1 (
-        echo FAILED: pip install failed.
-        pause
-        exit /b 1
-    )
-    echo Requirements installed.
-) else (
-    echo WARNING: requirements.txt not found - skipping.
-)
+echo Installing requirements...
+"%PY%" -m pip install -q --disable-pip-version-check -r "%REQUIREMENTS%" || (echo FAILED: pip install failed & exit /b 1)
 
-:: ── 3. Start the agent ────────────────────────────────────────────
-echo Starting RIMDocs agent...
-start /b "" "%PY%" "%AGENT_DIR%RIMDocs_agent.py" >> "%LOG%" 2>&1
+echo Starting agent on :%PORT%...
+start "" /b "%PY%" "%AGENT%" >> "%LOG%" 2>&1
 
-:: ── 4. Wait and verify ────────────────────────────────────────────
-echo Waiting for agent to start on :8443...
 set /a COUNT=0
-
 :WAIT_LOOP
 timeout /t 1 /nobreak >nul
 set /a COUNT+=1
-curl -sf http://localhost:8443/health >nul 2>&1
+curl -skf %SCHEME%://localhost:%PORT%/health >nul 2>&1
 if not errorlevel 1 (
-    echo SUCCESS: RIMDocs agent is running on :8443
+    echo SUCCESS: agent is running on :%PORT%
     exit /b 0
 )
-if %COUNT% LSS 12 goto WAIT_LOOP
+if %COUNT% LSS 20 goto WAIT_LOOP
 
-echo FAILED: Agent did not respond on :8443 within 12s.
-echo Check %LOG% for errors.
+echo FAILED: agent did not respond on :%PORT% within 20s. Check %LOG%
 exit /b 1

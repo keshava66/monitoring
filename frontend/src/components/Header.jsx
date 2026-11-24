@@ -1,137 +1,67 @@
-import React, { useState } from "react";
-import { useNavigate } from "react-router-dom";
-import { useAuth } from "../context/AuthContext";
-import { useProfilePhoto } from "../context/ProfilePhotoContext";
-import userIcon    from "/icons/JJ_Icon_Profile_red.svg";
-import logoutIcon  from "/icons/JJ_Icon_Log_Out_RGB.svg";
-import chevronIcon from "/icons/JJ_Icon_Chevron_Down.svg";
+import React, { useState } from 'react';
+import { useLocation } from 'react-router-dom';
+import { useAuth } from '../context/AuthContext';
+import { useRBAC } from '../context/RBACContext';
+import { useProfilePhoto } from '../context/ProfilePhotoContext';
+import { Icon, Menu, MenuItem, Badge } from './ui';
+import { PAGE_TITLES } from '../navigation';
 
-const FILTER_RED  = 'brightness(0) saturate(100%) invert(17%) sepia(100%) saturate(7426%) hue-rotate(3deg) brightness(92%) contrast(118%)';
-const FILTER_GRAY = 'brightness(0) saturate(100%) invert(42%) sepia(6%) saturate(656%) hue-rotate(346deg) brightness(92%) contrast(88%)';
+export function Avatar({ src, name, className = 'w-8 h-8' }) {
+  const initials = (name || '?').split(/[\s.@_-]+/).filter(Boolean).slice(0, 2).map((w) => w[0].toUpperCase()).join('');
+  return src ? (
+    <img src={src} alt="" className={`${className} rounded-full object-cover ring-1 ring-jj-gray-03 flex-shrink-0`} />
+  ) : (
+    <span aria-hidden="true" className={`${className} rounded-full bg-jj-gray-02 text-jj-gray-07 font-johnson-display text-xs flex items-center justify-center ring-1 ring-jj-gray-03 flex-shrink-0`}>
+      {initials}
+    </span>
+  );
+}
 
-export default function Header() {
-  const [showDropdown, setShowDropdown] = useState(false);
-  const { logout, user } = useAuth();
-  const navigate = useNavigate();
-
-  const { profilePhoto, photoLoading } = useProfilePhoto();
-
-  const handleLogout = async () => {
-    try {
-      await logout();
-    } catch (error) {
-      console.error('Logout failed:', error);
-      navigate('/login');
-    }
-  };
-
-  const displayUser = {
-    name: (user?.name || user?.username || "User").replace(/\s*\[.*?\]\s*/g, '').trim(),
-    email: user?.email || user?.username || "email@its.jnj.com",
-    avatar: profilePhoto
-  };
+/** Sticky app bar: navigation toggle (mobile), page title, user menu. */
+export default function Header({ onMenuClick }) {
+  const { user, logout } = useAuth();
+  const { roleName, roleColor } = useRBAC();
+  const { profilePhoto } = useProfilePhoto();
+  const location = useLocation();
+  const [open, setOpen] = useState(false);
+  const title = PAGE_TITLES[location.pathname] || 'RDI-AI Monitoring';
 
   return (
-    <header className="w-full h-16 flex items-center px-6 bg-white border-b-4 border-jj-red shadow-md sticky top-0 z-20 select-none">
-
-      {/* Centered title */}
-      <div className="absolute left-1/2 top-1/2 transform -translate-x-1/2 -translate-y-1/2 flex items-center pointer-events-none">
-        <h1 className="font-johnson-display text-jj-gray-08">
-          <span className="text-4xl">RDI-AI Monitoring Tools</span>
-        </h1>
+    <header className="sticky top-0 z-40 flex items-center gap-2 sm:gap-3 h-14 sm:h-16 px-3 sm:px-6 bg-white/95 backdrop-blur border-b border-jj-gray-02 pt-[env(safe-area-inset-top)] box-content">
+      <button type="button" onClick={onMenuClick} aria-label="Open navigation"
+        className="lg:hidden w-10 h-10 -ml-1 flex items-center justify-center rounded-lg text-jj-gray-07 hover:bg-jj-gray-01 focus-ring">
+        <svg viewBox="0 0 20 20" className="w-5 h-5" aria-hidden="true">
+          <path d="M3 5.5h14M3 10h14M3 14.5h14" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" />
+        </svg>
+      </button>
+      <div className="flex items-center gap-3 min-w-0 flex-1">
+        <span className="hidden lg:inline-block w-1 h-6 rounded-full bg-jj-red" aria-hidden="true" />
+        <p className="font-johnson-display text-base sm:text-lg text-jj-gray-08 truncate">{title}</p>
+        <span className="hidden md:inline font-johnson-text text-xs text-jj-gray-05 truncate">RDI-AI Monitoring</span>
       </div>
-
-      {/* Profile section on far right */}
-      <div className="ml-auto relative">
-        <button
-          onClick={() => setShowDropdown(!showDropdown)}
-          className="flex items-center space-x-3 text-jj-gray-07 hover:text-jj-red transition-colors duration-200 px-3 py-2 rounded-lg hover:bg-jj-gray-01 focus:outline-none focus:ring-2 focus:ring-jj-red focus:ring-opacity-20"
-          aria-label="User menu"
-        >
-          <div className="flex items-center space-x-2">
-            {photoLoading ? (
-              <div className="w-8 h-8 rounded-full bg-jj-gray-02 animate-pulse"></div>
-            ) : displayUser.avatar ? (
-              <img
-                src={displayUser.avatar}
-                alt={displayUser.name}
-                className="w-8 h-8 rounded-full object-cover border-2 border-jj-gray-02"
-                onError={() => {}}
-              />
-            ) : (
-              <div className="w-8 h-8 rounded-full flex items-center justify-center">
-                <img src={userIcon} alt="User" className="w-10 h-10" />
-              </div>
-            )}
-
-            <div className="hidden sm:block text-left">
-              <p className="text-sm font-johnson-display text-jj-gray-08 leading-tight">
-                {displayUser.name}
-              </p>
-              <p className="text-xs text-jj-gray-05 font-johnson-text leading-tight">
-                {displayUser.email}
-              </p>
-            </div>
-          </div>
-
-          <img
-            src={chevronIcon}
-            alt=""
-            className={`w-4 h-4 transition-transform duration-200 ${showDropdown ? 'rotate-180' : ''}`}
-            style={{ filter: FILTER_GRAY }}
-          />
+      <Menu open={open} onOpenChange={setOpen} trigger={(
+        <button type="button" onClick={() => setOpen((v) => !v)} aria-haspopup="menu" aria-expanded={open}
+          className="flex items-center gap-2.5 rounded-full sm:rounded-lg pl-1 pr-1 sm:pr-2 py-1 hover:bg-jj-gray-01 transition-colors focus-ring">
+          <Avatar src={profilePhoto} name={user?.name} />
+          <span className="hidden md:flex flex-col items-start min-w-0 max-w-[14rem]">
+            <span className="font-johnson-text text-sm text-jj-gray-08 leading-tight truncate max-w-full">{user?.name}</span>
+            <span className="font-johnson-text text-xs text-jj-gray-05 leading-tight truncate max-w-full">{roleName}</span>
+          </span>
+          <Icon name="chevronDown" className={`hidden sm:block w-3 h-3 text-jj-gray-05 transition-transform ${open ? 'rotate-180' : ''}`} />
         </button>
-
-        {/* Dropdown Menu */}
-        {showDropdown && (
-          <div className="absolute right-0 mt-2 w-64 bg-white rounded-lg shadow-lg border border-jj-gray-03 py-2 z-30">
-            <div className="px-4 py-3 border-b border-jj-gray-02">
-              <div className="flex items-center space-x-3">
-                {photoLoading ? (
-                  <div className="w-10 h-10 rounded-full bg-jj-gray-02 animate-pulse"></div>
-                ) : displayUser.avatar ? (
-                  <img
-                    src={displayUser.avatar}
-                    alt={displayUser.name}
-                    className="w-10 h-10 rounded-full object-cover border-2 border-jj-gray-02"
-                  />
-                ) : (
-                  <div className="w-10 h-10 rounded-full flex items-center justify-center">
-                    <img src={userIcon} alt="User" className="w-10 h-10" />
-                  </div>
-                )}
-                <div className="flex-1 min-w-0">
-                  <p className="text-sm font-johnson-display text-jj-gray-08 truncate">
-                    {displayUser.name}
-                  </p>
-                  <p className="text-xs text-jj-gray-05 font-johnson-text truncate">
-                    {displayUser.email}
-                  </p>
-                </div>
-              </div>
-            </div>
-
-            <div className="py-1">
-              <button
-                onClick={handleLogout}
-                className="w-full flex items-center space-x-3 px-4 py-2 text-sm font-johnson-text text-jj-red hover:bg-red-50 transition-colors duration-200 text-left"
-              >
-                <img src={logoutIcon} alt="" className="w-4 h-4 flex-shrink-0" style={{ filter: FILTER_RED }} />
-                <span>Sign out</span>
-              </button>
-            </div>
+      )}>
+        <div className="px-4 py-3 border-b border-jj-gray-02 flex items-center gap-3">
+          <Avatar src={profilePhoto} name={user?.name} className="w-10 h-10" />
+          <div className="min-w-0">
+            <p className="font-johnson-text text-sm text-jj-gray-08 truncate">{user?.name}</p>
+            <p className="font-johnson-text text-xs text-jj-gray-05 truncate">{user?.email}</p>
+            <Badge color={roleColor} className="mt-1.5">{roleName}</Badge>
           </div>
-        )}
-
-        {/* Backdrop to close dropdown */}
-        {showDropdown && (
-          <div
-            className="fixed inset-0 z-20"
-            onClick={() => setShowDropdown(false)}
-            aria-hidden="true"
-          />
-        )}
-      </div>
+        </div>
+        <MenuItem tone="danger" onClick={() => { setOpen(false); logout(); }}>
+          <span className="flex items-center gap-2"><Icon name="logout" className="w-4 h-4" />Sign out</span>
+        </MenuItem>
+      </Menu>
     </header>
   );
 }

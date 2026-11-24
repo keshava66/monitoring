@@ -1,54 +1,62 @@
 /** @type {import('tailwindcss').Config} */
 export default {
-  content: [
-    "./index.html",
-    "./src/**/*.{js,ts,jsx,tsx}",
-  ],
+  content: ['./index.html', './src/**/*.{js,jsx}'],
   theme: {
     extend: {
       colors: {
-        // J&J Brand Colors - Core Palette (70% of design)
-        "jj-red": "#eb1700",
-        "jj-white": "#ffffff",
-        "jj-black": "#000000",
-
-        // J&J Gray Scale - Neutral Palette
-        "jj-gray-01": "#f1efed",
-        "jj-gray-02": "#e8e6e3",
-        "jj-gray-03": "#d5cfc9",
-        "jj-gray-04": "#cbc4bc",
-        "jj-gray-05": "#a39992",
-        "jj-gray-06": "#81766f",
-        "jj-gray-07": "#6e6259",
-        "jj-gray-08": "#312c2a",
-
-        // J&J Accent Colors - Limited Use (Max 30% combined)
-        // Use ONLY for data visualization, illustrations, photography
-        // NEVER for backgrounds or text
-        "jj-yellow-01": "#fbe058",
-        "jj-orange-03": "#ff6017",
-        "jj-maroon-05": "#9e0000",
-
-        // J&J Violet Scale
-        "jj-violet-01": "#b19beb",
-        "jj-violet-03": "#8c3bbb",
-        "jj-violet-05": "#541980",
-
-        // J&J Blue Scale
-        "jj-blue-01": "#69d0ff",
-        "jj-blue-03": "#0f68b2",
-        "jj-blue-05": "#004685",
-
-        // J&J Green Scale
-        "jj-green-01": "#53ce76",
-        "jj-green-03": "#328714",
-        "jj-green-05": "#3b5a0d",
+        'jj-red': '#eb1700',
+        'jj-white': '#ffffff',
+        'jj-black': '#000000',
+        'jj-gray-01': '#f1efed',
+        'jj-gray-02': '#e8e6e3',
+        'jj-gray-03': '#d5cfc9',
+        'jj-gray-04': '#cbc4bc',
+        'jj-gray-05': '#857a73',
+        'jj-gray-06': '#6e6259',
+        'jj-gray-07': '#574d46',
+        'jj-gray-08': '#312c2a',
+        'jj-yellow-01': '#fbe058',
+        'jj-orange-03': '#ff6017',
+        'jj-maroon-05': '#9e0000',
+        'jj-violet-01': '#b19beb',
+        'jj-violet-03': '#8c3bbb',
+        'jj-violet-05': '#541980',
+        'jj-blue-01': '#69d0ff',
+        'jj-blue-03': '#0f68b2',
+        'jj-blue-05': '#004685',
+        'jj-green-01': '#53ce76',
+        'jj-green-03': '#328714',
+        'jj-green-05': '#3b5a0d',
+        terminal: '#0d1117',
       },
       fontFamily: {
-        'johnson-text': ['JohnsonText', 'Arial', 'sans-serif'],
-        'johnson-display': ['JohnsonDisplay', 'Arial', 'sans-serif'],
+        'johnson-text': ['JohnsonText', 'system-ui', 'Arial', 'sans-serif'],
+        'johnson-display': ['JohnsonDisplay', 'system-ui', 'Arial', 'sans-serif'],
+        mono: ['ui-monospace', 'SFMono-Regular', 'Menlo', 'Consolas', 'Liberation Mono', 'monospace'],
       },
-    }
+      boxShadow: {
+        card: '0 1px 2px rgba(49,44,42,0.05), 0 1px 3px rgba(49,44,42,0.06)',
+        overlay: '0 12px 32px -4px rgba(49,44,42,0.22), 0 4px 10px -2px rgba(49,44,42,0.10)',
+      },
+      keyframes: {
+        'fade-in': { from: { opacity: '0' }, to: { opacity: '1' } },
+        'dialog-in': { from: { opacity: '0', transform: 'translateY(12px) scale(0.98)' }, to: { opacity: '1', transform: 'none' } },
+        'drawer-in': { from: { transform: 'translateX(24px)', opacity: '0' }, to: { transform: 'none', opacity: '1' } },
+        'pop-in': { from: { opacity: '0', transform: 'translateY(-4px) scale(0.98)' }, to: { opacity: '1', transform: 'none' } },
+        'toast-in': { from: { opacity: '0', transform: 'translateY(8px)' }, to: { opacity: '1', transform: 'none' } },
+        'slide-in-left': { from: { transform: 'translateX(-100%)' }, to: { transform: 'none' } },
+        blink: { '0%,100%': { opacity: '1' }, '50%': { opacity: '0' } },
+      },
+      animation: {
+        'fade-in': 'fade-in 160ms ease-out',
+        'dialog-in': 'dialog-in 220ms cubic-bezier(0.16,1,0.3,1)',
+        'drawer-in': 'drawer-in 240ms cubic-bezier(0.16,1,0.3,1)',
+        'pop-in': 'pop-in 140ms cubic-bezier(0.16,1,0.3,1)',
+        'toast-in': 'toast-in 220ms cubic-bezier(0.16,1,0.3,1)',
+        'slide-in-left': 'slide-in-left 240ms cubic-bezier(0.16,1,0.3,1)',
+        blink: 'blink 1s step-end infinite',
+      },
+    },
   },
   plugins: [],
 }

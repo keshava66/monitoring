@@ -1,848 +1,652 @@
+"""Server manager: start / stop / restart the backend and frontend services on
+this host, tail their logs, git pull, and an interactive admin terminal.
+
+Every route except /health requires a Microsoft Graph token whose user is a
+member of AD_GROUP_ADMIN (comma-separated names or object ids). The terminal
+WebSocket authenticates with a short-lived one-time ticket obtained from
+POST /api/terminal/ticket, so no bearer token ever appears in a URL.
+"""
+from __future__ import annotations
+
+import asyncio
 import configparser
+import hashlib
 import json
-import secrets
-import subprocess
+import logging
 import os
 import re
-import stat
-import tempfile
-import time
-from pathlib import Path
-from typing import Optional
-
-import psutil
-import requests
-from dotenv import load_dotenv
-
-from pydantic import BaseModel
-from fastapi import FastAPI, APIRouter, HTTPException, WebSocket, WebSocketDisconnect, Header, Depends, Request
-from starlette.responses import Response as StarletteResponse
-from fastapi.responses import JSONResponse
-import asyncio
+import secrets
 import signal as _signal
+import stat
+import subprocess
+import tempfile
+import threading
+import time
+from collections import OrderedDict
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import httpx
+import psutil
 import uvicorn
+from dotenv import load_dotenv
+from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Query, Request, WebSocket
+from pydantic import BaseModel, Field
+from starlette.concurrency import run_in_threadpool
+from starlette.responses import Response as StarletteResponse
 
-BASE_DIR          = Path(__file__).parent
+BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
-CONFIG_FILE       = BASE_DIR / "config.ini"
+CONFIG_FILE = Path(os.environ.get("MANAGE_CONFIG", BASE_DIR / "config.ini"))
 SERVICE_DIRS_FILE = BASE_DIR / "service_directories.json"
+SERVICES = ("backend", "frontend")
+GRAPH_BASE = os.getenv("GRAPH_BASE_URL", "https://graph.microsoft.com/v1.0").rstrip("/")
+ENTRY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]*:[A-Za-z_][A-Za-z0-9_]*$")
 
-SERVICES = {"backend", "frontend"}
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+logger = logging.getLogger("manage")
 
 
 # ── AUTH ─────────────────────────────────────────────────────────────────────
-# This panel starts/stops services, runs git pull with stored credentials, and
-# gives a raw shell over WebSocket — it used to have NO auth check at all.
-# Every HTTP route now requires a valid Microsoft Graph token belonging to
-# someone in the configured admin AD group. Same model as backend/auth.py,
-# duplicated here on purpose since this runs standalone on its own box with
-# no shared library to import from.
 
-_TOKEN_CACHE: dict = {}
-_TOKEN_CACHE_TTL = 60
+_graph = httpx.Client(timeout=httpx.Timeout(10.0, connect=5.0))
+_ADMIN_GROUPS = {g.strip() for g in os.environ.get("AD_GROUP_ADMIN", "").split(",") if g.strip()}
+if not _ADMIN_GROUPS:
+    logger.warning("AD_GROUP_ADMIN is not set — every request will be rejected.")
 
 
-def _is_admin_token(token: str) -> bool:
-    cached = _TOKEN_CACHE.get(token)
-    if cached and cached[0] > time.time():
-        return cached[1]
+class _TokenCache:
+    def __init__(self, ttl: int = 60, max_entries: int = 1024):
+        self.ttl, self.max_entries = ttl, max_entries
+        self._data: "OrderedDict[str, Tuple[float, Optional[str]]]" = OrderedDict()
+        self._lock = threading.Lock()
 
-    me = requests.get(
-        "https://graph.microsoft.com/v1.0/me",
-        headers={"Authorization": f"Bearer {token}"}, timeout=10,
-    )
-    if me.status_code == 401:
+    def get(self, token: str):
+        k = hashlib.sha256(token.encode()).hexdigest()
+        with self._lock:
+            hit = self._data.get(k)
+            if hit and hit[0] > time.monotonic():
+                return True, hit[1]
+            self._data.pop(k, None)
+            return False, None
+
+    def put(self, token: str, email: Optional[str]):
+        k = hashlib.sha256(token.encode()).hexdigest()
+        with self._lock:
+            self._data[k] = (time.monotonic() + self.ttl, email)
+            while len(self._data) > self.max_entries:
+                self._data.popitem(last=False)
+
+
+_tokens = _TokenCache()
+
+
+def _graph_get(url: str, token: str, params: Optional[Dict] = None) -> httpx.Response:
+    try:
+        return _graph.get(url if url.startswith("http") else GRAPH_BASE + url, params=params,
+                          headers={"Authorization": f"Bearer {token}"})
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=503, detail="Identity provider unavailable") from exc
+
+
+def _admin_email(token: str) -> Optional[str]:
+    """Email of the token's user if they're an admin, else None."""
+    hit, email = _tokens.get(token)
+    if hit:
+        return email
+    me = _graph_get("/me", token, {"$select": "mail,userPrincipalName"})
+    if me.status_code in (401, 403):
         raise HTTPException(status_code=401, detail="Invalid or expired token")
-    if not me.ok:
-        raise HTTPException(status_code=me.status_code, detail="Failed to validate token")
-
-    admin_group = os.environ.get("AD_GROUP_ADMIN", "")
+    if not me.is_success:
+        raise HTTPException(status_code=503, detail="Identity provider unavailable")
+    profile = me.json()
+    email = (profile.get("mail") or profile.get("userPrincipalName") or "").lower()
     is_admin = False
-    if admin_group:
-        g = requests.get(
-            "https://graph.microsoft.com/v1.0/me/memberOf",
-            headers={"Authorization": f"Bearer {token}"}, timeout=10,
-        )
-        if g.ok:
-            for grp in g.json().get("value", []):
-                if grp.get("displayName") == admin_group or grp.get("id") == admin_group:
-                    is_admin = True
-                    break
-    else:
-        # No admin group configured — nobody gets in. Misconfiguration
-        # should fail closed, not silently grant access to everyone.
-        is_admin = False
-
-    _TOKEN_CACHE[token] = (time.time() + _TOKEN_CACHE_TTL, is_admin)
-    return is_admin
+    url: Optional[str] = "/me/memberOf"
+    params: Optional[Dict] = {"$select": "id,displayName", "$top": "999"}
+    for _ in range(20):
+        if not url or is_admin or not _ADMIN_GROUPS:
+            break
+        resp = _graph_get(url, token, params)
+        if not resp.is_success:
+            break
+        body = resp.json()
+        is_admin = any(g.get("displayName") in _ADMIN_GROUPS or g.get("id") in _ADMIN_GROUPS for g in body.get("value", []))
+        url, params = body.get("@odata.nextLink"), None
+    result = email if is_admin and email else None
+    _tokens.put(token, result)
+    return result
 
 
-def require_admin(request: Request, authorization: Optional[str] = Header(None)):
-    # /health is the one intentionally-open route — start.sh, load balancers,
-    # and uptime checks hit it with no token and just need a liveness signal.
-    # It reveals nothing sensitive (see the handler below).
-    if request.url.path == "/health":
-        return
+def require_admin(authorization: Optional[str] = Header(None)) -> str:
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
-    token = authorization[7:]
-    if not _is_admin_token(token):
+    email = _admin_email(authorization[7:].strip())
+    if not email:
         raise HTTPException(status_code=403, detail="Admin role required")
+    return email
 
 
-app = FastAPI(title="Server Manager")
+# One-time terminal tickets: browsers can't send headers on a WebSocket
+# handshake, so the authenticated REST call mints a 30-second ticket instead.
+_tickets: Dict[str, Tuple[float, str]] = {}
+_tickets_lock = threading.Lock()
+TICKET_TTL = 30
+
+
+def _mint_ticket(email: str) -> str:
+    ticket = secrets.token_urlsafe(32)
+    now = time.monotonic()
+    with _tickets_lock:
+        for k in [k for k, (exp, _) in _tickets.items() if exp <= now]:
+            del _tickets[k]
+        _tickets[ticket] = (now + TICKET_TTL, email)
+    return ticket
+
+
+def _redeem_ticket(ticket: str) -> Optional[str]:
+    with _tickets_lock:
+        entry = _tickets.pop(ticket, None)
+    if entry and entry[0] > time.monotonic():
+        return entry[1]
+    return None
+
+
+# ── APP / CORS ───────────────────────────────────────────────────────────────
+
+app = FastAPI(title="Server Manager", version="2.0.0", docs_url=None, redoc_url=None, openapi_url=None)
 _protected = APIRouter(dependencies=[Depends(require_admin)])
+_ALLOWED_ORIGINS = [o.strip().rstrip("/") for o in os.environ.get("ALLOWED_ORIGINS", "").split(",") if o.strip()]
 
-# ── CORS ─────────────────────────────────────────────────────────────────────
-# Pure ASGI middleware — the only reliable way to skip WebSocket connections.
-# BaseHTTPMiddleware and Starlette's CORSMiddleware both have version-dependent
-# bugs that reject WebSocket upgrades with HTTP 403.  A raw ASGI middleware
-# lets us gate on scope["type"] before any Starlette machinery runs.
+
 class _CORSMiddleware:
+    """Minimal CORS for bearer-token APIs. WebSocket and lifespan scopes pass
+    straight through untouched."""
+
     def __init__(self, app):
         self.app = app
 
     async def __call__(self, scope, receive, send):
-        # WebSocket (and lifespan) — pass straight through, no CORS check
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
-
-        origin = dict(scope.get("headers", [])).get(b"origin", b"").decode()
-        allow_origin = origin if (origin and origin in _ALLOWED_ORIGINS) else (_ALLOWED_ORIGINS[0] if _ALLOWED_ORIGINS else "")
-
-        # OPTIONS preflight — respond immediately
-        if scope.get("method") == "OPTIONS":
-            response = StarletteResponse(
-                status_code=200,
-                headers={
-                    "Access-Control-Allow-Origin":  allow_origin,
-                    "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-                    "Access-Control-Allow-Headers": "*",
-                    "Access-Control-Max-Age":       "600",
-                },
-            )
-            await response(scope, receive, send)
+        origin = dict(scope.get("headers") or []).get(b"origin", b"").decode("latin-1")
+        allowed = origin if origin in _ALLOWED_ORIGINS else ""
+        if scope.get("method") == "OPTIONS" and origin:
+            headers = {"Vary": "Origin"}
+            if allowed:
+                headers.update({
+                    "Access-Control-Allow-Origin": allowed,
+                    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+                    "Access-Control-Allow-Headers": "Authorization, Content-Type",
+                    "Access-Control-Max-Age": "600",
+                })
+            await StarletteResponse(status_code=204 if allowed else 403, headers=headers)(scope, receive, send)
             return
 
-        # All other HTTP — inject CORS header into the response
         async def _inject(message):
             if message["type"] == "http.response.start":
                 headers = list(message.get("headers", []))
-                if allow_origin:
-                    headers.append((b"access-control-allow-origin", allow_origin.encode()))
+                headers.append((b"vary", b"Origin"))
+                headers.append((b"x-content-type-options", b"nosniff"))
+                if allowed:
+                    headers.append((b"access-control-allow-origin", allowed.encode()))
                 message = {**message, "headers": headers}
             await send(message)
 
         await self.app(scope, receive, _inject)
 
-_ALLOWED_ORIGINS = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "").split(",") if o.strip()]
+
 app.add_middleware(_CORSMiddleware)
 
 
-# ── helpers ───────────────────────────────────────────────────────────────────
+# ── helpers ──────────────────────────────────────────────────────────────────
 
 def read_config() -> configparser.ConfigParser:
-    cfg = configparser.ConfigParser()
-    if not CONFIG_FILE.exists():
-        raise RuntimeError(f"config.ini not found at {CONFIG_FILE}")
-    cfg.read(CONFIG_FILE)
+    if not CONFIG_FILE.is_file():
+        raise HTTPException(status_code=500, detail=f"config.ini not found at {CONFIG_FILE}")
+    cfg = configparser.ConfigParser(interpolation=None)
+    cfg.read(CONFIG_FILE, encoding="utf-8")
     return cfg
 
 
-def run_script(script_path: str, args: Optional[list] = None, timeout: int = 30) -> dict:
-    if not script_path or not Path(script_path).exists():
+def _section(cfg: configparser.ConfigParser, name: str) -> Dict[str, str]:
+    return dict(cfg[name]) if cfg.has_section(name) else {}
+
+
+def _ssl_env(cfg: configparser.ConfigParser) -> Dict[str, str]:
+    ssl = _section(cfg, "ssl")
+    return {"SSL_CERTFILE": ssl.get("certfile", ""), "SSL_KEYFILE": ssl.get("keyfile", "")}
+
+
+def allowed_roots(cfg: configparser.ConfigParser) -> List[Path]:
+    roots = [Path.home().resolve()]
+    roots += [Path(p.strip()).resolve() for p in _section(cfg, "search_paths").values() if p.strip()]
+    return roots
+
+
+def within_roots(path: Path, roots: List[Path]) -> bool:
+    return any(path == r or r in path.parents for r in roots)
+
+
+def run_script(script_path: str, args: List[str], env_extra: Dict[str, str], timeout: int = 60) -> dict:
+    if not script_path or not Path(script_path).is_file():
         return {"stdout": "", "stderr": f"Script not found: {script_path}", "returncode": -1}
     try:
-        result = subprocess.run(
-            ["bash", script_path] + (args or []),
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-        return {
-            "stdout": result.stdout.strip(),
-            "stderr": result.stderr.strip(),
-            "returncode": result.returncode,
-        }
+        result = subprocess.run(["bash", script_path, *args], capture_output=True, text=True, timeout=timeout,
+                                env={**os.environ, **{k: v for k, v in env_extra.items() if v}})
+        return {"stdout": result.stdout.strip(), "stderr": result.stderr.strip(), "returncode": result.returncode}
     except subprocess.TimeoutExpired:
-        return {"stdout": "", "stderr": "Script timed out", "returncode": -1}
-    except Exception as exc:
+        return {"stdout": "", "stderr": f"Script timed out after {timeout}s", "returncode": -1}
+    except OSError as exc:
         return {"stdout": "", "stderr": str(exc), "returncode": -1}
 
 
-def read_pid(svc_dir: str) -> Optional[int]:
-    """Read the pidfile inside the service's own directory and confirm it's alive."""
+def read_pid(svc_dir: str, service: str) -> Optional[int]:
     if not svc_dir:
         return None
-    pid_file = None
-    for name in ("backend.pid", "frontend.pid", "service.pid"):
-        candidate = Path(svc_dir) / name
-        if candidate.exists():
-            pid_file = candidate
-            break
-    if not pid_file:
-        return None
     try:
-        pid = int(pid_file.read_text().strip())
-        return pid if psutil.pid_exists(pid) else None
-    except Exception:
+        pid = int((Path(svc_dir) / f"{service}.pid").read_text().strip())
+    except (OSError, ValueError):
         return None
-
-
-
+    return pid if psutil.pid_exists(pid) else None
 
 
 def fmt_uptime(create_time: float) -> str:
-    secs = int(time.time() - create_time)
+    secs = max(0, int(time.time() - create_time))
     d, r = divmod(secs, 86400)
     h, r = divmod(r, 3600)
     m, _ = divmod(r, 60)
-    if d: return f"{d}d {h}h"
-    if h: return f"{h}h {m}m"
+    if d:
+        return f"{d}d {h}h"
+    if h:
+        return f"{h}h {m}m"
     return f"{m}m"
 
 
 def proc_stats(pid: Optional[int]) -> dict:
-    """Best-effort CPU/mem/uptime for a known PID. None fields if unavailable
-    (process from another user, already exited, or psutil not permitted)."""
     if not pid:
         return {"cpu": None, "mem": None, "uptime": None}
     try:
         p = psutil.Process(pid)
-        return {
-            "cpu":    round(p.cpu_percent(interval=0.1), 1),
-            "mem":    round(p.memory_percent(), 1),
-            "uptime": fmt_uptime(p.create_time()),
-        }
-    except Exception:
+        return {"cpu": round(p.cpu_percent(interval=0.1), 1), "mem": round(p.memory_percent(), 1),
+                "uptime": fmt_uptime(p.create_time())}
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
         return {"cpu": None, "mem": None, "uptime": None}
 
 
-def validate_service(service: str):
+def validate_service(service: str) -> None:
     if service not in SERVICES:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unknown service '{service}'. Valid: {sorted(SERVICES)}"
-        )
+        raise HTTPException(status_code=400, detail=f"Unknown service '{service}'. Valid: {list(SERVICES)}")
 
 
-# ── routes ────────────────────────────────────────────────────────────────────
+def _service_args(cfg, service: str, action: str) -> Tuple[str, List[str]]:
+    sec = _section(cfg, service)
+    script = _section(cfg, "scripts").get(service, "")
+    dir_, port_ = sec.get("dir", ""), sec.get("port", "")
+    if not dir_:
+        raise HTTPException(status_code=400, detail=f"{service}.dir not set in config.ini")
+    if not port_.isdigit():
+        raise HTTPException(status_code=400, detail=f"{service}.port not set in config.ini")
+    args = [action, dir_, port_]
+    if service == "backend" and action != "stop":
+        entry = sec.get("entry", "")
+        if not ENTRY_RE.match(entry):
+            raise HTTPException(status_code=400, detail="backend.entry must look like module:app in config.ini")
+        args.append(entry)
+    return script, args
 
-@_protected.get("/health")
-async def health():
+
+def _service_action(service: str, action: str, email: str, timeout: int) -> dict:
+    validate_service(service)
+    cfg = read_config()
+    script, args = _service_args(cfg, service, action)
+    logger.info("%s requested %s %s", email, action, service)
+    result = run_script(script, args, _ssl_env(cfg), timeout=timeout)
+    output = "\n".join(x for x in (result["stdout"], result["stderr"]) if x).strip()
+    logger.info("%s %s finished with code %s", action, service, result["returncode"])
+    return {"service": service, "action": action, "output": output, "returncode": result["returncode"]}
+
+
+# ── routes ───────────────────────────────────────────────────────────────────
+
+@app.get("/health")
+def health():
     return {"status": "healthy"}
 
 
 @_protected.get("/api/services")
-async def get_services():
-    """Return display metadata for each service (name, port, dir).
-    No credentials, SSL details, or internal config are exposed.
-    """
+def get_services():
     cfg = read_config()
-    result = {}
-    for svc in SERVICES:
-        section = cfg[svc] if svc in cfg else {}
-        result[svc] = {
-            "name": section.get("name", ""),
-            "port": section.get("port", ""),
-            "dir":  section.get("dir", ""),
-        }
-    return result
+    return {svc: {k: _section(cfg, svc).get(k, "") for k in ("name", "port", "dir")} for svc in SERVICES}
 
 
 @_protected.get("/api/status/{service}")
 def status(service: str):
     validate_service(service)
-    cfg     = read_config()
-    svc_dir = cfg[service].get("dir", "") if service in cfg else ""
-    pid     = read_pid(svc_dir)
-    stats   = proc_stats(pid)
-    return {
-        "service":    service,
-        "running":    pid is not None,
-        "pid":        pid,
-        "cpu":        stats["cpu"],
-        "mem":        stats["mem"],
-        "uptime":     stats["uptime"],
-    }
+    svc_dir = _section(read_config(), service).get("dir", "")
+    pid = read_pid(svc_dir, service)
+    return {"service": service, "running": pid is not None, "pid": pid, **proc_stats(pid)}
 
 
 @_protected.post("/api/start/{service}")
-def start(service: str):
-    validate_service(service)
-    cfg    = read_config()
-    script = cfg["scripts"].get(service, "")
-    dir_   = cfg[service].get("dir", "") if service in cfg else ""
-    port_  = cfg[service].get("port", "") if service in cfg else ""
-    if not dir_:
-        raise HTTPException(status_code=400, detail=f"{service}.dir not set in config.ini")
-    if not port_:
-        raise HTTPException(status_code=400, detail=f"{service}.port not set in config.ini")
-    script_args = ["start", dir_, port_]
-    if service == "backend":
-        entry_ = cfg[service].get("entry", "")
-        if not entry_:
-            raise HTTPException(status_code=400, detail="backend.entry not set in config.ini")
-        script_args.append(entry_)
-    result = run_script(script, args=script_args)
-    output = (result["stdout"] or result["stderr"]).strip()
-    return {
-        "service":    service,
-        "action":     "start",
-        "output":     output,
-        "returncode": result["returncode"],
-    }
+def start(service: str, email: str = Depends(require_admin)):
+    return _service_action(service, "start", email, timeout=600)
 
 
 @_protected.post("/api/stop/{service}")
-def stop(service: str):
-    validate_service(service)
-    cfg    = read_config()
-    script = cfg["scripts"].get(service, "")
-    dir_   = cfg[service].get("dir", "") if service in cfg else ""
-    port_  = cfg[service].get("port", "") if service in cfg else ""
-    if not dir_:
-        raise HTTPException(status_code=400, detail=f"{service}.dir not set in config.ini")
-    if not port_:
-        raise HTTPException(status_code=400, detail=f"{service}.port not set in config.ini")
-    result = run_script(script, args=["stop", dir_, port_])
-    output = (result["stdout"] or result["stderr"]).strip()
-    return {
-        "service":    service,
-        "action":     "stop",
-        "output":     output,
-        "returncode": result["returncode"],
-    }
+def stop(service: str, email: str = Depends(require_admin)):
+    return _service_action(service, "stop", email, timeout=60)
 
 
 @_protected.post("/api/restart/{service}")
-def restart(service: str):
-    validate_service(service)
-    cfg    = read_config()
-    script = cfg["scripts"].get(service, "")
-    dir_   = cfg[service].get("dir", "") if service in cfg else ""
-    port_  = cfg[service].get("port", "") if service in cfg else ""
-    if not dir_:
-        raise HTTPException(status_code=400, detail=f"{service}.dir not set in config.ini")
-    if not port_:
-        raise HTTPException(status_code=400, detail=f"{service}.port not set in config.ini")
-    script_args = ["restart", dir_, port_]
-    if service == "backend":
-        entry_ = cfg[service].get("entry", "")
-        if not entry_:
-            raise HTTPException(status_code=400, detail="backend.entry not set in config.ini")
-        script_args.append(entry_)
-    # frontend rebuilds inside the script itself on restart, so give it more time
-    result = run_script(script, args=script_args, timeout=300)
-    output = (result["stdout"] or result["stderr"]).strip()
-    return {
-        "service":    service,
-        "action":     "restart",
-        "output":     output,
-        "returncode": result["returncode"],
-    }
+def restart(service: str, email: str = Depends(require_admin)):
+    return _service_action(service, "restart", email, timeout=900)
 
 
 @_protected.get("/api/logs/{service}")
-def logs(service: str, lines: int = 100):
+def logs(service: str, lines: int = Query(200, ge=1, le=5000)):
     validate_service(service)
-    cfg      = read_config()
-    svc_dir  = cfg[service].get("dir", "") if service in cfg else ""
-    log_name = "backend.log" if service == "backend" else "frontend.log"
-    log_file = str(Path(svc_dir) / log_name) if svc_dir else ""
-    if not log_file or not Path(log_file).exists():
-        return {"service": service, "logs": f"Log file not found: {log_file}"}
-    result = subprocess.run(
-        ["tail", "-n", str(min(lines, 500)), log_file],
-        capture_output=True, text=True,
-    )
+    svc_dir = _section(read_config(), service).get("dir", "")
+    log_file = Path(svc_dir) / f"{service}.log" if svc_dir else None
+    if not log_file or not log_file.is_file():
+        return {"service": service, "logs": f"Log file not found: {log_file or '(service dir not set)'}"}
+    result = subprocess.run(["tail", "-n", str(lines), str(log_file)], capture_output=True, text=True, timeout=10)
     return {"service": service, "logs": result.stdout}
 
 
 @_protected.get("/api/scripts")
 def list_scripts():
-    """
-    Return .sh scripts found in service directories and the home directory.
-    Used by the Terminal palette to populate the Scripts category.
-    """
     cfg = read_config()
-    search_dirs: set[str] = {str(Path.home())}
-
-    for section in SERVICES:
-        try:
-            d = cfg[section].get("dir", "").strip() if section in cfg else ""
-            if d and Path(d).exists():
-                search_dirs.add(d)
-        except Exception:
-            pass
-
-    scripts: list[dict] = []
-    seen: set[str]      = set()
-
-    for d in sorted(search_dirs):
-        try:
-            result = subprocess.run(
-                ["find", d, "-maxdepth", "1", "-name", "*.sh", "-type", "f"],
-                capture_output=True, text=True, timeout=5,
-            )
-            for line in result.stdout.strip().splitlines():
-                path = line.strip()
-                if path and path not in seen:
-                    seen.add(path)
-                    scripts.append({
-                        "name": Path(path).name,
-                        "path": path,
-                        "cmd":  f"bash {path}",
-                    })
-        except Exception:
-            pass
-
+    dirs = {str(Path.home())}
+    for svc in SERVICES:
+        d = _section(cfg, svc).get("dir", "").strip()
+        if d and Path(d).is_dir():
+            dirs.add(d)
+    scripts, seen = [], set()
+    for d in sorted(dirs):
+        for path in sorted(Path(d).glob("*.sh")):
+            if path.is_file() and str(path) not in seen:
+                seen.add(str(path))
+                scripts.append({"name": path.name, "path": str(path), "cmd": f"bash {json.dumps(str(path))}"})
     return {"scripts": sorted(scripts, key=lambda s: s["name"])}
-
-
-def _make_askpass(username: str, password: str) -> str:
-    """
-    Write a temporary Python GIT_ASKPASS script and return its path.
-    The caller is responsible for deleting the file when done.
-    """
-    content = (
-        "#!/usr/bin/env python3\n"
-        "import sys\n"
-        "prompt = sys.argv[1] if len(sys.argv) > 1 else ''\n"
-        f"print({repr(username)} if 'Username' in prompt else {repr(password)})\n"
-    )
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
-        f.write(content)
-        path = f.name
-    os.chmod(path, stat.S_IRWXU)
-    return path
-
-
-
-
-# ── DIRECTORY / REPO MANAGEMENT ──────────────────────────────────────────────
-
-class ServiceDirUpdate(BaseModel):
-    dir: str
-    port: Optional[int] = None
-    entry: Optional[str] = None   # e.g. "app:app" — only needed if auto-detect can't find it
 
 
 @_protected.get("/api/repos")
 def list_repos():
-    """
-    Walk configured search paths (config.ini [search_paths]) looking for git
-    repos (directories that contain a .git folder).  Falls back to the home
-    directory if no search paths are configured.
-
-    config.ini example:
-        [search_paths]
-        dev  = /home/sa-prd-rdi-react-dev
-        data = /opt/projects
-    """
     cfg = read_config()
-
-    search_dirs = []
-    if "search_paths" in cfg:
-        for key in cfg["search_paths"]:
-            p = cfg["search_paths"][key].strip()
-            if p and Path(p).exists():
-                search_dirs.append(p)
-
-    if not search_dirs:
-        search_dirs = [str(Path.home())]
-
-    repos: set[str] = set()
-    for base in search_dirs:
+    bases = [p for p in (v.strip() for v in _section(cfg, "search_paths").values()) if p and Path(p).is_dir()]
+    repos = set()
+    for base in bases or [str(Path.home())]:
         try:
             result = subprocess.run(
                 ["find", base, "-maxdepth", "5", "-name", ".git", "-type", "d",
-                 "-not", "-path", "*/node_modules/*",
-                 "-not", "-path", "*/.venv/*",
-                 "-not", "-path", "*/venv/*"],
+                 "-not", "-path", "*/node_modules/*", "-not", "-path", "*/.venv/*", "-not", "-path", "*/venv/*"],
                 capture_output=True, text=True, timeout=15,
             )
-            for line in result.stdout.strip().splitlines():
-                git_dir = line.strip()
-                if git_dir:
-                    repos.add(str(Path(git_dir).parent))
-        except Exception:
-            pass
-
+            repos.update(str(Path(l.strip()).parent) for l in result.stdout.splitlines() if l.strip())
+        except subprocess.TimeoutExpired:
+            logger.warning("Repo scan under %s timed out", base)
     return {"repos": sorted(repos)}
 
 
 @_protected.get("/api/service-directories")
 def list_service_directories():
-    if not SERVICE_DIRS_FILE.exists():
+    if not SERVICE_DIRS_FILE.is_file():
         return {svc: [] for svc in SERVICES}
-
     try:
-        with open(SERVICE_DIRS_FILE) as f:
-            data = json.load(f)
-    except Exception:
+        data = json.loads(SERVICE_DIRS_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
         raise HTTPException(status_code=500, detail="service_directories.json is not valid JSON.")
-
     result = {}
     for svc in SERVICES:
         out = []
         for entry in data.get(svc, []):
             path = (entry.get("path") or "").strip()
-            if not path:
-                continue
-            out.append({
-                "path":   path,
-                "label":  entry.get("label") or path,
-                "notes":  entry.get("notes", ""),
-                "port":   entry.get("port"),
-                "entry":  entry.get("entry", ""),
-                "exists": Path(path).exists(),
-            })
+            if path:
+                out.append({"path": path, "label": entry.get("label") or path, "notes": entry.get("notes", ""),
+                            "port": entry.get("port"), "entry": entry.get("entry", ""), "exists": Path(path).is_dir()})
         result[svc] = out
     return result
 
 
+class ServiceDirUpdate(BaseModel):
+    dir: str = Field(..., min_length=1, max_length=1024)
+    port: Optional[int] = Field(None, ge=1, le=65535)
+    entry: Optional[str] = Field(None, max_length=128)
+
+
 @_protected.post("/api/service/{service}/dir")
-async def update_service_dir(service: str, body: ServiceDirUpdate):
-    """Persist a new working directory for a service in config.ini."""
+def update_service_dir(service: str, body: ServiceDirUpdate, email: str = Depends(require_admin)):
     validate_service(service)
-    new_dir = body.dir.strip()
-
-    if not new_dir:
-        raise HTTPException(status_code=400, detail="Directory path is required.")
-    resolved = Path(new_dir).resolve()
-    if not resolved.exists():
-        raise HTTPException(status_code=400, detail=f"Directory does not exist: {new_dir}")
-
-    # This directory becomes a `cwd` that later gets a shell script run in
-    # it — restrict it to somewhere the operator actually configured
-    # (search_paths / home dir) instead of accepting any path on the box.
     cfg = read_config()
-    allowed_roots = [Path.home().resolve()]
-    if "search_paths" in cfg:
-        for key in cfg["search_paths"]:
-            p = cfg["search_paths"][key].strip()
-            if p:
-                allowed_roots.append(Path(p).resolve())
-    if not any(resolved == root or root in resolved.parents for root in allowed_roots):
-        raise HTTPException(
-            status_code=400,
-            detail="Directory is outside the configured search_paths / home directory.",
-        )
-    new_dir = str(resolved)
-
-    if service not in cfg:
-        cfg[service] = {}
-    cfg[service]["dir"] = new_dir
+    resolved = Path(body.dir.strip()).resolve()
+    if not resolved.is_dir():
+        raise HTTPException(status_code=400, detail=f"Directory does not exist: {body.dir}")
+    if not within_roots(resolved, allowed_roots(cfg)):
+        raise HTTPException(status_code=400, detail="Directory is outside the configured search_paths / home directory.")
+    if body.entry and not ENTRY_RE.match(body.entry):
+        raise HTTPException(status_code=400, detail="entry must look like module:app")
+    if not cfg.has_section(service):
+        cfg.add_section(service)
+    cfg[service]["dir"] = str(resolved)
     if body.port:
         cfg[service]["port"] = str(body.port)
     if body.entry:
         cfg[service]["entry"] = body.entry
     elif "entry" in cfg[service]:
+        # A different directory almost always means a different app module;
+        # never carry the previous one over silently.
         del cfg[service]["entry"]
-
-    with open(CONFIG_FILE, "w") as f:
+    fd, tmp = tempfile.mkstemp(dir=str(CONFIG_FILE.parent), prefix=".config_", suffix=".ini")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
         cfg.write(f)
+    os.chmod(tmp, stat.S_IRUSR | stat.S_IWUSR)
+    os.replace(tmp, CONFIG_FILE)
+    logger.info("%s set %s dir to %s", email, service, resolved)
+    return {"success": True, "service": service, "dir": str(resolved), "port": cfg[service].get("port", "")}
 
-    return {"success": True, "service": service, "dir": new_dir, "port": cfg[service].get("port", "")}
+
+def _make_askpass(username: str, password: str) -> str:
+    """Temporary 0700 GIT_ASKPASS helper; the caller deletes it."""
+    content = (
+        "#!/usr/bin/env python3\nimport sys\n"
+        "prompt = sys.argv[1] if len(sys.argv) > 1 else ''\n"
+        f"print({username!r} if 'username' in prompt.lower() else {password!r})\n"
+    )
+    fd, path = tempfile.mkstemp(prefix="askpass_", suffix=".py")
+    with os.fdopen(fd, "w") as f:
+        f.write(content)
+    os.chmod(path, stat.S_IRWXU)
+    return path
+
+
+def _repo_credentials(cfg) -> Tuple[str, str]:
+    repo = _section(cfg, "repo")
+    return (os.environ.get("REPO_USERNAME") or repo.get("username", ""),
+            os.environ.get("REPO_PASSWORD") or repo.get("password", ""))
+
 
 class GitPullRequest(BaseModel):
-    dir: Optional[str] = None   # target directory; falls back to repo.dir in config if omitted
+    dir: Optional[str] = Field(None, max_length=1024)
 
 
 @_protected.post("/api/gitpull")
-def gitpull(body: GitPullRequest = GitPullRequest()):
+def gitpull(body: GitPullRequest = GitPullRequest(), email: str = Depends(require_admin)):
     cfg = read_config()
-
-    # Resolve target directory: request body → config.ini [repo] dir → error
-    repo_dir = (body.dir or "").strip()
+    repo_dir = (body.dir or _section(cfg, "repo").get("dir", "")).strip()
     if not repo_dir:
-        repo_dir = cfg["repo"].get("dir", "").strip() if "repo" in cfg else ""
-    if not repo_dir or not Path(repo_dir).exists():
-        raise HTTPException(
-            status_code=400,
-            detail='No target directory. Pass dir in the request body or set repo.dir in config.ini.',
-        )
-
-    username = cfg["repo"].get("username", "", vars=None, raw=True) if "repo" in cfg else ""
-    password = cfg["repo"].get("password", "", vars=None, raw=True) if "repo" in cfg else ""
-
+        raise HTTPException(status_code=400, detail="No target directory. Pass dir or set repo.dir in config.ini.")
+    target = Path(repo_dir).resolve()
+    if not (target / ".git").exists():
+        raise HTTPException(status_code=400, detail=f"Not a git repository: {repo_dir}")
+    if body.dir and not within_roots(target, allowed_roots(cfg)):
+        raise HTTPException(status_code=400, detail="Repository is outside the configured search_paths / home directory.")
+    username, password = _repo_credentials(cfg)
     if not username or not password:
-        raise HTTPException(status_code=400, detail="repo.username / repo.password not set in config.ini")
-
-    askpass_file = None
+        raise HTTPException(status_code=400, detail="repo.username / repo.password not set")
+    askpass = _make_askpass(username, password)
     try:
-        askpass_file = _make_askpass(username, password)
-        env                        = os.environ.copy()
-        env["GIT_ASKPASS"]         = askpass_file
-        env["GIT_TERMINAL_PROMPT"] = "0"
-
-        result = subprocess.run(
-            ["git", "-C", repo_dir, "pull"],
-            capture_output=True,
-            text=True,
-            timeout=120,
-            env=env,
-        )
-
-        output = (result.stdout + result.stderr).strip()
-        output = output.replace(username, "***").replace(password, "***")
-
+        env = {**os.environ, "GIT_ASKPASS": askpass, "GIT_TERMINAL_PROMPT": "0"}
+        result = subprocess.run(["git", "-C", str(target), "pull", "--ff-only"], capture_output=True, text=True,
+                                timeout=180, env=env)
+        output = (result.stdout + result.stderr).strip().replace(password, "***")
+        logger.info("%s ran git pull in %s (code %s)", email, target, result.returncode)
         return {"output": output, "returncode": result.returncode}
-
     except subprocess.TimeoutExpired:
-        return {"output": "git pull timed out after 120 seconds.", "returncode": -1}
-    except Exception as exc:
-        return {"output": str(exc), "returncode": -1}
+        return {"output": "git pull timed out after 180 seconds.", "returncode": -1}
     finally:
-        if askpass_file and Path(askpass_file).exists():
-            os.unlink(askpass_file)
+        Path(askpass).unlink(missing_ok=True)
 
 
-# ── TERMINAL ──────────────────────────────────────────────────────────────────
+@_protected.post("/api/terminal/ticket")
+def terminal_ticket(email: str = Depends(require_admin)):
+    return {"ticket": _mint_ticket(email), "expires_in": TICKET_TTL}
+
 
 app.include_router(_protected)
 
+
+# ── TERMINAL ─────────────────────────────────────────────────────────────────
+
+_LS_COLORS = ":".join([
+    "rs=0", "di=01;34", "ln=01;36", "pi=40;33", "so=01;35", "bd=40;33;01", "cd=40;33;01", "or=40;31;01",
+    "ex=01;32", "*.tar=01;31", "*.tgz=01;31", "*.zip=01;31", "*.gz=01;31", "*.jpg=01;35", "*.png=01;35",
+    "*.json=00;33", "*.yaml=00;33", "*.yml=00;33", "*.ini=00;33", "*.py=00;33", "*.js=00;33", "*.jsx=00;33",
+    "*.sql=00;33", "*.md=00;36", "*.txt=00;36", "*.log=00;90", "*.pem=01;33", "*.key=01;33",
+])
+_COLOR_INIT = (
+    'ls(){ command ls --color=always "$@"; }; '
+    'grep(){ command grep --color=always "$@"; }; '
+)
+MAX_OUTPUT_CHUNK = 16 * 1024
+
+
+def _kill_group(proc, sig=_signal.SIGTERM) -> None:
+    try:
+        os.killpg(os.getpgid(proc.pid), sig)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.send_signal(sig)
+        except ProcessLookupError:
+            pass
+
+
 @app.websocket("/ws/terminal")
 async def terminal_ws(websocket: WebSocket):
-    """
-    Interactive terminal over WebSocket.
-
-    Client → Server messages (JSON):
-      { "cmd": "ls -la" }                          — run a command
-      { "type": "signal", "signal": "SIGINT" }     — send Ctrl+C to running process
-
-    Server → Client messages (JSON):
-      { "type": "cwd",    "cwd": "/path" }         — sent on connect and after cd
-      { "type": "stdout", "data": "..." }           — streamed stdout chunk
-      { "type": "stderr", "data": "..." }           — streamed stderr chunk
-      { "type": "exit",   "code": 0, "cwd": "/" }  — process finished
-      { "type": "clear" }                           — clear screen (for 'clear' command)
-    """
+    """Client → server: {"cmd": "..."} or {"type": "signal", "signal": "SIGINT"}.
+    Server → client: cwd / stdout / stderr / exit / clear messages."""
     await websocket.accept()
-
-    # Browsers can't set an Authorization header on a WebSocket handshake, so
-    # the token is passed as a query param instead — validated exactly like
-    # every REST route (see require_admin above). Reject before doing
-    # anything else: this used to accept and run commands with zero checks.
-    token = websocket.query_params.get("token", "")
-    try:
-        if not token or not _is_admin_token(token):
-            await websocket.close(code=4401)
-            return
-    except HTTPException:
-        await websocket.close(code=4401)
+    email = _redeem_ticket(websocket.query_params.get("ticket", ""))
+    if not email:
+        await websocket.close(code=4401, reason="Not authorized")
         return
 
     cwd = str(Path.home())
     await websocket.send_json({"type": "cwd", "cwd": cwd})
+    logger.info("%s opened a terminal session", email)
 
-    # Build a process environment that includes git credentials from config.ini.
-    # All subprocesses inherit this env so `git pull / push / fetch` work without
-    # interactive prompts, exactly like the /api/gitpull endpoint.
-    _askpass_file = None
+    askpass = None
     try:
-        _cfg = read_config()
-        _username = _cfg["repo"].get("username", "", vars=None, raw=True) if "repo" in _cfg else ""
-        _password = _cfg["repo"].get("password", "", vars=None, raw=True) if "repo" in _cfg else ""
-        if _username and _password:
-            _askpass_file = _make_askpass(_username, _password)
-    except Exception:
+        username, password = _repo_credentials(read_config())
+        if username and password:
+            askpass = _make_askpass(username, password)
+    except HTTPException:
         pass
 
-    _term_env = os.environ.copy()
-    # ── Color environment ─────────────────────────────────────────────────────
-    # TERM + COLORTERM tell most programs (git, python CLIs, etc.) to emit ANSI.
-    # CLICOLOR / CLICOLOR_FORCE enable color in BSD/macOS ls.
-    # FORCE_COLOR=3 enables truecolor in Node.js / some Python tools.
-    # GIT_COLOR_UI ensures git always outputs color regardless of TTY detection.
-    _LS_COLORS = ":".join([
-        "rs=0", "di=01;34", "ln=01;36", "mh=00", "pi=40;33",
-        "so=01;35", "do=01;35", "bd=40;33;01", "cd=40;33;01",
-        "or=40;31;01", "mi=00", "su=37;41", "sg=30;43", "ca=30;41",
-        "tw=30;42", "ow=34;42", "st=37;44", "ex=01;32",
-        "*.tar=01;31", "*.tgz=01;31", "*.zip=01;31", "*.gz=01;31",
-        "*.bz2=01;31", "*.xz=01;31", "*.zst=01;31", "*.7z=01;31",
-        "*.rar=01;31", "*.deb=01;31", "*.rpm=01;31",
-        "*.jpg=01;35", "*.jpeg=01;35", "*.png=01;35", "*.gif=01;35",
-        "*.svg=01;35", "*.ico=01;35", "*.mp4=01;35", "*.mkv=01;35",
-        "*.mp3=00;36", "*.ogg=00;36", "*.wav=00;36",
-        "*.json=00;33", "*.yaml=00;33", "*.yml=00;33",
-        "*.toml=00;33", "*.ini=00;33", "*.cfg=00;33", "*.conf=00;33",
-        "*.env=00;33", "*.xml=00;33", "*.csv=00;33",
-        "*.py=00;33", "*.js=00;33", "*.jsx=00;33",
-        "*.ts=00;33", "*.tsx=00;33", "*.sql=00;33",
-        "*.html=00;33", "*.css=00;33", "*.md=00;36", "*.txt=00;36",
-        "*.pem=01;33", "*.key=01;33", "*.crt=01;33", "*.pub=01;33",
-        "*.log=00;90", "*.pyc=00;90", "*.o=00;90", "*.so=00;90",
-    ])
+    env = {**os.environ, "TERM": "xterm-256color", "COLORTERM": "truecolor", "CLICOLOR": "1",
+           "CLICOLOR_FORCE": "1", "FORCE_COLOR": "3", "GIT_COLOR_UI": "always", "LS_COLORS": _LS_COLORS}
+    if askpass:
+        env.update({"GIT_ASKPASS": askpass, "GIT_TERMINAL_PROMPT": "0"})
 
-    _term_env.update({
-        "TERM":           "xterm-256color",
-        "COLORTERM":      "truecolor",
-        "CLICOLOR":       "1",
-        "CLICOLOR_FORCE": "1",
-        "FORCE_COLOR":    "3",
-        "GIT_COLOR_UI":   "always",
-        "LS_COLORS":      _LS_COLORS,
-    })
-    if _askpass_file:
-        _term_env["GIT_ASKPASS"]         = _askpass_file
-        _term_env["GIT_TERMINAL_PROMPT"] = "0"
-
-    # ── Shell function overrides ───────────────────────────────────────────────
-    # GNU ls, grep, diff, ip ignore CLICOLOR_FORCE and only colorize when they
-    # detect a real TTY. Wrapping them as shell functions injects --color=always
-    # transparently so the user never has to type flags manually.
-    _COLOR_INIT = (
-        "ls(){    command ls    --color=always \"$@\"; }; "
-        "grep(){  command grep  --color=always \"$@\"; }; "
-        "diff(){  command diff  --color=always \"$@\" 2>/dev/null "
-                "|| command diff \"$@\"; }; "
-        "ip(){    command ip    --color=always \"$@\" 2>/dev/null "
-                "|| command ip \"$@\"; }; "
-    )
-
-    # Decouple WS receiving from command processing so we can handle signals
-    # while a process is running.
     inbox: asyncio.Queue = asyncio.Queue()
-    current_process = None  # asyncio.subprocess.Process | None
 
-    async def _receiver():
-        """Pump all incoming WS messages into the inbox queue."""
+    async def receiver():
         try:
             while True:
-                msg = await websocket.receive_json()
-                await inbox.put(msg)
+                await inbox.put(await websocket.receive_json())
         except Exception:
             await inbox.put({"type": "_disconnect"})
 
-    recv_task = asyncio.create_task(_receiver())
+    recv_task = asyncio.create_task(receiver())
+    current = None
 
     try:
         while True:
             msg = await inbox.get()
-
-            # Connection closed
             if msg.get("type") == "_disconnect":
                 break
-
-            # Ctrl+C while a process is running
             if msg.get("type") == "signal":
-                if msg.get("signal") == "SIGINT" and current_process:
-                    try:
-                        os.killpg(os.getpgid(current_process.pid), _signal.SIGINT)
-                    except Exception:
-                        try:
-                            current_process.terminate()
-                        except Exception:
-                            pass
                 continue
-
-            cmd = msg.get("cmd", "").strip()
+            cmd = str(msg.get("cmd", "")).strip()
             if not cmd:
                 continue
-
-            # Built-in: clear
             if cmd in ("clear", "cls"):
                 await websocket.send_json({"type": "clear"})
                 continue
-
-            # Built-in: cd (must be handled in-process to track cwd)
             if re.match(r"^cd(\s|$)", cmd):
-                parts = cmd.split(None, 1)
-                raw_target = parts[1].strip() if len(parts) > 1 else "~"
-                target = os.path.expanduser(raw_target)
-                if not os.path.isabs(target):
-                    target = os.path.join(cwd, target)
-                target = os.path.normpath(target)
+                raw = cmd.split(None, 1)[1].strip() if len(cmd.split(None, 1)) > 1 else "~"
+                target = os.path.normpath(os.path.join(cwd, os.path.expanduser(raw.strip("'\""))))
                 if os.path.isdir(target):
                     cwd = target
                     await websocket.send_json({"type": "exit", "code": 0, "cwd": cwd})
                 else:
-                    await websocket.send_json({
-                        "type": "stderr",
-                        "data": f"cd: {raw_target}: No such file or directory\n",
-                    })
+                    await websocket.send_json({"type": "stderr", "data": f"cd: {raw}: No such file or directory\n"})
                     await websocket.send_json({"type": "exit", "code": 1, "cwd": cwd})
                 continue
 
-            # General command — run asynchronously and stream output
+            logger.info("%s ran in %s: %s", email, cwd, cmd[:500])
             try:
-                process = await asyncio.create_subprocess_shell(
-                    _COLOR_INIT + cmd,   # prepend color overrides
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    cwd=cwd,
-                    env=_term_env,
-                    start_new_session=True,   # lets us kill the whole process group
+                current = await asyncio.create_subprocess_shell(
+                    _COLOR_INIT + cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                    stdin=asyncio.subprocess.DEVNULL, cwd=cwd, env=env, start_new_session=True,
                 )
-                current_process = process
-                proc_done = asyncio.Event()
-
-                async def _read_out():
-                    while True:
-                        chunk = await process.stdout.read(1024)
-                        if not chunk:
-                            break
-                        await websocket.send_json({
-                            "type": "stdout",
-                            "data": chunk.decode("utf-8", errors="replace"),
-                        })
-
-                async def _read_err():
-                    while True:
-                        chunk = await process.stderr.read(1024)
-                        if not chunk:
-                            break
-                        await websocket.send_json({
-                            "type": "stderr",
-                            "data": chunk.decode("utf-8", errors="replace"),
-                        })
-
-                async def _wait_proc():
-                    await asyncio.gather(_read_out(), _read_err())
-                    await process.wait()
-                    proc_done.set()
-
-                async def _watch_signals():
-                    """
-                    While the process is running, drain the inbox looking for
-                    a SIGINT. Any non-signal messages are put back for the
-                    outer loop to handle after the process exits.
-                    """
-                    while not proc_done.is_set():
-                        try:
-                            sig_msg = await asyncio.wait_for(inbox.get(), timeout=0.05)
-                            if sig_msg.get("type") == "_disconnect":
-                                await inbox.put(sig_msg)
-                                return
-                            if (sig_msg.get("type") == "signal"
-                                    and sig_msg.get("signal") == "SIGINT"):
-                                try:
-                                    os.killpg(os.getpgid(process.pid), _signal.SIGINT)
-                                except Exception:
-                                    process.terminate()
-                                return
-                            # Any other message (e.g. next command) → keep for later
-                            await inbox.put(sig_msg)
-                        except asyncio.TimeoutError:
-                            continue
-
-                await asyncio.gather(_wait_proc(), _watch_signals())
-                current_process = None
-                await websocket.send_json({
-                    "type": "exit",
-                    "code": process.returncode,
-                    "cwd": cwd,
-                })
-
-            except Exception as exc:
-                await websocket.send_json({"type": "stderr", "data": str(exc) + "\n"})
+            except OSError as exc:
+                await websocket.send_json({"type": "stderr", "data": f"{exc}\n"})
                 await websocket.send_json({"type": "exit", "code": -1, "cwd": cwd})
-                current_process = None
+                continue
 
+            proc = current
+
+            async def pump(stream, kind):
+                while True:
+                    chunk = await stream.read(MAX_OUTPUT_CHUNK)
+                    if not chunk:
+                        return
+                    await websocket.send_json({"type": kind, "data": chunk.decode("utf-8", errors="replace")})
+
+            output = asyncio.gather(pump(proc.stdout, "stdout"), pump(proc.stderr, "stderr"))
+            disconnected = False
+            deferred = []
+            while True:
+                getter = asyncio.create_task(inbox.get())
+                done, _ = await asyncio.wait({output, getter}, return_when=asyncio.FIRST_COMPLETED)
+                if getter not in done and getter.cancel():
+                    break
+                m = getter.result()
+                if m.get("type") == "_disconnect":
+                    disconnected = True
+                    _kill_group(proc, _signal.SIGKILL)
+                    output.cancel()
+                    break
+                if m.get("type") == "signal":
+                    if m.get("signal") == "SIGINT":
+                        _kill_group(proc, _signal.SIGINT)
+                else:
+                    deferred.append(m)
+                if output.done():
+                    break
+            for m in deferred:
+                inbox.put_nowait(m)
+            if disconnected:
+                break
+            try:
+                await output
+            except Exception:
+                break
+            await proc.wait()
+            current = None
+            await websocket.send_json({"type": "exit", "code": proc.returncode, "cwd": cwd})
     except Exception as exc:
         try:
             await websocket.send_json({"type": "stderr", "data": f"Terminal error: {exc}\n"})
@@ -850,38 +654,21 @@ async def terminal_ws(websocket: WebSocket):
             pass
     finally:
         recv_task.cancel()
-        if current_process:
-            try:
-                current_process.terminate()
-            except Exception:
-                pass
-        if _askpass_file and Path(_askpass_file).exists():
-            try:
-                os.unlink(_askpass_file)
-            except Exception:
-                pass
+        if current and current.returncode is None:
+            _kill_group(current, _signal.SIGKILL)
+        if askpass:
+            Path(askpass).unlink(missing_ok=True)
+        logger.info("%s closed the terminal session", email)
 
 
-# ── entry point ───────────────────────────────────────────────────────────────
+# ── entry point ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     cfg = read_config()
-
-    mgr_host = cfg["manager"].get("host", "0.0.0.0")
-    mgr_port = int(cfg["manager"].get("port", "9000"))
-
-    ssl_cert = cfg["ssl"].get("certfile", "") if "ssl" in cfg else ""
-    ssl_key  = cfg["ssl"].get("keyfile",  "") if "ssl" in cfg else ""
-
-    use_ssl = bool(ssl_cert and ssl_key and
-                   Path(ssl_cert).exists() and Path(ssl_key).exists())
-
-    print(f"Starting manager on {'https' if use_ssl else 'http'}://{mgr_host}:{mgr_port}")
-
-    uvicorn.run(
-        app,
-        host=mgr_host,
-        port=mgr_port,
-        ssl_certfile=ssl_cert if use_ssl else None,
-        ssl_keyfile=ssl_key  if use_ssl else None,
-    )
+    mgr = _section(cfg, "manager")
+    ssl = _section(cfg, "ssl")
+    cert, key = ssl.get("certfile", ""), ssl.get("keyfile", "")
+    use_ssl = bool(cert and key and Path(cert).is_file() and Path(key).is_file())
+    host, port = mgr.get("host", "0.0.0.0"), int(mgr.get("port", "8001"))
+    logger.info("Starting manager on %s://%s:%s", "https" if use_ssl else "http", host, port)
+    uvicorn.run(app, host=host, port=port, ssl_certfile=cert if use_ssl else None, ssl_keyfile=key if use_ssl else None)

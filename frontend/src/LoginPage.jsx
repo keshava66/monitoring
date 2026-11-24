@@ -1,154 +1,81 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { useMsal, useIsAuthenticated } from '@azure/msal-react';
+import { InteractionStatus } from '@azure/msal-browser';
+import { useIsAuthenticated, useMsal } from '@azure/msal-react';
 import { loginRequest } from './msalConfig';
-import logo from "/sh_logo.png";
-import signinIcon from "/icons/JJ_Icon_Login_RGB.svg";
+import { POST_LOGIN_REDIRECT_KEY } from './context/AuthContext';
+import { Alert, Button, Spinner } from './components/ui';
+import logo from '/sh_logo.png';
+
+const ERRORS = {
+  user_cancelled: 'Sign-in was cancelled. Please try again.',
+  interaction_in_progress: 'A sign-in is already in progress in another window.',
+  popup_window_error: 'Your browser blocked the sign-in window. Allow pop-ups for this site and retry.',
+};
 
 export default function LoginPage() {
   const navigate = useNavigate();
   const { instance, inProgress } = useMsal();
   const isAuthenticated = useIsAuthenticated();
-  const [loginLoading, setLoginLoading] = useState(false);
-  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const redirected = useRef(false);
 
-  // Redirect to wherever the user was actually trying to go (if they hit a
-  // deep link while logged out), falling back to /dashboard otherwise.
-  // hasRedirected guards against StrictMode double-invoking this effect —
-  // without it, the second invocation would find sessionStorage already
-  // cleared by the first and silently fall back to /dashboard.
-  const hasRedirected = useRef(false);
   useEffect(() => {
-    if (isAuthenticated && inProgress === "none" && !hasRedirected.current) {
-      hasRedirected.current = true;
+    document.title = 'Sign in · RDI-AI Monitoring';
+    if (isAuthenticated && inProgress === InteractionStatus.None && !redirected.current) {
+      redirected.current = true;
       let target = '/dashboard';
       try {
-        const saved = sessionStorage.getItem('postLoginRedirect');
-        if (saved) {
-          sessionStorage.removeItem('postLoginRedirect');
-          target = saved;
-        }
-      } catch {
-        // non-critical — falls back to /dashboard
-      }
+        const saved = sessionStorage.getItem(POST_LOGIN_REDIRECT_KEY);
+        if (saved && saved.startsWith('/') && !saved.startsWith('//')) target = saved;
+        sessionStorage.removeItem(POST_LOGIN_REDIRECT_KEY);
+      } catch { /* storage unavailable */ }
       navigate(target, { replace: true });
     }
   }, [isAuthenticated, inProgress, navigate]);
 
-  const handleLogin = async () => {
-    setLoginLoading(true);
-    setError("");
-
+  const signIn = async () => {
+    setBusy(true);
+    setError('');
     try {
-      // Initiate Microsoft login redirect
       await instance.loginRedirect(loginRequest);
     } catch (err) {
-      console.error("Login error:", err);
-
-      // Handle specific error types
-      if (err.errorCode === 'user_cancelled') {
-        setError("Login was cancelled. Please try again.");
-      } else if (err.errorCode === 'interaction_in_progress') {
-        setError("Another login is already in progress.");
-      } else {
-        setError("Unable to sign in. Please try again or contact support.");
-      }
-
-      setLoginLoading(false);
+      setError(ERRORS[err?.errorCode] || 'Unable to sign in. Please try again or contact your IT administrator.');
+      setBusy(false);
     }
   };
 
-  // Show loading state during auth check or login redirect
-  if (inProgress !== "none" || (isAuthenticated && !error)) {
-    return (
-      <div
-        className="min-h-screen flex items-center justify-center"
-        style={{
-          backgroundImage: 'url(/background.png)',
-          backgroundSize: 'cover',
-          backgroundPosition: 'center',
-          backgroundRepeat: 'no-repeat'
-        }}
-      >
-        <div className="text-center">
-          <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-jj-red mx-auto"></div>
-          <p className="mt-4 text-white font-johnson-text bg-black bg-opacity-50 px-4 py-2 rounded">
-            {inProgress === "login" ? "Signing in..." : "Loading..."}
-          </p>
-        </div>
-      </div>
-    );
-  }
+  const pending = inProgress !== InteractionStatus.None || (isAuthenticated && !error);
 
   return (
-    <div
-      className="min-h-screen flex items-center justify-center"
-      style={{
-        backgroundImage: 'url(/background.png)',
-        backgroundSize: 'cover',
-        backgroundPosition: 'center',
-        backgroundRepeat: 'no-repeat'
-      }}
-    >
-      <div>
-        <div className="text-center mb-4">
-          <img src={logo} alt="JnJ Logo" className="h-16 mx-auto" />
-          <p className="text-xs text-jj-gray-06 font-johnson-text text-right mb-2">
-            powered by RDI-AI
-          </p>
-          <p className="text-lg font-bold text-center text-jj-gray-08 font-johnson-display">
-            Where regulatory data meets intelligence
-          </p>
+    <div className="min-h-dvh flex items-center justify-center px-4 py-10 bg-jj-gray-01 bg-cover bg-center"
+      style={{ backgroundImage: 'url(/background.webp)' }}>
+      <main className="w-full max-w-sm bg-white/95 backdrop-blur rounded-2xl shadow-overlay border border-white px-6 py-8 sm:px-8 sm:py-10">
+        <div className="flex flex-col items-center text-center">
+          <img src={logo} alt="SmartHub" className="h-14 sm:h-16 w-auto" />
+          <h1 className="mt-6 font-johnson-display text-2xl text-jj-gray-08">RDI-AI Monitoring</h1>
+          <p className="mt-1.5 font-johnson-text text-sm text-jj-gray-06">Where regulatory data meets intelligence</p>
         </div>
 
-        <div className="space-y-4">
-          {/* JNJ SSO Sign In Button */}
-          <div className="flex justify-center">
-            <button
-              onClick={handleLogin}
-              disabled={loginLoading}
-              className={`py-1.5 px-8 bg-jj-red text-white rounded-md hover:bg-jj-maroon-05 transition-all duration-200 font-johnson-text flex items-center justify-center space-x-2 shadow-md hover:shadow-lg ${
-                loginLoading ? 'cursor-not-allowed opacity-60' : ''
-              }`}
-              style={{ outline: 'none' }}
-            >
-              {loginLoading ? (
-                <>
-                  <svg className="animate-spin h-5 w-5 text-white" fill="none" viewBox="0 0 24 24">
-                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
-                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-                  </svg>
-                  <span>Signing in...</span>
-                </>
-              ) : (
-                <>
-                  <span>Sign in via SSO</span>
-                  <img
-                    src={signinIcon}
-                    alt="JNJ"
-                    className="w-5 h-5"
-                    style={{ filter: 'brightness(0) invert(1)' }}
-                  />
-                </>
-              )}
-            </button>
-          </div>
-
-          {/* Error Message */}
-          {error && (
-            <div className="text-jj-red text-sm font-johnson-text bg-red-50 p-3 rounded-md border border-red-200" role="alert">
-              {error}
+        <div className="mt-8 flex flex-col gap-4">
+          {pending ? (
+            <div className="flex items-center justify-center gap-3 h-11 font-johnson-text text-sm text-jj-gray-07" role="status">
+              <Spinner className="w-5 h-5 text-jj-red" />
+              {inProgress === InteractionStatus.Login ? 'Signing you in…' : 'Loading…'}
             </div>
+          ) : (
+            <Button variant="primary" size="lg" icon="login" onClick={signIn} loading={busy} className="w-full">
+              Sign in with Johnson &amp; Johnson SSO
+            </Button>
           )}
+          {error && <Alert tone="error">{error}</Alert>}
         </div>
 
-        {/* Footer */}
-        <div className="mt-4 pt-2 border-t border-jj-gray-02">
-          <p className="text-xs text-jj-gray-05 font-johnson-text text-center">
-            Having trouble signing in? Contact your IT administrator
-          </p>
-        </div>
-      </div>
+        <p className="mt-8 pt-5 border-t border-jj-gray-02 font-johnson-text text-xs text-jj-gray-06 text-center">
+          Trouble signing in? Contact your IT administrator.
+        </p>
+      </main>
     </div>
   );
 }

@@ -1,62 +1,37 @@
-import { useEffect, useRef, useCallback } from 'react';
+import { useEffect, useRef } from 'react';
 import { apiFetch } from '../utils/apiClient';
 
 const HEARTBEAT_INTERVAL_MS = 30_000;
-const ACTIVITY_TIMEOUT_MS   = 60_000;
+const ACTIVITY_WINDOW_MS = 60_000;
+const EVENTS = ['pointerdown', 'keydown', 'scroll', 'touchstart', 'wheel'];
 
-function debounce(fn, ms) {
-  let timer;
-  const debounced = (...args) => {
-    clearTimeout(timer);
-    timer = setTimeout(() => fn(...args), ms);
-  };
-  debounced.cancel = () => clearTimeout(timer);
-  return debounced;
-}
-
+/** Tells the backend this user is active (Audit → Active Now) while they interact. */
 export function useHeartbeat(userEmail) {
-  const lastActivityRef = useRef(null);
-  const intervalRef     = useRef(null);
-  const emailRef        = useRef(userEmail);
-
-  useEffect(() => { emailRef.current = userEmail; }, [userEmail]);
-
-  const sendHeartbeat = useCallback(async () => {
-    const email = emailRef.current;
-    if (!email || !lastActivityRef.current) return;
-    if (Date.now() - lastActivityRef.current > ACTIVITY_TIMEOUT_MS) return;
-    try {
-      await apiFetch('/api/audit/heartbeat', { method: 'POST' });
-    } catch { /* non-critical */ }
-  }, []);
-
-  const recordActivity = useCallback(() => {
-    lastActivityRef.current = Date.now();
-  }, []);
+  const lastActivity = useRef(0);
 
   useEffect(() => {
-    if (!userEmail) {
-      clearInterval(intervalRef.current);
-      intervalRef.current = null;
-      return;
-    }
-
-    // Discrete events fire once per action — no debounce needed.
-    const discreteEvents = ['mousedown', 'keydown', 'scroll', 'touchstart', 'click'];
-    discreteEvents.forEach(e => window.addEventListener(e, recordActivity, { passive: true }));
-
-    // mousemove fires hundreds of times per second — debounce to 500 ms.
-    const debouncedMouseMove = debounce(recordActivity, 500);
-    window.addEventListener('mousemove', debouncedMouseMove, { passive: true });
-
-    intervalRef.current = setInterval(sendHeartbeat, HEARTBEAT_INTERVAL_MS);
-
-    return () => {
-      discreteEvents.forEach(e => window.removeEventListener(e, recordActivity));
-      window.removeEventListener('mousemove', debouncedMouseMove);
-      debouncedMouseMove.cancel();
-      clearInterval(intervalRef.current);
-      intervalRef.current = null;
+    if (!userEmail) return undefined;
+    lastActivity.current = Date.now();
+    const mark = () => { lastActivity.current = Date.now(); };
+    EVENTS.forEach((e) => window.addEventListener(e, mark, { passive: true }));
+    let lastMove = 0;
+    const onMove = () => {
+      const now = Date.now();
+      if (now - lastMove > 1000) { lastMove = now; mark(); }
     };
-  }, [userEmail, sendHeartbeat, recordActivity]);
+    window.addEventListener('pointermove', onMove, { passive: true });
+
+    const beat = () => {
+      if (document.visibilityState !== 'visible') return;
+      if (Date.now() - lastActivity.current > ACTIVITY_WINDOW_MS) return;
+      apiFetch('/api/audit/heartbeat', { method: 'POST', timeoutMs: 10_000 }).catch(() => {});
+    };
+    beat();
+    const id = setInterval(beat, HEARTBEAT_INTERVAL_MS);
+    return () => {
+      clearInterval(id);
+      EVENTS.forEach((e) => window.removeEventListener(e, mark));
+      window.removeEventListener('pointermove', onMove);
+    };
+  }, [userEmail]);
 }

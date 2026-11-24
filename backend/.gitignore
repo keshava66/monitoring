@@ -1,7 +1,15 @@
 .idea/
-dq_config.json
+__pycache__/
+*.pyc
+.pytest_cache/
+venv/
+.venv/
 rbac_config.json
-audit_log.json
+.rbac_*.json
 /audit_log.db
+/audit_log.db-*
 /config.ini
+/config/
 /.env
+/backend.pid
+/backend.log

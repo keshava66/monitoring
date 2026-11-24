@@ -1,53 +1,39 @@
+import { LogLevel } from '@azure/msal-browser';
+
+const CLIENT_ID = import.meta.env.VITE_MSAL_CLIENT_ID || '574b1b8c-3ee9-44ef-9950-b29cab62a260';
+const TENANT_ID = import.meta.env.VITE_MSAL_TENANT_ID || '3ac94b33-9135-4821-9502-eafda6592a35';
+const AUTHORITY_HOST = (import.meta.env.VITE_MSAL_AUTHORITY_HOST || 'https://login.microsoftonline.com').replace(/\/$/, '');
+
 export const msalConfig = {
   auth: {
-    clientId: "574b1b8c-3ee9-44ef-9950-b29cab62a260", // Application (client) ID
-    authority: "https://login.microsoftonline.com/3ac94b33-9135-4821-9502-eafda6592a35", // Directory (tenant) ID
-    redirectUri: window.location.origin, // Dynamically uses current origin
-    postLogoutRedirectUri: window.location.origin + "/login", // Redirect to login after logout
+    clientId: CLIENT_ID,
+    authority: `${AUTHORITY_HOST}/${TENANT_ID}`,
+    redirectUri: window.location.origin,
+    postLogoutRedirectUri: `${window.location.origin}/login`,
     navigateToLoginRequestUrl: false,
   },
   cache: {
-    cacheLocation: "localStorage", // Store tokens in localStorage for persistence
-    storeAuthStateInCookie: false, // Set to true if you have issues on IE11 or Edge
+    cacheLocation: 'localStorage',
   },
   system: {
     loggerOptions: {
+      logLevel: LogLevel.Error,
+      piiLoggingEnabled: false,
       loggerCallback: (level, message, containsPii) => {
-        if (containsPii) {
-          return;
-        }
-        switch (level) {
-          case 0: // Error
-            console.error(message);
-
-            return;
-          default:
-            return;
-        }
+        if (!containsPii && level === LogLevel.Error) console.error(message);
       },
     },
   },
 };
 
-// Scopes required for the application
+// Graph scopes. The backend validates this same token against Graph and
+// resolves the caller's role server-side; the directory scopes are only
+// needed by the User Management screens.
+export const API_SCOPES = ['User.Read', 'Group.Read.All'];
+export const DIRECTORY_SCOPES = ['User.Read.All', 'Group.Read.All', 'GroupMember.Read.All'];
+
 export const loginRequest = {
-  scopes: [
-    "openid",
-    "profile",
-    "email",
-    "User.Read",
-    "User.Read.All",
-    "Group.Read.All",
-    "GroupMember.Read.All",
-    "offline_access"
-  ],
+  scopes: ['openid', 'profile', 'email', 'offline_access', ...new Set([...API_SCOPES, ...DIRECTORY_SCOPES])],
 };
 
-// Optional: Additional graph scopes if you need more user data
-export const graphConfig = {
-  graphMeEndpoint: "https://graph.microsoft.com/v1.0/me",
-  graphMePhotoEndpoint: "https://graph.microsoft.com/v1.0/me/photo/$value",
-  graphMeMemberOfEndpoint: "https://graph.microsoft.com/v1.0/me/memberOf",
-  graphUsersEndpoint: "https://graph.microsoft.com/v1.0/users",
-  graphGroupsEndpoint: "https://graph.microsoft.com/v1.0/groups"
-};
+export const GRAPH_BASE = (import.meta.env.VITE_GRAPH_BASE_URL || 'https://graph.microsoft.com/v1.0').replace(/\/$/, '');

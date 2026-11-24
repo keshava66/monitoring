@@ -1,2086 +1,608 @@
-import React, { useState, useEffect, useMemo, useRef } from 'react';
-import ReactDOM from 'react-dom';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
-import { useRBAC } from '../context/RBACContext';
 import { useAuth } from '../context/AuthContext';
-import mailSrc     from "/icons/JJ_Icon_Communication_RGB.svg"; // Email / phone fields
-import userSrc     from "/icons/JJ_Icon_user_black.svg";     // Job / work fields
-import buildingSrc from "/icons/JJ_Icon_Office_RGB.svg";        // Org / location fields
-import phoneSrc    from "/icons/JJ_Icon_Phone_RGB.svg";        // Org / location fields
-import globeSrc    from "/icons/JJ_Icon_Globe_RGB.svg";        // Org / location fields
-import closeIcon   from "/icons/JJ_Icon_Close.svg";
-import plusIcon    from "/icons/JJ_Icon_Add.svg";
-import editIcon    from "/icons/JJ_Icon_Edit_RGB.svg";
-import trashIcon   from "/icons/JJ_Icon_Delete_RGB.svg";
-import saveIcon    from "/icons/JJ_Icon_Save_RGB.svg";
-import alertIcon   from "/icons/JJ_Icon_Alert_RGB.svg";
-import checkIcon   from "/icons/JJ_Icon_Check_RGB.svg";
-import searchIcon  from "/icons/JJ_Icon_Search_RGB.svg";
-import chevronLeftIcon  from "/icons/JJ_Icon_Chevron_Left.svg";
-import chevronRightIcon from "/icons/JJ_Icon_Chevron_Right.svg";
-import userPlusIcon     from "/icons/JJ_Icon_Person_RGB.svg";
-import shieldCheckIcon  from "/icons/JJ_Icon_Safety.svg";
-import refreshSvgIcon   from "/icons/JJ_Icon_Refresh_RGB.svg";
-import { useMsal } from '@azure/msal-react';
+import { useRBAC } from '../context/RBACContext';
+import { DIRECTORY_SCOPES } from '../msalConfig';
+import { apiJson, graphJson, graphPhoto, isAbort, mapLimit, odata } from '../utils/apiClient';
+import { Avatar } from '../components/Header';
+import {
+  Alert, Badge, Button, Drawer, EmptyState, Icon, IconButton, LoadingBlock, Modal, Page, PageHeader, SearchInput, Select, Skeleton, Tabs, TextField,
+  cx, fmtNum, useDebouncedValue, useFeedback,
+} from '../components/ui';
 
-import shieldIcon from "/icons/JJ_Icon_Gear_RGB.svg";
-import groupIcon  from "/icons/JJ_Icon_Community_RGB.svg";
-import Shield     from "/icons/JJ_Icon_Shield_RGB.svg";
+const GUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const USER_FIELDS = 'id,displayName,mail,userPrincipalName,jobTitle,department';
+const userEmail = (u) => (u.mail || u.userPrincipalName || '').toLowerCase();
 
-// ─── Shared helpers ──────────────────────────────────────────────────────────
-const formatPerm = (key) => key.replace(/([A-Z])/g, ' $1').replace(/^./, s => s.toUpperCase());
+const walk = (nodes, fn, depth = 0, parent = null) => nodes.forEach((n) => { fn(n, depth, parent); walk(n.children || [], fn, depth + 1, n); });
 
-// Flat permission key → human label, built from PERMISSION_GROUPS below (filled in after it's defined).
-let PERMISSION_LABELS = {};
-const buildPermissionLabels = (groups) => {
-  const out = {};
-  const walk = (nodes) => {
-    nodes.forEach(node => {
-      out[node.key] = node.label;
-      if (node.children?.length) walk(node.children);
-    });
-  };
-  walk(groups);
-  return out;
-};
+// ── Data ──────────────────────────────────────────────────────────────────────
 
-// Builds a human-readable summary of what changed between two role definitions.
-const buildRoleChangeSummary = (before, after, verb = 'Updated') => {
-  if (!before) return `${verb} role '${after.name}'`;
-  const changes = [];
-
-  if (before.name !== after.name) {
-    changes.push(`name changed from "${before.name}" to "${after.name}"`);
-  }
-  if ((before.description || '') !== (after.description || '')) {
-    changes.push(`description changed from "${before.description || '(none)'}" to "${after.description || '(none)'}"`);
-  }
-  if (before.color !== after.color) {
-    changes.push(`color changed from ${before.color} to ${after.color}`);
-  }
-
-  const allKeys = new Set([...Object.keys(before.permissions || {}), ...Object.keys(after.permissions || {})]);
-  const permChanges = [];
-  allKeys.forEach(key => {
-    const was = !!(before.permissions || {})[key];
-    const is  = !!(after.permissions  || {})[key];
-    if (was !== is) {
-      const label = PERMISSION_LABELS[key] || formatPerm(key);
-      permChanges.push(`${label} ${is ? 'enabled' : 'disabled'}`);
+function useRbacAdmin() {
+  const [config, setConfig] = useState(null);
+  const [error, setError] = useState(null);
+  const reload = useCallback(async () => {
+    try {
+      const d = await apiJson('/api/rbac/config');
+      setConfig(d.config);
+      setError(null);
+    } catch (e) {
+      setError(e.message);
     }
-  });
-  if (permChanges.length) {
-    changes.push(`permissions: ${permChanges.join(', ')}`);
-  }
+  }, []);
+  useEffect(() => { reload(); }, [reload]);
+  return { config, error, reload };
+}
 
-  if (!changes.length) return `${verb} role '${after.name}' (no changes detected)`;
-  return `${verb} role '${after.name}' — ${changes.join('; ')}`;
-};
+function useGraph() {
+  const { acquireToken } = useAuth();
+  return useCallback(async (fn) => fn(await acquireToken(DIRECTORY_SCOPES)), [acquireToken]);
+}
 
-// ─── Permission hierarchy definition ────────────────────────────────────────
-// Each group has a parent permission and its child sub-permissions.
-// Standalone items have no children.
-const PERMISSION_GROUPS = [
-  {
-    key: 'viewDashboard',
-    label: 'Dashboard',
-    description: 'Access to the main dashboard',
-    children: [],
-  },
-  {
-    key: 'viewEPODStats',
-    label: 'Ingestion Stats',
-    description: 'Access to the Ingestion Stats page',
-    children: [
-      { key: 'viewEPODStatsEPOD',    label: 'EPOD',    description: 'Access to the EPOD ingestion stats tab'    },
-      { key: 'viewEPODStatsRIMDOCS', label: 'RIMDOCS', description: 'Access to the RIMDOCS ingestion stats tab' },
-    ],
-  },
-  {
-    key: 'viewServerMonitor',
-    label: 'Server Monitor',
-    description: 'Access to the EPOD server monitor',
-    children: [
-      { key: 'viewEPodDev',  label: 'EPOD DEV',  description: 'Access to the DEV environment monitor',
-        children: [{ key: 'stopScriptDev',  label: 'Stop Script', description: 'Allows stopping the DEV extraction script' }] },
-      { key: 'viewEPodQA',   label: 'EPOD QA',   description: 'Access to the QA environment monitor',
-        children: [{ key: 'stopScriptQA',   label: 'Stop Script', description: 'Allows stopping the QA extraction script'  }] },
-      { key: 'viewEPodProd', label: 'EPOD PROD',  description: 'Access to the Production environment monitor',
-        children: [{ key: 'stopScriptProd', label: 'Stop Script', description: 'Allows stopping the PROD extraction script' }] },
-      { key: 'viewRimdocsDev',  label: 'RIMDOCS DEV',  description: 'Access to the RIMDOCS DEV environment monitor',
-        children: [{ key: 'stopScriptRimdocsDev',  label: 'Stop Script', description: 'Allows stopping the RIMDOCS DEV extraction script' }] },
-      { key: 'viewRimdocsQA',   label: 'RIMDOCS QA',   description: 'Access to the RIMDOCS QA environment monitor',
-        children: [{ key: 'stopScriptRimdocsQA',   label: 'Stop Script', description: 'Allows stopping the RIMDOCS QA extraction script'  }] },
-      { key: 'viewRimdocsProd', label: 'RIMDOCS PROD',  description: 'Access to the RIMDOCS Production environment monitor',
-        children: [{ key: 'stopScriptRimdocsProd', label: 'Stop Script', description: 'Allows stopping the RIMDOCS PROD extraction script' }] },
-      { key: 'viewRimdocsDev1',  label: 'RIMDOCS DEV1',  description: 'Access to the RIMDOCS DEV1 environment monitor',
-        children: [{ key: 'stopScriptRimdocsDev1',  label: 'Stop Script', description: 'Allows stopping the RIMDOCS DEV1 extraction script' }] },
-      { key: 'viewRimdocsDev2',  label: 'RIMDOCS DEV2',  description: 'Access to the RIMDOCS DEV2 environment monitor',
-        children: [{ key: 'stopScriptRimdocsDev2',  label: 'Stop Script', description: 'Allows stopping the RIMDOCS DEV2 extraction script' }] },
-      { key: 'viewRimdocsQA2',   label: 'RIMDOCS QA2',   description: 'Access to the RIMDOCS QA2 environment monitor',
-        children: [{ key: 'stopScriptRimdocsQA2',   label: 'Stop Script', description: 'Allows stopping the RIMDOCS QA2 extraction script'  }] },
-      { key: 'viewRimdocsProd2', label: 'RIMDOCS PROD2',  description: 'Access to the RIMDOCS PROD2 environment monitor',
-        children: [{ key: 'stopScriptRimdocsProd2', label: 'Stop Script', description: 'Allows stopping the RIMDOCS PROD2 extraction script' }] },
-    ],
-  },
-  {
-    key: 'viewServerManager',
-    label: 'Server Manager',
-    description: 'Start, stop, and restart services; run terminal commands and tail live logs',
-    children: [
-      {
-        key: 'viewServerManagerDev',
-        label: 'DEV Server',
-        description: 'Access to the DEV manage server',
-        children: [
-          { key: 'adminAccessDev', label: 'Admin Access (Stop Script)', description: 'Allows stopping the DEV extraction script' },
-        ],
-      },
-      {
-        key: 'viewServerManagerQA',
-        label: 'QA Server',
-        description: 'Access to the QA manage server',
-        children: [
-          { key: 'adminAccessQA', label: 'Admin Access (Stop Script)', description: 'Allows stopping the QA extraction script' },
-        ],
-      },
-      {
-        key: 'viewServerManagerProd',
-        label: 'PROD Server',
-        description: 'Access to the PROD manage server',
-        children: [
-          { key: 'adminAccessProd', label: 'Admin Access (Stop Script)', description: 'Allows stopping the PROD extraction script' },
-        ],
-      },
-      {
-        key: 'viewServerManagerPOC',
-        label: 'POC Server',
-        description: 'Access to the POC manage server',
-        children: [
-          { key: 'adminAccessPOC', label: 'Admin Access (Stop Script)', description: 'Allows stopping the POC extraction script' },
-        ],
-      },
-    ],
-  },
-  {
-    key: 'viewNasScanner',
-    label: 'NAS Scanner',
-    description: 'Access to the EPOD NAS Scanner — segment sizes, file type breakdown, largest PDFs, and trends',
-    children: [],
-  },
-  {
-    key: 'viewAudit',
-    label: 'Audit Log',
-    description: 'Access to the audit log',
-    children: [],
-  },
-  {
-    key: 'viewUserManagement',
-    label: 'User Management',
-    description: 'Access to user management',
-    children: [
-      { key: 'manageUsers', label: 'Manage Users', description: 'Assign and remove user roles' },
-      { key: 'manageRoles', label: 'Manage Roles', description: 'Create, edit and delete roles' },
-    ],
-  },
-];
-PERMISSION_LABELS = buildPermissionLabels(PERMISSION_GROUPS);
+function usePhotos(ids) {
+  const withToken = useGraph();
+  const [photos, setPhotos] = useState({});
+  const key = [...new Set(ids.filter(Boolean))].sort().join(',');
+  useEffect(() => {
+    if (!key) return undefined;
+    let cancelled = false;
+    withToken((token) => mapLimit(key.split(','), 6, async (id) => {
+      const url = await graphPhoto(id, token);
+      if (url && !cancelled) setPhotos((p) => ({ ...p, [id.toLowerCase()]: url }));
+    })).catch(() => {});
+    return () => { cancelled = true; };
+  }, [key, withToken]);
+  return photos;
+}
 
-// ─── PermissionTree component ────────────────────────────────────────────────
-const PermissionTree = ({ permissions, onChange }) => {
+// ── Roles ─────────────────────────────────────────────────────────────────────
 
-  const handleParentClick = (group) => {
-    const next = !permissions[group.key];
-    const updates = { [group.key]: next };
-    if (!next) {
-      (group.children || []).forEach(child => {
-        updates[child.key] = false;
-        (child.children || []).forEach(gc => { updates[gc.key] = false; });
-      });
-    }
-    onChange(updates);
+function RoleBadge({ roleId, roles }) {
+  const r = roles[roleId];
+  return r ? <Badge color={r.color}>{r.name}</Badge> : <Badge tone="warning">{roleId} (missing)</Badge>;
+}
+
+function PermissionTree({ catalog, value, onChange, locked = [] }) {
+  const parents = useMemo(() => {
+    const out = {};
+    walk(catalog, (n, _d, p) => { out[n.key] = p?.key || null; });
+    return out;
+  }, [catalog]);
+  const enabled = (key) => { let p = parents[key]; while (p) { if (!value[p]) return false; p = parents[p]; } return true; };
+  const toggle = (node) => {
+    const next = !value[node.key];
+    const patch = { [node.key]: next };
+    if (!next) walk(node.children || [], (c) => { patch[c.key] = false; });
+    onChange(patch);
   };
-
-  const handleChildClick = (child, parentOn) => {
-    if (!parentOn) return;
-    const next = !permissions[child.key];
-    const updates = { [child.key]: next };
-    if (!next) {
-      (child.children || []).forEach(gc => { updates[gc.key] = false; });
-    }
-    onChange(updates);
-  };
-
-  const handleGrandchildClick = (gc, childOn) => {
-    if (!childOn) return;
-    onChange({ [gc.key]: !permissions[gc.key] });
-  };
-
-  const Checkbox = ({ checked, size = 18 }) => (
-    <div style={{
-      width: size, height: size, borderRadius: 4, flexShrink: 0,
-      display: 'flex', alignItems: 'center', justifyContent: 'center',
-      border: checked ? 'none' : '2px solid #d5cfc9',
-      backgroundColor: checked ? '#eb1700' : '#ffffff',
-      transition: 'all 0.15s',
-    }}>
-      {checked && (
-        <svg width="9" height="7" viewBox="0 0 9 7" fill="none">
-          <path d="M1 3.5L3.2 5.5L8 1" stroke="white" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
-        </svg>
-      )}
-    </div>
-  );
-
-  const LockTag = ({ label }) => (
-    <div className="flex items-center gap-1.5 flex-shrink-0">
-      <svg width="10" height="12" viewBox="0 0 10 12" fill="none">
-        <rect x="1" y="5" width="8" height="7" rx="1.5" stroke="#cbc4bc" strokeWidth="1.5" />
-        <path d="M3 5V3.5C3 2.4 3.9 1.5 5 1.5C6.1 1.5 7 2.4 7 3.5V5" stroke="#cbc4bc" strokeWidth="1.5" strokeLinecap="round" />
-      </svg>
-      <span className="text-xs font-johnson-text text-jj-gray-04">Requires {label}</span>
-    </div>
-  );
-
-  return (
-    <div className="space-y-1.5">
-      {PERMISSION_GROUPS.map((group) => {
-        const parentOn = !!permissions[group.key];
-        const hasChildren = (group.children || []).length > 0;
-
+  const render = (nodes, depth) => (
+    <ul className={cx('flex flex-col gap-1.5', depth > 0 && 'mt-1.5 ml-4 sm:ml-6 pl-3 border-l-2 border-jj-gray-02')}>
+      {nodes.map((n) => {
+        const reachable = enabled(n.key);
+        const isLocked = locked.includes(n.key);
+        const on = !!value[n.key] && reachable;
         return (
-          <div key={group.key}>
-
-            {/* ── Level 1: Parent ── */}
-            <div
-              onClick={() => handleParentClick(group)}
-              className={`flex items-center gap-3 px-4 py-3 rounded-lg border cursor-pointer transition-all duration-150 ${
-                parentOn
-                  ? 'bg-jj-gray-01 border-jj-gray-03 border-l-4 border-l-jj-red'
-                  : 'bg-white border-jj-gray-03 hover:bg-jj-gray-01'
-              }`}
-            >
-              <Checkbox checked={parentOn} />
-              <div className="flex-1 min-w-0">
-                <p className="text-sm font-johnson-text text-jj-gray-08">{group.label}</p>
-                <p className="text-xs font-johnson-text text-jj-gray-05 mt-0.5">{group.description}</p>
-              </div>
-              {hasChildren && (
-                <span className="text-xs font-johnson-text px-2.5 py-1 rounded-full bg-jj-gray-01 border border-jj-gray-03 text-jj-gray-05">
-                  {group.children.length} sub-feature{group.children.length > 1 ? 's' : ''}
-                </span>
-              )}
-            </div>
-
-            {/* ── Level 2 + Level 3 ── */}
-            {hasChildren && (
-              <div className="ml-7 mt-1">
-                {group.children.map((child, idx) => {
-                  const isLast = idx === group.children.length - 1;
-                  const childOn = !!permissions[child.key];
-                  const childDisabled = !parentOn;
-                  const hasGrandchildren = (child.children || []).length > 0;
-
-                  return (
-                    <div
-                      key={child.key}
-                      style={{
-                        position: 'relative',
-                        // flow-root creates a new block formatting context — prevents child
-                        // margins (e.g. mb-1 on grandchild container) from collapsing OUT of
-                        // this wrapper, which would create a gap between siblings and break
-                        // the absolute connector line.
-                        display: 'flow-root',
-                      }}
-                    >
-                      {/* Vertical line for non-last: full height of wrapper (top→bottom).
-                          Works correctly because flow-root above contains child margins. */}
-                      {!isLast && (
-                        <div className="absolute bg-jj-gray-03"
-                          style={{ left: '-16px', top: 0, bottom: 0, width: '2px' }} />
-                      )}
-
-                      {/* ── Level-2 row ── */}
-                      <div style={{ position: 'relative', marginBottom: '4px' }}>
-                        {/* Last item: "└" — only top-half of the row height */}
-                        {isLast && (
-                          <div className="absolute bg-jj-gray-03"
-                            style={{ left: '-16px', top: 0, height: '50%', width: '2px' }} />
-                        )}
-                        {/* Horizontal branch */}
-                        <div className="absolute bg-jj-gray-03"
-                          style={{ left: '-16px', top: '50%', transform: 'translateY(-50%)', width: '16px', height: '2px' }} />
-
-                        <div
-                          onClick={() => handleChildClick(child, parentOn)}
-                          className={`flex items-center gap-3 px-4 py-2.5 rounded-lg border transition-all duration-150 ${
-                            childDisabled
-                              ? 'bg-jj-gray-01 border-jj-gray-02 cursor-not-allowed opacity-40'
-                              : childOn
-                                ? 'bg-jj-gray-01 border-jj-gray-02 cursor-pointer'
-                                : 'bg-white border-jj-gray-02 cursor-pointer hover:bg-jj-gray-01'
-                          }`}
-                        >
-                          <Checkbox checked={childOn && !childDisabled} size={16} />
-                          <div className="flex-1 min-w-0">
-                            <p className="text-sm font-johnson-text text-jj-gray-08">{child.label}</p>
-                            <p className="text-xs font-johnson-text text-jj-gray-05 mt-0.5">{child.description}</p>
-                          </div>
-                          {childDisabled
-                            ? <LockTag label={group.label} />
-                            : hasGrandchildren && (
-                              <span className="text-xs font-johnson-text px-2 py-0.5 rounded-full bg-jj-gray-01 border border-jj-gray-03 text-jj-gray-05">
-                                {child.children.length} more
-                              </span>
-                            )
-                          }
-                        </div>
-                      </div>
-
-                      {/* ── Level-3 grandchildren ── */}
-                      {hasGrandchildren && (
-                        <div className="ml-7 mt-1 mb-1 space-y-1" style={{ position: 'relative' }}>
-                          <div className="absolute bg-jj-gray-02"
-                            style={{ left: '-16px', top: 0, bottom: '18px', width: '2px', borderRadius: '2px' }} />
-                          {child.children.map((gc) => {
-                            const gcOn = !!permissions[gc.key];
-                            const gcDisabled = !childOn || childDisabled;
-                            return (
-                              <div key={gc.key} style={{ position: 'relative' }}>
-                                <div className="absolute bg-jj-gray-02"
-                                  style={{ left: '-16px', top: '50%', width: '16px', height: '2px' }} />
-                                <div
-                                  onClick={() => handleGrandchildClick(gc, childOn && !childDisabled)}
-                                  className={`flex items-center gap-3 px-4 py-2 rounded-lg border transition-all duration-150 ${
-                                    gcDisabled
-                                      ? 'bg-jj-gray-01 border-jj-gray-02 cursor-not-allowed opacity-40'
-                                      : gcOn
-                                        ? 'bg-jj-gray-01 border-jj-gray-02 cursor-pointer'
-                                        : 'bg-white border-jj-gray-02 cursor-pointer hover:bg-jj-gray-01'
-                                  }`}
-                                >
-                                  <Checkbox checked={gcOn && !gcDisabled} size={14} />
-                                  <div className="flex-1 min-w-0">
-                                    <p className="text-sm font-johnson-text text-jj-gray-08">{gc.label}</p>
-                                    <p className="text-xs font-johnson-text text-jj-gray-05 mt-0.5">{gc.description}</p>
-                                  </div>
-                                  {gcDisabled && <LockTag label={child.label} />}
-                                </div>
-                              </div>
-                            );
-                          })}
-                        </div>
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-
-          </div>
+          <li key={n.key}>
+            <label className={cx('flex items-start gap-3 rounded-lg border px-3 py-2.5 transition-colors',
+              !reachable || isLocked ? 'opacity-50 cursor-not-allowed bg-jj-gray-01 border-jj-gray-02' : 'cursor-pointer hover:bg-jj-gray-01',
+              on ? 'border-jj-red/40 bg-red-50/40' : 'border-jj-gray-02 bg-white')}>
+              <input type="checkbox" className="mt-0.5 w-4 h-4 accent-jj-red flex-shrink-0" checked={on} disabled={!reachable || isLocked} onChange={() => toggle(n)} />
+              <span className="min-w-0">
+                <span className="block font-johnson-text text-sm text-jj-gray-08">{n.label}{isLocked && <span className="ml-2 text-xs text-jj-gray-05">(required for Admin)</span>}</span>
+                <span className="block font-johnson-text text-xs text-jj-gray-06">{n.description}</span>
+              </span>
+            </label>
+            {n.children?.length > 0 && render(n.children, depth + 1)}
+          </li>
         );
       })}
-    </div>
+    </ul>
   );
-};
+  return render(catalog, 0);
+}
 
-const Icon = ({ src, alt = '', className = 'w-5 h-5', style = {} }) => (
-  <img src={src} alt={alt} className={className} style={style} />
-);
+const EMPTY_ROLE = { name: '', description: '', color: '#0f68b2', permissions: { viewDashboard: true } };
+const slug = (name) => name.toLowerCase().trim().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '').replace(/^(\d)/, 'r_$1').slice(0, 48);
 
-const MorePermissionsTag = ({ remaining }) => {
-  const [visible, setVisible] = useState(false);
-  const [coords, setCoords] = useState({ top: 0, left: 0 });
-  const tagRef = useRef(null);
+function RoleEditor({ open, roleId, config, onClose, onSaved }) {
+  const { toast } = useFeedback();
+  const editing = !!roleId;
+  const [form, setForm] = useState(() => structuredClone(editing ? config.roles[roleId] : EMPTY_ROLE));
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState(null);
 
-  const handleMouseEnter = () => {
-    if (tagRef.current) {
-      const rect = tagRef.current.getBoundingClientRect();
-      setCoords({
-        top: rect.bottom + window.scrollY + 8,
-        left: rect.left + window.scrollX + rect.width / 2,
-      });
+  const id = editing ? roleId : slug(form.name);
+  const idTaken = !editing && id && config.roles[id];
+  const allKeys = useMemo(() => { const k = []; walk(config.permission_catalog, (n) => k.push(n.key)); return k; }, [config]);
+  const allOn = allKeys.every((k) => form.permissions[k]);
+  const locked = roleId === 'admin' ? config.admin_locked_permissions : [];
+
+  const save = async () => {
+    setSaving(true);
+    setError(null);
+    try {
+      if (editing) await apiJson(`/api/rbac/roles/${encodeURIComponent(roleId)}`, { method: 'PUT', body: { role_definition: form } });
+      else await apiJson('/api/rbac/roles', { body: { role_id: id, role_definition: form } });
+      toast.success(editing ? `Saved ${form.name}` : `Created ${form.name}`);
+      onSaved();
+      onClose();
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setSaving(false);
     }
-    setVisible(true);
   };
 
   return (
-    <div
-      ref={tagRef}
-      style={{ position: 'relative', display: 'inline-block' }}
-      onMouseEnter={handleMouseEnter}
-      onMouseLeave={() => setVisible(false)}
-    >
-      <span className="text-xs font-johnson-text px-2 py-0.5 bg-jj-gray-02 text-jj-gray-07 rounded border border-jj-gray-03 cursor-default select-none">
-        +{remaining.length} more
-      </span>
-
-      {visible && ReactDOM.createPortal(
-        <div style={{
-          position: 'absolute',
-          top: coords.top,
-          left: coords.left,
-          transform: 'translateX(-50%)',
-          zIndex: 9999,
-          pointerEvents: 'none',
-        }}>
-          {/* Arrow */}
-          <div style={{
-            position: 'absolute',
-            top: '-5px',
-            left: '50%',
-            transform: 'translateX(-50%) rotate(45deg)',
-            width: '10px',
-            height: '10px',
-            backgroundColor: '#312c2a',
-          }} />
-          {/* Card */}
-          <div style={{
-            backgroundColor: '#312c2a',
-            borderRadius: '10px',
-            padding: '10px 12px',
-            boxShadow: '0 8px 24px rgba(49,44,42,0.2)',
-            minWidth: '160px',
-            maxWidth: '260px',
-          }}>
-            <p style={{
-              fontFamily: 'JohnsonText, Arial, sans-serif',
-              fontSize: '10px',
-              fontWeight: 700,
-              color: '#a39992',
-              textTransform: 'uppercase',
-              letterSpacing: '0.06em',
-              marginBottom: '8px',
-            }}>
-              {remaining.length} more permission{remaining.length !== 1 ? 's' : ''}
-            </p>
-            <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px' }}>
-              {remaining.map(([key]) => (
-                <span key={key} style={{
-                  fontFamily: 'JohnsonText, Arial, sans-serif',
-                  fontSize: '11px',
-                  color: '#ffffff',
-                  backgroundColor: '#6e6259',
-                  padding: '2px 8px',
-                  borderRadius: '4px',
-                  whiteSpace: 'nowrap',
-                }}>
-                  {formatPerm(key)}
-                </span>
-              ))}
-            </div>
-          </div>
-        </div>,
-        document.body
-      )}
-    </div>
-  );
-};
-
-
-// Reusable CSS filter map — all from J&J palette
-const F = {
-  white:  'brightness(0) invert(1)',
-  black:  'brightness(0)',
-  red:    'brightness(0) saturate(100%) invert(17%) sepia(100%) saturate(7426%) hue-rotate(3deg) brightness(92%) contrast(118%)',
-  gray04: 'brightness(0) saturate(100%) invert(82%) sepia(6%) saturate(356%) hue-rotate(346deg) brightness(92%) contrast(88%)',
-  gray05: 'brightness(0) saturate(100%) invert(65%) sepia(6%) saturate(556%) hue-rotate(346deg) brightness(92%) contrast(88%)',
-  gray06: 'brightness(0) saturate(100%) invert(50%) sepia(6%) saturate(656%) hue-rotate(346deg) brightness(92%) contrast(88%)',
-  gray07: 'brightness(0) saturate(100%) invert(42%) sepia(6%) saturate(656%) hue-rotate(346deg) brightness(92%) contrast(88%)',
-  gray08: 'brightness(0) saturate(100%) invert(15%) sepia(7%) saturate(806%) hue-rotate(346deg) brightness(95%) contrast(89%)',
-};
-
-const UserDetailPanel = ({ graphUser, assignedRole, photo, ext, profileInfoOpen, setProfileInfoOpen, onFetchExtended, getRoleDefinition, onClose, onAssignRole, onRemoveRole, busy }) => {
-  const email = graphUser.mail || graphUser.userPrincipalName;
-  const roleKey = assignedRole || 'viewer';
-  const roleDef = getRoleDefinition(roleKey);
-  const enabledPerms = Object.entries(roleDef.permissions || {}).filter(([, v]) => v);
-  const disabledPerms = Object.entries(roleDef.permissions || {}).filter(([, v]) => !v);
-  const formatDate = (iso) => iso ? new Date(iso).toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' }) : null;
-
-  const hasExtended = Object.keys(ext).length > 0;
-
-  const infoFields = [
-    { icon: mailSrc, label: 'Email', value: email },
-    { icon: buildingSrc, label: 'Department', value: ext.department || graphUser.department },
-    { icon: userSrc, label: 'Job Title', value: ext.jobTitle || graphUser.jobTitle },
-    { icon: buildingSrc, label: 'Company', value: ext.companyName },
-    { icon: buildingSrc, label: 'Office', value: ext.officeLocation },
-    { icon: globeSrc, label: 'City', value: ext.city },
-    { icon: globeSrc, label: 'Country', value: ext.country },
-    { icon: phoneSrc, label: 'Mobile', value: ext.mobilePhone },
-    { icon: phoneSrc, label: 'Business Phone', value: ext.businessPhones?.[0] },
-    { icon: userSrc, label: 'Employee ID', value: ext.employeeId },
-    { icon: userSrc, label: 'Employee Type', value: ext.employeeType },
-    { icon: userSrc, label: 'User Type', value: ext.userType },
-    { icon: userSrc, label: 'Account Status', value: ext.accountEnabled != null ? (ext.accountEnabled ? 'Enabled' : 'Disabled') : null },
-    { icon: userSrc, label: 'Created', value: formatDate(ext.createdDateTime) },
-  ].filter(f => f.value);
-
-  return ReactDOM.createPortal(
-    <>
-      {/* Backdrop */}
-      <div className="fixed inset-0 bg-black bg-opacity-40 z-40" onClick={onClose} />
-
-      {/* Slide-in panel */}
-      <div className="fixed top-0 right-0 h-full w-full max-w-md bg-white z-50 flex flex-col shadow-2xl">
-
-        {/* Panel header */}
-        <div className="flex items-center justify-between px-6 py-5 border-b-4 border-jj-red bg-white flex-shrink-0">
-          <div>
-            <h2 className="text-lg font-johnson-display text-jj-gray-08">User Details</h2>
-            <p className="text-xs font-johnson-text text-jj-gray-05 mt-0.5">{email}</p>
-          </div>
-          <button onClick={onClose} className="p-2 rounded-lg hover:bg-jj-gray-01 transition-colors">
-            <Icon src={closeIcon} className="w-5 h-5" style={{ filter: F.gray06 }} />
-          </button>
+    <Modal open={open} onClose={onClose} size="lg" title={editing ? `Edit ${config.roles[roleId]?.name || roleId}` : 'Create role'}
+      description={editing ? (config.builtin_role_ids.includes(roleId) ? 'Built-in role · changes override the defaults and can be reset later' : 'Custom role') : 'Pick the pages and actions this role can use.'}
+      footer={(
+        <>
+          <Button onClick={onClose} disabled={saving}>Cancel</Button>
+          <Button variant="primary" icon="save" onClick={save} loading={saving} disabled={!form.name.trim() || !id || !!idTaken}>{editing ? 'Save changes' : 'Create role'}</Button>
+        </>
+      )}>
+      <div className="flex flex-col gap-5">
+        {error && <Alert tone="error">{error}</Alert>}
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <TextField label="Name" value={form.name} maxLength={64} data-autofocus placeholder="e.g. Pipeline operator" onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))} />
+          <TextField label="Role ID" value={id} readOnly hint={editing ? 'Role IDs can’t change' : 'Generated from the name'} error={idTaken ? 'A role with this ID already exists' : null} />
         </div>
-
-        <div className="flex-1 overflow-y-auto">
-
-          {/* Profile hero */}
-          <div className="px-6 py-8 border-b border-jj-gray-02 bg-jj-gray-01 flex flex-col items-center text-center">
-            <div className="w-20 h-20 rounded-full bg-white border-2 border-jj-gray-03 overflow-hidden flex items-center justify-center mb-4 flex-shrink-0">
-              {photo ? (
-                <img src={photo} alt={graphUser.displayName} className="w-full h-full object-cover" />
-              ) : (
-                <Icon src={userPlusIcon} className="w-10 h-10" style={{ filter: F.red }} />
-              )}
-            </div>
-            <h3 className="text-xl font-johnson-display text-jj-gray-08 mb-1" style={{ lineHeight: '115%' }}>
-              {graphUser.displayName || email}
-            </h3>
-            {(ext.jobTitle || graphUser.jobTitle) && (
-              <p className="text-sm font-johnson-text text-jj-gray-05 mb-3">{ext.jobTitle || graphUser.jobTitle}</p>
-            )}
-            <span
-              className="px-4 py-1.5 rounded-full text-white font-johnson-text text-sm"
-              style={{ backgroundColor: roleDef.color || '#a39992' }}
-            >
-              {assignedRole ? roleDef.name : 'No Role Assigned'}
-            </span>
-          </div>
-
-          {/* Profile Information — collapsible */}
-          <div className="border-b border-jj-gray-02">
-            <button
-              onClick={() => { setProfileInfoOpen(prev => !prev); if (!profileInfoOpen) onFetchExtended(); }}
-              className="w-full flex items-center justify-between px-6 py-4 hover:bg-jj-gray-01 transition-colors text-left"
-            >
-              <span className="text-sm font-johnson-text font-bold text-jj-gray-08">Profile Information</span>
-              <div className="flex items-center gap-2">
-                {!profileInfoOpen && <span className="text-xs font-johnson-text text-jj-gray-05">Click to expand</span>}
-                <Icon
-                  src={chevronRightIcon}
-                  className={`w-4 h-4 transition-transform duration-200 ${profileInfoOpen ? 'rotate-90' : ''}`}
-                  style={{ filter: F.black }}
-                />
-              </div>
-            </button>
-            {profileInfoOpen && (
-              <div className="px-6 pb-6">
-                {!hasExtended && graphUser.id && (
-                  <div className="space-y-3 mb-3">
-                    {[1, 2, 3].map(i => (
-                      <div key={i} className="flex items-center gap-3">
-                        <div className="w-4 h-4 rounded bg-jj-gray-02 animate-pulse flex-shrink-0" />
-                        <div className="flex-1">
-                          <div className="h-3 w-16 bg-jj-gray-02 rounded animate-pulse mb-1" />
-                          <div className="h-4 w-40 bg-jj-gray-02 rounded animate-pulse" />
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                )}
-                <div className="space-y-4">
-                  {infoFields.map(({ icon: fieldIconSrc, label, value }) => (
-                    <div key={label} className="flex items-start gap-3">
-                      <img src={fieldIconSrc} alt="" className="w-4 h-4 flex-shrink-0 mt-0.5" style={{ filter: 'brightness(0) saturate(100%) invert(82%) sepia(6%) saturate(356%) hue-rotate(346deg) brightness(92%) contrast(88%)' }} />
-                      <div className="min-w-0">
-                        <p className="text-xs font-johnson-text text-jj-gray-05 uppercase tracking-wide mb-0.5">{label}</p>
-                        <p className="text-sm font-johnson-text text-jj-gray-08 break-all">{value}</p>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
-          </div>
-
-          {/* Access & Permissions */}
-          <div className="px-6 py-5">
-            <h4 className="text-sm font-johnson-text font-bold text-jj-gray-08 mb-4">Access & Permissions</h4>
-            {!assignedRole && (
-              <div className="p-3 bg-jj-gray-01 rounded-lg border border-jj-gray-03 mb-4">
-                <p className="text-sm font-johnson-text text-jj-gray-06">
-                  Permissions derived from AD group membership or default viewer access.
-                </p>
-              </div>
-            )}
-            <div className="grid grid-cols-1 gap-3">
-              {enabledPerms.length > 0 && (
-                <div>
-                  <p className="text-xs font-johnson-text font-bold text-jj-gray-07 uppercase tracking-wide mb-2">Has Access</p>
-                  <div className="space-y-1.5">
-                    {enabledPerms.map(([key]) => (
-                      <div key={key} className="flex items-center gap-2 py-1 px-2 rounded bg-jj-gray-01">
-                        <Icon src={shieldCheckIcon} className="w-3.5 h-3.5 flex-shrink-0" style={{ filter: F.gray07 }} />
-                        <span className="text-sm font-johnson-text text-jj-gray-07">{formatPerm(key)}</span>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              )}
-              {disabledPerms.length > 0 && (
-                <div>
-                  <p className="text-xs font-johnson-text font-bold text-jj-gray-05 uppercase tracking-wide mb-2">No Access</p>
-                  <div className="space-y-1.5">
-                    {disabledPerms.map(([key]) => (
-                      <div key={key} className="flex items-center gap-2 py-1 px-2">
-                        <Icon src={shieldCheckIcon} className="w-3.5 h-3.5 flex-shrink-0" style={{ filter: F.gray04 }} />
-                        <span className="text-sm font-johnson-text text-jj-gray-05">{formatPerm(key)}</span>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              )}
-            </div>
-          </div>
+        <TextField label="Description" multiline rows={2} maxLength={256} value={form.description} placeholder="What is this role for?" onChange={(e) => setForm((f) => ({ ...f, description: e.target.value }))} />
+        <div className="flex items-center gap-3">
+          <label className="font-johnson-text text-xs font-semibold text-jj-gray-07" htmlFor="role-color">Badge colour</label>
+          <input id="role-color" type="color" value={form.color} onChange={(e) => setForm((f) => ({ ...f, color: e.target.value }))} className="w-10 h-10 rounded-lg border border-jj-gray-03 p-0.5 cursor-pointer" />
+          <Badge color={form.color}>{form.name || 'Preview'}</Badge>
         </div>
-
-        {/* Footer */}
-        <div className="px-6 py-4 border-t border-jj-gray-02 flex gap-3 flex-shrink-0 bg-white">
-          <button
-            onClick={onAssignRole}
-            disabled={busy}
-            className="flex-1 bg-jj-red text-white py-2.5 rounded-lg hover:bg-jj-maroon-05 transition-colors font-johnson-text text-sm flex items-center justify-center gap-2 disabled:opacity-50"
-          >
-            <Icon src={userPlusIcon} className="w-4 h-4" style={{ filter: F.white }} />
-            {assignedRole ? 'Change Role' : 'Assign Role'}
-          </button>
-          {assignedRole && (
-            <button
-              onClick={() => onRemoveRole(email)}
-              disabled={busy}
-              className="px-4 py-2.5 border-2 border-jj-red text-jj-red rounded-lg hover:bg-jj-gray-01 transition-colors font-johnson-text text-sm flex items-center gap-2 disabled:opacity-50"
-            >
-              <Icon src={trashIcon} className="w-4 h-4" style={{ filter: F.red }} />
-              Remove
-            </button>
-          )}
+        <div>
+          <div className="flex items-center justify-between mb-3">
+            <p className="font-johnson-text text-xs font-semibold text-jj-gray-07">Permissions</p>
+            <Button size="xs" variant="ghost" onClick={() => setForm((f) => ({ ...f, permissions: Object.fromEntries(allKeys.map((k) => [k, !allOn || locked.includes(k)])) }))}>
+              {allOn ? 'Clear all' : 'Select all'}
+            </Button>
+          </div>
+          <PermissionTree catalog={config.permission_catalog} value={form.permissions} locked={locked}
+            onChange={(patch) => setForm((f) => ({ ...f, permissions: { ...f.permissions, ...patch } }))} />
         </div>
       </div>
-    </>,
-    document.body
+    </Modal>
   );
-};
+}
+
+function RolesTab({ config, reload, canManage }) {
+  const { toast, confirm } = useFeedback();
+  const [editor, setEditor] = useState({ open: false, roleId: null });
+  const labels = useMemo(() => { const l = {}; walk(config.permission_catalog, (n, _d, p) => { l[n.key] = p ? `${p.label} › ${n.label}` : n.label; }); return l; }, [config]);
+  const assignments = useMemo(() => {
+    const c = {};
+    Object.values(config.user_role_overrides).forEach((r) => { c[r] = (c[r] || 0) + 1; });
+    return c;
+  }, [config]);
+  const adGroups = Object.entries(config.ad_group_roles);
+
+  const removeRole = async (roleId) => {
+    const role = config.roles[roleId];
+    const builtin = config.builtin_role_ids.includes(roleId);
+    const ok = await confirm(builtin
+      ? { title: `Reset ${role.name}?`, message: 'Custom changes are discarded and the built-in definition is restored.', confirmLabel: 'Reset role', tone: 'danger' }
+      : { title: `Delete ${role.name}?`, message: `${assignments[roleId] || 0} user(s) assigned to this role fall back to their AD group role.`, confirmLabel: 'Delete role', tone: 'danger' });
+    if (!ok) return;
+    try {
+      await apiJson(`/api/rbac/roles/${encodeURIComponent(roleId)}`, { method: 'DELETE' });
+      toast.success(builtin ? `${role.name} reset` : `${role.name} deleted`);
+      reload();
+    } catch (e) {
+      toast.error(e.message);
+    }
+  };
+
+  return (
+    <div className="flex flex-col gap-5">
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+        <p className="font-johnson-text text-sm text-jj-gray-06">{Object.keys(config.roles).length} roles · manual assignments take precedence over AD group mappings.</p>
+        {canManage && <Button variant="primary" icon="add" onClick={() => setEditor({ open: true, roleId: null })}>Create role</Button>}
+      </div>
+      <ul className="grid grid-cols-1 lg:grid-cols-2 2xl:grid-cols-3 gap-4">
+        {Object.entries(config.roles).map(([id, role]) => {
+          const builtin = config.builtin_role_ids.includes(id);
+          const modified = builtin && config.custom_roles[id];
+          const granted = Object.entries(role.permissions).filter(([, v]) => v).map(([k]) => k);
+          return (
+            <li key={id} className="bg-white rounded-xl border border-jj-gray-02 shadow-card flex flex-col">
+              <div className="flex items-start justify-between gap-3 p-4 sm:p-5">
+                <div className="min-w-0">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="w-3 h-3 rounded-full flex-shrink-0" style={{ background: role.color }} aria-hidden="true" />
+                    <h3 className="font-johnson-display text-lg text-jj-gray-08 truncate">{role.name}</h3>
+                    <Badge tone={modified ? 'warning' : builtin ? 'neutral' : 'info'}>{modified ? 'Modified' : builtin ? 'Built-in' : 'Custom'}</Badge>
+                  </div>
+                  <p className="mt-1 font-johnson-text text-sm text-jj-gray-06 line-clamp-2">{role.description || 'No description'}</p>
+                </div>
+                {canManage && (
+                  <div className="flex items-center gap-1 flex-shrink-0">
+                    <IconButton icon="edit" label={`Edit ${role.name}`} size="sm" onClick={() => setEditor({ open: true, roleId: id })} />
+                    {(modified || !builtin) && <IconButton icon={builtin ? 'refresh' : 'trash'} label={builtin ? `Reset ${role.name}` : `Delete ${role.name}`} size="sm" onClick={() => removeRole(id)} />}
+                  </div>
+                )}
+              </div>
+              <div className="mt-auto px-4 sm:px-5 pb-4 sm:pb-5">
+                <p className="font-johnson-text text-xs text-jj-gray-06 mb-2">
+                  {granted.length} permission{granted.length === 1 ? '' : 's'} · {fmtNum(assignments[id] || 0)} manual assignment{assignments[id] === 1 ? '' : 's'}
+                </p>
+                <div className="flex flex-wrap gap-1.5">
+                  {granted.slice(0, 6).map((k) => <span key={k} className="px-2 py-0.5 rounded-md bg-jj-gray-01 border border-jj-gray-02 font-johnson-text text-xs text-jj-gray-07" title={labels[k]}>{labels[k]?.split(' › ').pop() || k}</span>)}
+                  {granted.length > 6 && <span className="px-2 py-0.5 rounded-md bg-jj-gray-02 font-johnson-text text-xs text-jj-gray-07" title={granted.slice(6).map((k) => labels[k]).join('\n')}>+{granted.length - 6} more</span>}
+                </div>
+              </div>
+            </li>
+          );
+        })}
+      </ul>
+      <section className="bg-white rounded-xl border border-jj-gray-02 shadow-card overflow-hidden">
+        <div className="px-4 sm:px-5 py-4 border-b border-jj-gray-02">
+          <h3 className="font-johnson-display text-base text-jj-gray-08">AD group mappings</h3>
+          <p className="font-johnson-text text-xs text-jj-gray-06">Members of these groups get the role automatically. Configured on the backend (AD_GROUP_*).</p>
+        </div>
+        {adGroups.length === 0 ? <p className="px-5 py-4 font-johnson-text text-sm text-jj-gray-06">No AD groups are mapped.</p> : (
+          <ul className="divide-y divide-jj-gray-02">
+            {adGroups.map(([group, roleId]) => (
+              <li key={group} className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 px-4 sm:px-5 py-3">
+                <span className="font-mono text-xs sm:text-sm text-jj-gray-07 break-all">{group}</span>
+                <RoleBadge roleId={roleId} roles={config.roles} />
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+      {editor.open && <RoleEditor key={editor.roleId || 'new'} open roleId={editor.roleId} config={config} onClose={() => setEditor({ open: false, roleId: null })} onSaved={reload} />}
+    </div>
+  );
+}
+
+// ── Users ─────────────────────────────────────────────────────────────────────
+
+function AssignModal({ target, config, onClose, onSaved }) {
+  const { toast } = useFeedback();
+  const [role, setRole] = useState(target.current || 'viewer');
+  const [saving, setSaving] = useState(false);
+  const save = async () => {
+    setSaving(true);
+    try {
+      await apiJson('/api/rbac/user-assignments', { body: { user_email: target.email, role_name: role } });
+      toast.success(`${config.roles[role].name} assigned to ${target.name || target.email}`);
+      onSaved();
+      onClose();
+    } catch (e) {
+      toast.error(e.message);
+    } finally {
+      setSaving(false);
+    }
+  };
+  return (
+    <Modal open onClose={onClose} size="sm" title={target.current ? 'Change role' : 'Assign role'} description={target.name ? `${target.name} · ${target.email}` : target.email}
+      footer={<><Button onClick={onClose} disabled={saving}>Cancel</Button><Button variant="primary" onClick={save} loading={saving}>Save</Button></>}>
+      <label className="flex flex-col gap-1.5 font-johnson-text text-xs font-semibold text-jj-gray-07">
+        Role
+        <Select value={role} onChange={setRole} label="Role" className="w-full">
+          {Object.entries(config.roles).map(([id, r]) => <option key={id} value={id}>{r.name}</option>)}
+        </Select>
+      </label>
+      <p className="mt-3 font-johnson-text text-xs text-jj-gray-06">A manual assignment overrides any role from AD group membership.</p>
+    </Modal>
+  );
+}
+
+function UserDrawer({ person, config, onClose, onAssign, onRemove, canManage }) {
+  const withToken = useGraph();
+  const [profile, setProfile] = useState(null);
+  const photos = usePhotos(person ? [person.email] : []);
+  useEffect(() => {
+    if (!person) return undefined;
+    let cancelled = false;
+    withToken((t) => graphJson(`/users/${encodeURIComponent(person.id || person.email)}?$select=${USER_FIELDS},officeLocation,city,country,companyName,mobilePhone,businessPhones,employeeType,accountEnabled,createdDateTime`, t))
+      .then((p) => { if (!cancelled) setProfile(p); })
+      .catch(() => { if (!cancelled) setProfile({}); });
+    return () => { cancelled = true; };
+  }, [person, withToken]);
+  if (!person) return null;
+  const override = config.user_role_overrides[person.email];
+  const role = config.roles[override || 'viewer'];
+  const labels = {};
+  walk(config.permission_catalog, (n, _d, p) => { labels[n.key] = p ? `${p.label} › ${n.label}` : n.label; });
+  const fields = profile ? [
+    ['Job title', profile.jobTitle], ['Department', profile.department], ['Company', profile.companyName], ['Office', profile.officeLocation],
+    ['Location', [profile.city, profile.country].filter(Boolean).join(', ')], ['Mobile', profile.mobilePhone], ['Phone', profile.businessPhones?.[0]],
+    ['Employee type', profile.employeeType], ['Account', profile.accountEnabled == null ? null : profile.accountEnabled ? 'Enabled' : 'Disabled'],
+    ['Created', profile.createdDateTime ? new Date(profile.createdDateTime).toLocaleDateString('en-US', { dateStyle: 'medium' }) : null],
+  ].filter(([, v]) => v) : [];
+
+  return (
+    <Drawer open onClose={onClose} title={person.name || person.email} description={person.email}
+      footer={canManage ? (
+        <>
+          <Button variant="primary" className="flex-1" onClick={onAssign}>{override ? 'Change role' : 'Assign role'}</Button>
+          {override && <Button variant="dangerOutline" onClick={onRemove}>Remove</Button>}
+        </>
+      ) : null}>
+      <div className="flex flex-col items-center text-center gap-2 px-5 py-6 bg-jj-gray-01 border-b border-jj-gray-02">
+        <Avatar src={photos[person.email]} name={person.name || person.email} className="w-20 h-20 text-xl" />
+        <p className="font-johnson-display text-lg text-jj-gray-08">{person.name || person.email}</p>
+        {override ? <RoleBadge roleId={override} roles={config.roles} /> : <Badge>No manual role · AD group or Viewer</Badge>}
+      </div>
+      <div className="px-5 py-5 flex flex-col gap-6">
+        <section>
+          <h3 className="font-johnson-text text-xs font-semibold text-jj-gray-07 mb-2">Profile</h3>
+          {!profile ? <div className="flex flex-col gap-2">{[0, 1, 2].map((i) => <Skeleton key={i} className="h-4 w-full" />)}</div>
+            : fields.length === 0 ? <p className="font-johnson-text text-sm text-jj-gray-06">No directory details available.</p> : (
+              <dl className="divide-y divide-jj-gray-02 border-y border-jj-gray-02">
+                {fields.map(([k, v]) => (
+                  <div key={k} className="flex justify-between gap-4 py-2 font-johnson-text text-sm"><dt className="text-jj-gray-06">{k}</dt><dd className="text-jj-gray-08 text-right break-words min-w-0">{v}</dd></div>
+                ))}
+              </dl>
+            )}
+        </section>
+        {override && role && (
+          <section>
+            <h3 className="font-johnson-text text-xs font-semibold text-jj-gray-07 mb-2">Access through {role.name}</h3>
+            <ul className="flex flex-col gap-1">
+              {Object.entries(role.permissions).filter(([, v]) => v).map(([k]) => (
+                <li key={k} className="flex items-center gap-2 font-johnson-text text-sm text-jj-gray-07"><Icon name="check" className="w-3.5 h-3.5 text-jj-green-03" />{labels[k] || k}</li>
+              ))}
+            </ul>
+          </section>
+        )}
+      </div>
+    </Drawer>
+  );
+}
+
+function UsersTab({ config, reload, canManage }) {
+  const withToken = useGraph();
+  const { toast, confirm } = useFeedback();
+  const [mode, setMode] = useState('assigned');
+  const [search, setSearch] = useState('');
+  const [roleFilter, setRoleFilter] = useState('');
+  const q = useDebouncedValue(search.trim(), 400);
+  const [directory, setDirectory] = useState({ users: [], next: null, stack: [], loading: false, error: null });
+  const [details, setDetails] = useState({});
+  const [assignTarget, setAssignTarget] = useState(null);
+  const [drawer, setDrawer] = useState(null);
+
+  const assigned = useMemo(() => Object.entries(config.user_role_overrides)
+    .filter(([, r]) => !roleFilter || r === roleFilter)
+    .map(([email, role]) => ({ email, role, ...details[email] }))
+    .filter((u) => !q || u.email.includes(q.toLowerCase()) || (u.name || '').toLowerCase().includes(q.toLowerCase()))
+    .sort((a, b) => (a.name || a.email).localeCompare(b.name || b.email)), [config, roleFilter, details, q]);
+
+  useEffect(() => {
+    const missing = Object.keys(config.user_role_overrides).filter((e) => !details[e]);
+    if (!missing.length) return undefined;
+    let cancelled = false;
+    withToken((t) => mapLimit(missing, 6, async (email) => {
+      try {
+        const u = await graphJson(`/users/${encodeURIComponent(email)}?$select=${USER_FIELDS}`, t);
+        if (!cancelled) setDetails((d) => ({ ...d, [email]: { id: u.id, name: u.displayName, jobTitle: u.jobTitle, department: u.department } }));
+      } catch {
+        if (!cancelled) setDetails((d) => ({ ...d, [email]: { missing: true } }));
+      }
+    })).catch(() => {});
+    return () => { cancelled = true; };
+  }, [config, withToken]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const loadDirectory = useCallback(async (url, stack) => {
+    setDirectory((d) => ({ ...d, loading: true, error: null }));
+    try {
+      const data = await withToken((t) => graphJson(url, t));
+      setDirectory({ users: data.value || [], next: data['@odata.nextLink'] || null, stack, loading: false, error: null, current: url });
+    } catch (e) {
+      if (!isAbort(e)) setDirectory((d) => ({ ...d, loading: false, error: e.message }));
+    }
+  }, [withToken]);
+
+  useEffect(() => {
+    if (mode !== 'directory') return;
+    const s = odata(q);
+    const url = q
+      ? `/users?$filter=${encodeURIComponent(`startswith(displayName,'${s}') or startswith(mail,'${s}') or startswith(userPrincipalName,'${s}')`)}&$top=25&$select=${USER_FIELDS}`
+      : `/users?$top=25&$select=${USER_FIELDS}&$orderby=displayName`;
+    loadDirectory(url, []);
+  }, [mode, q, loadDirectory]);
+
+  const rows = mode === 'assigned' ? assigned : directory.users.map((u) => ({
+    email: userEmail(u), id: u.id, name: u.displayName, jobTitle: u.jobTitle, department: u.department, role: config.user_role_overrides[userEmail(u)],
+  }));
+  const photos = usePhotos(rows.map((r) => r.email));
+
+  const removeOverride = async (person) => {
+    const ok = await confirm({ title: 'Remove manual role?', message: `${person.name || person.email} falls back to their AD group role, or Viewer.`, confirmLabel: 'Remove', tone: 'danger' });
+    if (!ok) return;
+    try {
+      await apiJson(`/api/rbac/user-assignments/${encodeURIComponent(person.email)}`, { method: 'DELETE' });
+      toast.success('Manual role removed');
+      setDrawer(null);
+      reload();
+    } catch (e) {
+      toast.error(e.message);
+    }
+  };
+
+  const loading = mode === 'directory' && directory.loading;
+
+  return (
+    <div className="flex flex-col gap-4">
+      <div className="bg-white rounded-xl border border-jj-gray-02 shadow-card p-3 sm:p-4 flex flex-col lg:flex-row lg:items-center gap-3">
+        <Tabs variant="pill" label="User list" value={mode} onChange={setMode}
+          tabs={[{ id: 'assigned', label: `Assigned · ${Object.keys(config.user_role_overrides).length}` }, { id: 'directory', label: 'Directory' }]} />
+        <SearchInput value={search} onChange={setSearch} placeholder={mode === 'assigned' ? 'Filter by name or email' : 'Search the directory (starts with)'} className="flex-1 lg:max-w-sm" />
+        {mode === 'assigned' && (
+          <Select value={roleFilter} onChange={setRoleFilter} label="Role filter" className="min-w-[11rem]">
+            <option value="">All roles</option>
+            {Object.entries(config.roles).map(([id, r]) => <option key={id} value={id}>{r.name}</option>)}
+          </Select>
+        )}
+      </div>
+
+      {mode === 'directory' && directory.error && (
+        <Alert tone="error" title="Directory search failed" action={<Button size="sm" onClick={() => loadDirectory(directory.current || '/users?$top=25', directory.stack)}>Retry</Button>}>
+          {directory.error}. Signing out and in again usually refreshes directory consent.
+        </Alert>
+      )}
+
+      <div className="bg-white rounded-xl border border-jj-gray-02 shadow-card overflow-hidden">
+        {loading && !rows.length ? <LoadingBlock label="Searching the directory…" /> : rows.length === 0 ? (
+          <EmptyState icon="person" title={mode === 'assigned' ? 'No manual assignments' : 'No users found'}
+            description={mode === 'assigned' ? 'Switch to Directory to find someone and assign them a role.' : 'Try a different name or email prefix.'} />
+        ) : (
+          <ul className={cx('divide-y divide-jj-gray-02', loading && 'opacity-60')}>
+            {rows.map((u) => (
+              <li key={u.email} className="flex flex-col sm:flex-row sm:items-center gap-3 px-4 sm:px-5 py-3 hover:bg-jj-gray-01/70">
+                <button type="button" onClick={() => setDrawer(u)} className="flex items-center gap-3 min-w-0 flex-1 text-left rounded-lg focus-ring">
+                  <Avatar src={photos[u.email]} name={u.name || u.email} className="w-10 h-10" />
+                  <span className="min-w-0">
+                    <span className="block font-johnson-text text-sm text-jj-gray-08 truncate">{u.name || (u.missing ? `${u.email} (not in directory)` : u.email)}</span>
+                    <span className="block font-johnson-text text-xs text-jj-gray-06 truncate">{[u.email, u.jobTitle, u.department].filter(Boolean).join(' · ')}</span>
+                  </span>
+                </button>
+                <div className="flex items-center gap-2 sm:justify-end pl-[3.25rem] sm:pl-0">
+                  {u.role ? <RoleBadge roleId={u.role} roles={config.roles} /> : <span className="font-johnson-text text-xs text-jj-gray-05">No manual role</span>}
+                  {canManage && <IconButton icon="edit" label={`Change role for ${u.name || u.email}`} size="sm" onClick={() => setAssignTarget({ email: u.email, name: u.name, current: u.role })} />}
+                  {canManage && u.role && <IconButton icon="trash" label={`Remove role from ${u.name || u.email}`} size="sm" onClick={() => removeOverride(u)} />}
+                </div>
+              </li>
+            ))}
+          </ul>
+        )}
+        {mode === 'directory' && (directory.next || directory.stack.length > 0) && (
+          <div className="flex items-center justify-between gap-3 px-4 py-3 border-t border-jj-gray-02 bg-jj-gray-01">
+            <Button size="sm" icon="chevronLeft" disabled={!directory.stack.length || loading}
+              onClick={() => { const s = [...directory.stack]; const prev = s.pop(); loadDirectory(prev, s); }}>Previous</Button>
+            <span className="font-johnson-text text-sm text-jj-gray-06">Page {directory.stack.length + 1}</span>
+            <Button size="sm" iconRight="chevronRight" disabled={!directory.next || loading}
+              onClick={() => loadDirectory(directory.next, [...directory.stack, directory.current])}>Next</Button>
+          </div>
+        )}
+      </div>
+
+      {assignTarget && <AssignModal key={assignTarget.email} target={assignTarget} config={config} onClose={() => setAssignTarget(null)} onSaved={reload} />}
+      <UserDrawer key={drawer?.email || 'none'} person={drawer} config={config} canManage={canManage} onClose={() => setDrawer(null)}
+        onAssign={() => { setAssignTarget({ email: drawer.email, name: drawer.name, current: config.user_role_overrides[drawer.email] }); setDrawer(null); }}
+        onRemove={() => removeOverride(drawer)} />
+    </div>
+  );
+}
+
+// ── Groups ────────────────────────────────────────────────────────────────────
+
+function GroupsTab({ config }) {
+  const withToken = useGraph();
+  const [groups, setGroups] = useState(null);
+  const [error, setError] = useState(null);
+  const [open, setOpen] = useState(null);
+  const [members, setMembers] = useState(null);
+  const entries = useMemo(() => Object.entries(config.ad_group_roles), [config]);
+  const photos = usePhotos((members || []).map((m) => m.id));
+
+  useEffect(() => {
+    let cancelled = false;
+    withToken((t) => mapLimit(entries, 4, async ([ref, roleId]) => {
+      try {
+        const g = GUID_RE.test(ref)
+          ? await graphJson(`/groups/${ref}?$select=id,displayName,description,mail`, t)
+          : (await graphJson(`/groups?$filter=${encodeURIComponent(`displayName eq '${odata(ref)}'`)}&$select=id,displayName,description,mail`, t)).value?.[0];
+        return g ? { ...g, roleId, ref } : { ref, roleId, missing: true };
+      } catch {
+        return { ref, roleId, missing: true };
+      }
+    }))
+      .then((list) => { if (!cancelled) setGroups(list); })
+      .catch((e) => { if (!cancelled) setError(e.message); });
+    return () => { cancelled = true; };
+  }, [entries, withToken]);
+
+  const showMembers = async (g) => {
+    setOpen(g);
+    setMembers(null);
+    try {
+      const all = [];
+      let url = `/groups/${g.id}/members?$select=id,displayName,mail,userPrincipalName,jobTitle&$top=200`;
+      while (url && all.length < 2000) {
+        const page = await withToken((t) => graphJson(url, t));
+        all.push(...(page.value || []));
+        url = page['@odata.nextLink'];
+      }
+      setMembers(all.sort((a, b) => (a.displayName || '').localeCompare(b.displayName || '')));
+    } catch (e) {
+      setMembers([]);
+      setError(e.message);
+    }
+  };
+
+  if (!entries.length) return <EmptyState icon="community" title="No AD groups mapped" description="Set AD_GROUP_ADMIN / AD_GROUP_OPERATIONAL_SUPPORT on the backend to map groups to roles." />;
+  if (error && !groups) return <Alert tone="error" title="Couldn’t load groups">{error}</Alert>;
+  if (!groups) return <LoadingBlock label="Loading groups…" />;
+
+  return (
+    <>
+      <ul className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        {groups.map((g) => (
+          <li key={g.ref} className="bg-white rounded-xl border border-jj-gray-02 shadow-card p-4 sm:p-5 flex flex-col sm:flex-row sm:items-center gap-4">
+            <span className="w-11 h-11 rounded-xl bg-jj-gray-01 border border-jj-gray-02 text-jj-gray-07 flex items-center justify-center flex-shrink-0"><Icon name="community" className="w-5 h-5" /></span>
+            <div className="flex-1 min-w-0">
+              <p className="font-johnson-display text-base text-jj-gray-08 break-words">{g.displayName || g.ref}</p>
+              <p className="font-johnson-text text-xs text-jj-gray-06 break-words">{g.missing ? 'Not found in the directory' : g.description || g.mail || g.id}</p>
+              <div className="mt-2"><RoleBadge roleId={g.roleId} roles={config.roles} /></div>
+            </div>
+            {!g.missing && <Button size="sm" icon="community" onClick={() => showMembers(g)}>Members</Button>}
+          </li>
+        ))}
+      </ul>
+      <Drawer open={!!open} onClose={() => setOpen(null)} title={open?.displayName} description={members ? `${fmtNum(members.length)} members` : 'Loading members…'}>
+        {!members ? <LoadingBlock /> : members.length === 0 ? <EmptyState icon="community" title="No members" /> : (
+          <ul className="divide-y divide-jj-gray-02">
+            {members.map((m) => (
+              <li key={m.id} className="flex items-center gap-3 px-5 py-3">
+                <Avatar src={photos[m.id?.toLowerCase()]} name={m.displayName} className="w-9 h-9" />
+                <span className="min-w-0">
+                  <span className="block font-johnson-text text-sm text-jj-gray-08 truncate">{m.displayName}</span>
+                  <span className="block font-johnson-text text-xs text-jj-gray-06 truncate">{[m.mail || m.userPrincipalName, m.jobTitle].filter(Boolean).join(' · ')}</span>
+                </span>
+              </li>
+            ))}
+          </ul>
+        )}
+      </Drawer>
+    </>
+  );
+}
+
+// ── Page ──────────────────────────────────────────────────────────────────────
+
+const TABS = [
+  { id: 'users', label: 'Users', icon: 'person' },
+  { id: 'roles', label: 'Roles & permissions', icon: 'shield' },
+  { id: 'groups', label: 'AD groups', icon: 'community' },
+];
 
 export default function UserManagement() {
-  const { user } = useAuth();
-  const { instance } = useMsal();
-  const {
-    userRole,
-    getAllRoles,
-    getRoleDefinition,
-    getDefaultRoleDefinition,
-    getAllUserOverrides,
-    assignRoleToUser,
-    removeUserRoleOverride,
-    createCustomRole,
-    updateCustomRole,
-    deleteCustomRole,
-    customRoles,
-    AD_GROUP_ROLES
-  } = useRBAC();
-
-  // Built-in role IDs (cannot be deleted, but can be modified)
-  const BUILTIN_ROLE_IDS = ['admin', 'operational_support', 'viewer'];
-
-  const [searchParams, setSearchParams] = useSearchParams();
-
-  const VALID_TABS = ['groups', 'roles', 'users'];
-  const [activeTab, setActiveTab] = useState(() => {
-    const tab = searchParams.get('tab');
-    return VALID_TABS.includes(tab) ? tab : 'groups';
-  });
-
-  // Keep URL in sync when tab changes
-  const handleTabChange = (tab) => {
-    if (tab === activeTab) return;
-    setActiveTab(tab);
-    setSearchParams({ tab });
-  };
-
-  // Sync tab if URL changes externally (e.g. back/forward)
-  useEffect(() => {
-    const tab = searchParams.get('tab');
-    if (VALID_TABS.includes(tab) && tab !== activeTab) {
-      setActiveTab(tab);
-    }
-  }, [searchParams]);
-  const [notification, setNotification] = useState(null);
-
-  // Users tab state
-  const [users, setUsers] = useState([]);
-  const [usersLoading, setUsersLoading] = useState(false);
-  const [usersError, setUsersError] = useState(null);
-  const [usersSearchTerm, setUsersSearchTerm] = useState('');
-  const [usersPagination, setUsersPagination] = useState({
-    currentPage: 1,
-    pageSize: 20,
-    totalUsers: 0,
-    nextLink: null,
-    previousLinks: [] // Stack to store previous page links
-  });
-  const [selectedUserForRole, setSelectedUserForRole] = useState(null);
-  const [selectedRoleForUser, setSelectedRoleForUser] = useState('');
-  const [roleAssignmentTrigger, setRoleAssignmentTrigger] = useState(0); // Trigger to force re-render
-  const [showAssignedOnly, setShowAssignedOnly] = useState(true);
-  const [roleFilter, setRoleFilter] = useState('');
-  const [assignedUsersDetails, setAssignedUsersDetails] = useState({}); // email → graph user object
-  const [assignedUsersLoading, setAssignedUsersLoading] = useState(false);
-  const [assignedUsersPhotos, setAssignedUsersPhotos] = useState({}); // email → blob URL
-  const [selectedUserDetail, setSelectedUserDetail] = useState(null); // user clicked for detail panel
-  const [extendedUserDetails, setExtendedUserDetails] = useState({}); // id → full graph profile
-  const [profileInfoOpen, setProfileInfoOpen] = useState(false); // collapsible section in detail panel
-
-
-  // Groups tab state
-  const [groups, setGroups] = useState([]);
-  const [groupsLoading, setGroupsLoading] = useState(false);
-  const [selectedGroup, setSelectedGroup] = useState(null);
-  const [groupMembers, setGroupMembers] = useState([]);
-  const [groupMembersLoading, setGroupMembersLoading] = useState(false);
-  const [groupMemberPhotos, setGroupMemberPhotos] = useState({});
-
-  // Roles tab state
-  const [showCreateRole, setShowCreateRole] = useState(false);
-  const [roleActionBusy, setRoleActionBusy] = useState(false); // covers create/update/delete/reset/assign/remove — these all hit the same RBAC endpoints, only one is ever in flight from the modal/list at a time
-  const [editingRole, setEditingRole] = useState(null);
-  const [editingRoleSnapshot, setEditingRoleSnapshot] = useState(null);
-  const [newRoleId, setNewRoleId] = useState('');
-  const [newRoleName, setNewRoleName] = useState('');
-  const [newRoleDescription, setNewRoleDescription] = useState('');
-  const [newRoleColor, setNewRoleColor] = useState('#0f68b2');
-  const [newRolePermissions, setNewRolePermissions] = useState({
-    viewDashboard:          true,
-    viewEPODStats:          false,
-    viewEPODStatsEPOD:      false,
-    viewEPODStatsRIMDOCS:   false,
-    viewServerMonitor:      false,
-    viewEPodDev:            false,
-    stopScriptDev:          false,
-    viewEPodQA:             false,
-    stopScriptQA:           false,
-    viewEPodProd:           false,
-    stopScriptProd:         false,
-    viewRimdocsDev:         false,
-    stopScriptRimdocsDev:   false,
-    viewRimdocsQA:          false,
-    stopScriptRimdocsQA:    false,
-    viewRimdocsProd:        false,
-    stopScriptRimdocsProd:  false,
-    viewRimdocsDev1:        false,
-    stopScriptRimdocsDev1:  false,
-    viewRimdocsDev2:        false,
-    stopScriptRimdocsDev2:  false,
-    viewRimdocsQA2:         false,
-    stopScriptRimdocsQA2:   false,
-    viewRimdocsProd2:       false,
-    stopScriptRimdocsProd2: false,
-    viewServerManagerDev:   false,
-    viewServerManagerQA:    false,
-    viewServerManagerProd:  false,
-    viewServerManagerPOC:   false,
-    adminAccessDev:         false,
-    adminAccessQA:          false,
-    adminAccessProd:        false,
-    adminAccessPOC:         false,
-    viewAudit:              false,
-    viewUserManagement:     false,
-    manageUsers:            false,
-    manageRoles:            false,
-  });
-
-  const showNotification = (message, type = 'success') => {
-    setNotification({ message, type });
-    setTimeout(() => setNotification(null), 3000);
-  };
-
-  // Get access token for Microsoft Graph
-  const getGraphToken = async () => {
-    try {
-      const accounts = instance.getAllAccounts();
-      if (accounts.length === 0) throw new Error('No accounts found');
-
-      const scopes = ['User.Read.All', 'Group.Read.All', 'GroupMember.Read.All'];
-
-      try {
-        // Try silent token acquisition first
-        const response = await instance.acquireTokenSilent({
-          scopes: scopes,
-          account: accounts[0]
-        });
-        return response.accessToken;
-      } catch (silentError) {
-        console.log('Silent token acquisition failed, trying popup...', silentError);
-
-        // If silent fails, prompt user for consent
-        try {
-          const response = await instance.acquireTokenPopup({
-            scopes: scopes,
-            account: accounts[0]
-          });
-          return response.accessToken;
-        } catch (popupError) {
-          console.error('Popup token acquisition failed:', popupError);
-          throw new Error('Failed to acquire permissions. Please contact your administrator to grant User.Read.All permission.');
-        }
-      }
-    } catch (error) {
-      console.error('Error getting token:', error);
-      throw error;
-    }
-  };
-
-  // Fetch users from Microsoft Graph with pagination
-  const fetchUsers = async (direction = 'initial', searchQuery = '') => {
-    setUsersLoading(true);
-    setUsersError(null);
-    try {
-      const token = await getGraphToken();
-      let url;
-
-      if (direction === 'initial' || searchQuery) {
-        // Initial load or new search
-        if (searchQuery) {
-          // Search query - no orderby with filter
-          url = `https://graph.microsoft.com/v1.0/users?$filter=startswith(displayName,'${searchQuery}') or startswith(mail,'${searchQuery}') or startswith(userPrincipalName,'${searchQuery}')&$top=${usersPagination.pageSize}&$select=id,displayName,mail,userPrincipalName,jobTitle,department`;
-        } else {
-          // Initial load with ordering
-          url = `https://graph.microsoft.com/v1.0/users?$top=${usersPagination.pageSize}&$select=id,displayName,mail,userPrincipalName,jobTitle,department&$orderby=displayName`;
-        }
-
-        setUsersPagination(prev => ({ ...prev, currentPage: 1, previousLinks: [] }));
-      } else if (direction === 'next' && usersPagination.nextLink) {
-        // Navigate to next page
-        url = usersPagination.nextLink;
-      } else if (direction === 'previous' && usersPagination.previousLinks.length > 0) {
-        // Navigate to previous page
-        const previousLinks = [...usersPagination.previousLinks];
-        url = previousLinks.pop();
-        setUsersPagination(prev => ({
-          ...prev,
-          previousLinks,
-          currentPage: prev.currentPage - 1
-        }));
-      } else {
-        return; // No valid navigation
-      }
-
-      const response = await fetch(url, {
-        headers: {
-          'Authorization': `Bearer ${token}`,
-          'Content-Type': 'application/json'
-        }
-      });
-
-      if (!response.ok) {
-        const errorData = await response.json().catch(() => ({}));
-        throw new Error(errorData.error?.message || 'Failed to fetch users');
-      }
-
-      const data = await response.json();
-
-      setUsers(data.value || []);
-
-      if (direction === 'next') {
-        setUsersPagination(prev => ({
-          ...prev,
-          nextLink: data['@odata.nextLink'] || null,
-          currentPage: prev.currentPage + 1,
-          previousLinks: [...prev.previousLinks, url]
-        }));
-      } else if (direction === 'initial') {
-        setUsersPagination(prev => ({
-          ...prev,
-          nextLink: data['@odata.nextLink'] || null,
-          currentPage: 1,
-          previousLinks: []
-        }));
-      }
-    } catch (error) {
-      console.error('Error fetching users:', error);
-      setUsersError(error.message);
-      showNotification(error.message, 'error');
-    } finally {
-      setUsersLoading(false);
-    }
-  };
-
-  // Fetch mapped groups from Microsoft Graph
-  const fetchGroups = async () => {
-    setGroupsLoading(true);
-    try {
-      const token = await getGraphToken();
-      const mappedGroupNames = Object.keys(AD_GROUP_ROLES);
-
-      const groupPromises = mappedGroupNames.map(async (groupName) => {
-        try {
-          const response = await fetch(
-            `https://graph.microsoft.com/v1.0/groups?$filter=displayName eq '${groupName}'&$select=id,displayName,description,mail`,
-            {
-              headers: {
-                'Authorization': `Bearer ${token}`,
-                'Content-Type': 'application/json'
-              }
-            }
-          );
-
-          if (response.ok) {
-            const data = await response.json();
-            if (data.value && data.value.length > 0) {
-              return {
-                ...data.value[0],
-                mappedRole: AD_GROUP_ROLES[groupName]
-              };
-            }
-          }
-          return null;
-        } catch (error) {
-          console.error(`Error fetching group ${groupName}:`, error);
-          return null;
-        }
-      });
-
-      const groupsData = await Promise.all(groupPromises);
-      setGroups(groupsData.filter(g => g !== null));
-    } catch (error) {
-      console.error('Error fetching groups:', error);
-      showNotification('Failed to fetch groups', 'error');
-    } finally {
-      setGroupsLoading(false);
-    }
-  };
-
-  // Fetch group members
-  const fetchGroupMembers = async (groupId) => {
-    setGroupMembersLoading(true);
-    setGroupMemberPhotos({});
-    try {
-      const token = await getGraphToken();
-      const response = await fetch(
-        `https://graph.microsoft.com/v1.0/groups/${groupId}/members?$select=id,displayName,mail,userPrincipalName,jobTitle`,
-        { headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' } }
-      );
-      if (!response.ok) throw new Error('Failed to fetch group members');
-      const data = await response.json();
-      const members = data.value || [];
-      setGroupMembers(members);
-
-      // Fetch photos in background — non-blocking
-      const photoResults = await Promise.all(
-        members.slice(0, 50).map(async (m) => {
-          if (!m.id) return null;
-          try {
-            const res = await fetch(
-              `https://graph.microsoft.com/v1.0/users/${m.id}/photo/$value`,
-              { headers: { 'Authorization': `Bearer ${token}` } }
-            );
-            if (!res.ok) return null;
-            const blob = await res.blob();
-            return { id: m.id, url: URL.createObjectURL(blob) };
-          } catch { return null; }
-        })
-      );
-      const photos = {};
-      photoResults.forEach(r => { if (r) photos[r.id] = r.url; });
-      setGroupMemberPhotos(photos);
-    } catch (error) {
-      console.error('Error fetching group members:', error);
-      showNotification('Failed to fetch group members', 'error');
-    } finally {
-      setGroupMembersLoading(false);
-    }
-  };
-
-  // Load data when tab changes
-  useEffect(() => {
-    if (activeTab === 'users' && users.length === 0) {
-      fetchUsers();
-    } else if (activeTab === 'groups' && groups.length === 0) {
-      fetchGroups();
-    }
-  }, [activeTab]);
-
-  // Handle user search with debounce
-  useEffect(() => {
-    if (activeTab !== 'users') return;
-
-    const timer = setTimeout(() => {
-      fetchUsers('initial', usersSearchTerm);
-    }, 500);
-
-    return () => clearTimeout(timer);
-  }, [usersSearchTerm]);
-
-  // Fetch full Graph details for all users in userOverrides
-  const fetchAssignedUsersDetails = async () => {
-    const emails = Object.keys(userOverrides);
-    if (emails.length === 0) return;
-
-    // Skip emails we already have details for
-    const missing = emails.filter(e => !assignedUsersDetails[e]);
-    if (missing.length === 0) return;
-
-    setAssignedUsersLoading(true);
-    try {
-      const token = await getGraphToken();
-      const results = await Promise.all(
-        missing.map(async (email) => {
-          try {
-            const res = await fetch(
-              `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(email)}?$select=id,displayName,mail,userPrincipalName,jobTitle,department`,
-              { headers: { 'Authorization': `Bearer ${token}` } }
-            );
-            if (!res.ok) return null;
-            const data = await res.json();
-            return { email, data };
-          } catch {
-            return null;
-          }
-        })
-      );
-      const newDetails = {};
-      results.forEach(r => { if (r) newDetails[r.email] = r.data; });
-      setAssignedUsersDetails(prev => ({ ...prev, ...newDetails }));
-
-      // Fetch profile photos for successfully resolved users
-      const photoResults = await Promise.all(
-        Object.entries(newDetails).map(async ([email, userData]) => {
-          if (!userData?.id) return null;
-          try {
-            const res = await fetch(
-              `https://graph.microsoft.com/v1.0/users/${userData.id}/photo/$value`,
-              { headers: { 'Authorization': `Bearer ${token}` } }
-            );
-            if (!res.ok) return null;
-            const blob = await res.blob();
-            return { email, url: URL.createObjectURL(blob) };
-          } catch {
-            return null;
-          }
-        })
-      );
-      const newPhotos = {};
-      photoResults.forEach(r => { if (r) newPhotos[r.email] = r.url; });
-      setAssignedUsersPhotos(prev => ({ ...prev, ...newPhotos }));
-    } catch (error) {
-      console.error('Error fetching assigned user details:', error);
-    } finally {
-      setAssignedUsersLoading(false);
-    }
-  };
-
-  // Fetch extended profile for a single user when panel opens
-  const fetchExtendedUserDetails = async (userId) => {
-    if (!userId || extendedUserDetails[userId]) return;
-    try {
-      const token = await getGraphToken();
-      const fields = [
-        'id','displayName','mail','userPrincipalName','jobTitle','department',
-        'officeLocation','city','country','companyName','mobilePhone',
-        'businessPhones','employeeId','employeeType','userType','accountEnabled',
-        'createdDateTime','onPremisesDistinguishedName'
-      ].join(',');
-      const res = await fetch(
-        `https://graph.microsoft.com/v1.0/users/${userId}?$select=${fields}`,
-        { headers: { 'Authorization': `Bearer ${token}` } }
-      );
-      if (!res.ok) return;
-      const data = await res.json();
-      setExtendedUserDetails(prev => ({ ...prev, [userId]: data }));
-    } catch (error) {
-      console.error('Error fetching extended user details:', error);
-    }
-  };
-  useEffect(() => {
-    if (activeTab === 'users' && (showAssignedOnly || roleFilter)) {
-      fetchAssignedUsersDetails();
-    }
-  }, [activeTab, showAssignedOnly, roleFilter, roleAssignmentTrigger]);
-
-  // Reset profile info accordion when panel opens for a new user
-  useEffect(() => {
-    setProfileInfoOpen(false);
-  }, [selectedUserDetail]);
-
-  // Handle assign role to user
-  const handleAssignRoleToUser = async () => {
-    if (!selectedUserForRole || !selectedRoleForUser) {
-      showNotification('Please select a user and role', 'error');
-      return;
-    }
-
-    setRoleActionBusy(true);
-    try {
-      const email = selectedUserForRole.mail || selectedUserForRole.userPrincipalName;
-      await assignRoleToUser(email, selectedRoleForUser);
-      showNotification(`Role assigned to ${selectedUserForRole.displayName}`);
-      setSelectedUserForRole(null);
-      setSelectedRoleForUser('');
-      // Trigger re-render to show updated role
-      setRoleAssignmentTrigger(prev => prev + 1);
-    } catch (error) {
-      showNotification(error.message, 'error');
-    } finally {
-      setRoleActionBusy(false);
-    }
-  };
-
-  // Role management functions
-  const handleCreateRole = async () => {
-    if (!newRoleName) {
-      showNotification('Please enter a role name', 'error');
-      return;
-    }
-
-    if (!newRoleId) {
-      showNotification('Role ID could not be generated. Please enter a valid role name.', 'error');
-      return;
-    }
-
-    const allRoles = getAllRoles();
-    if (allRoles[newRoleId]) {
-      showNotification('A role with this ID already exists', 'error');
-      return;
-    }
-
-    setRoleActionBusy(true);
-    try {
-      await createCustomRole(newRoleId, {
-        name: newRoleName,
-        description: newRoleDescription,
-        color: newRoleColor,
-        permissions: newRolePermissions
-      });
-      showNotification('Custom role created successfully');
-      setShowCreateRole(false);
-      resetRoleForm();
-    } catch (error) {
-      showNotification(error.message, 'error');
-    } finally {
-      setRoleActionBusy(false);
-    }
-  };
-
-  const handleUpdateRole = async () => {
-    if (!editingRole) return;
-
-    const updatedRole = {
-      name: newRoleName,
-      description: newRoleDescription,
-      color: newRoleColor,
-      permissions: newRolePermissions
-    };
-
-    setRoleActionBusy(true);
-    try {
-      const changesSummary = buildRoleChangeSummary(editingRoleSnapshot, updatedRole);
-      await updateCustomRole(editingRole, updatedRole, changesSummary);
-      showNotification('Role updated successfully');
-      setEditingRole(null);
-      setShowCreateRole(false);
-      resetRoleForm();
-    } catch (error) {
-      showNotification(error.message, 'error');
-    } finally {
-      setRoleActionBusy(false);
-    }
-  };
-
-  // Generate unique role ID from role name
-  const generateRoleId = (roleName) => {
-    if (!roleName) return '';
-
-    // Convert to lowercase, replace spaces and special chars with underscore
-    let baseId = roleName
-      .toLowerCase()
-      .trim()
-      .replace(/[^a-z0-9]+/g, '_')
-      .replace(/^_+|_+$/g, ''); // Remove leading/trailing underscores
-
-    // Check if ID exists
-    const allRoles = getAllRoles();
-    let uniqueId = baseId;
-    let counter = 1;
-
-    while (allRoles[uniqueId]) {
-      uniqueId = `${baseId}_${counter}`;
-      counter++;
-    }
-
-    return uniqueId;
-  };
-
-  // Handle role name change and auto-generate ID
-  const handleRoleNameChange = (name) => {
-    setNewRoleName(name);
-    if (!editingRole) {
-      // Only auto-generate ID when creating new role, not editing
-      const generatedId = generateRoleId(name);
-      setNewRoleId(generatedId);
-    }
-  };
-
-  const handleDeleteRole = async (roleId) => {
-    const allRoles = getAllRoles();
-    if (window.confirm(`Delete custom role "${allRoles[roleId].name}"? Users assigned to this role will lose their permissions.`)) {
-      setRoleActionBusy(true);
-      try {
-        await deleteCustomRole(roleId);
-        showNotification('Role deleted successfully');
-      } catch (error) {
-        showNotification(error.message, 'error');
-      } finally {
-        setRoleActionBusy(false);
-      }
-    }
-  };
-
-  const handleResetToDefault = async (roleId) => {
-    const allRoles = getAllRoles();
-    const beforeRole = allRoles[roleId];
-    if (window.confirm(`Reset "${beforeRole.name}" to default settings? This will remove all custom modifications.`)) {
-      setRoleActionBusy(true);
-      try {
-        const afterRole = getDefaultRoleDefinition(roleId) || beforeRole;
-        const changesSummary = buildRoleChangeSummary(beforeRole, afterRole, 'Reset');
-        await deleteCustomRole(roleId, true, changesSummary); // Removing from customRoles will revert to ROLE_DEFINITIONS
-        showNotification('Role reset to default successfully');
-      } catch (error) {
-        showNotification(error.message, 'error');
-      } finally {
-        setRoleActionBusy(false);
-      }
-    }
-  };
-
-  const startEditingRole = (roleId) => {
-    const allRoles = getAllRoles();
-    const role = allRoles[roleId];
-    setShowCreateRole(false);
-    setEditingRole(roleId);
-    setEditingRoleSnapshot({
-      name: role.name,
-      description: role.description,
-      color: role.color,
-      permissions: { ...role.permissions },
-    });
-    setNewRoleId(roleId);
-    setNewRoleName(role.name);
-    setNewRoleDescription(role.description);
-    setNewRoleColor(role.color);
-    setNewRolePermissions(role.permissions);
-  };
-
-  const resetRoleForm = () => {
-    setNewRoleId('');
-    setNewRoleName('');
-    setNewRoleDescription('');
-    setNewRoleColor('#0f68b2');
-    setEditingRoleSnapshot(null);
-    setNewRolePermissions({
-      viewDashboard:          true,
-      viewEPODStats:          false,
-      viewEPODStatsEPOD:      false,
-      viewEPODStatsRIMDOCS:   false,
-      viewServerMonitor:      false,
-      viewEPodDev:            false,
-      stopScriptDev:          false,
-      viewEPodQA:             false,
-      stopScriptQA:           false,
-      viewEPodProd:           false,
-      stopScriptProd:         false,
-      viewRimdocsDev:         false,
-      stopScriptRimdocsDev:   false,
-      viewRimdocsQA:          false,
-      stopScriptRimdocsQA:    false,
-      viewRimdocsProd:        false,
-      stopScriptRimdocsProd:  false,
-      viewRimdocsDev1:        false,
-      stopScriptRimdocsDev1:  false,
-      viewRimdocsDev2:        false,
-      stopScriptRimdocsDev2:  false,
-      viewRimdocsQA2:         false,
-      stopScriptRimdocsQA2:   false,
-      viewRimdocsProd2:       false,
-      stopScriptRimdocsProd2: false,
-      viewServerManagerDev:   false,
-      viewServerManagerQA:    false,
-      viewServerManagerProd:  false,
-      viewServerManagerPOC:   false,
-      adminAccessDev:         false,
-      adminAccessQA:          false,
-      adminAccessProd:        false,
-      adminAccessPOC:         false,
-      viewAudit:              false,
-      viewUserManagement:     false,
-      manageUsers:            false,
-      manageRoles:            false,
-    });
-  };
-
-  const togglePermission = (updates) => {
-    setNewRolePermissions(prev => ({ ...prev, ...updates }));
-  };
-
-  const getRoleBadgeColor = (roleName) => {
-    const role = getRoleDefinition(roleName);
-    return role.color || '#a39992';
-  };
-
-  const allRoles = getAllRoles();
-
-  // Make userOverrides reactive to changes
-  const userOverrides = useMemo(() => {
-    return getAllUserOverrides();
-  }, [roleAssignmentTrigger, getAllUserOverrides]);
-
+  const { hasPermission, refresh } = useRBAC();
+  const [params, setParams] = useSearchParams();
+  const { config, error, reload } = useRbacAdmin();
+  const tab = TABS.some((t) => t.id === params.get('tab')) ? params.get('tab') : 'users';
+  const reloadAll = useCallback(() => { reload(); refresh(); }, [reload, refresh]);
 
   return (
-    <div className="h-full bg-jj-gray-01 overflow-auto">
-      <div className="flex flex-col w-full px-8 pt-5 pb-8 mx-auto">
-
-        {/* ── Toast notification ── */}
-        {notification && (
-          <div className="fixed top-20 right-8 z-50 animate-slide-in">
-            <div className={`${notification.type === 'success' ? 'bg-jj-gray-08' : 'bg-jj-red'} text-white px-5 py-4 rounded-xl shadow-xl flex items-center gap-3 min-w-64`}>
-              <Icon src={notification.type === 'success' ? checkIcon : alertIcon} className="w-5 h-5 flex-shrink-0" style={{ filter: F.white }} />
-              <span className="font-johnson-text text-sm">{notification.message}</span>
-            </div>
-          </div>
-        )}
-
-        {/* ── Page header ── */}
-        <div className="mb-6">
-          <div className="flex items-center gap-4">
-            <div className="w-12 h-12 bg-jj-red rounded-xl flex items-center justify-center flex-shrink-0">
-              <Icon src={shieldIcon} className="w-6 h-6" style={{ filter: F.white }} />
-            </div>
-            <div>
-              <h1 className="text-3xl font-johnson-display text-jj-gray-08" style={{ lineHeight: '110%' }}>User Management</h1>
-              <p className="text-sm font-johnson-text text-jj-gray-06 mt-0.5">Manage users, groups, roles and permissions</p>
-            </div>
-          </div>
-        </div>
-
-        {/* ── Tabs ── */}
-        <div className="flex border-b border-jj-gray-03 mb-6">
-          {[
-            { id: 'groups', label: 'Groups',              icon: groupIcon },
-            { id: 'roles',  label: 'Roles & Permissions', icon: Shield    },
-            { id: 'users',  label: 'Users',               icon: userPlusIcon  },
-          ].map(tab => (
-            <button
-              key={tab.id}
-              onClick={() => handleTabChange(tab.id)}
-              className={`flex items-center gap-2 px-6 py-3.5 font-johnson-text font-bold text-sm transition-all border-b-4 -mb-px ${
-                activeTab === tab.id
-                  ? 'text-jj-red border-jj-red'
-                  : 'text-jj-gray-06 border-transparent hover:text-jj-gray-08 hover:border-jj-gray-03'
-              }`}
-            >
-              <Icon src={tab.icon} className="w-4 h-4" style={{ filter: activeTab === tab.id ? F.red : F.gray06 }} />
-              {tab.label}
-            </button>
-          ))}
-        </div>
-
-        {/* ══ USERS TAB ══════════════════════════════════════ */}
-        {activeTab === 'users' && (
-          <div className="space-y-5">
-
-            {/* Toolbar */}
-            <div className="bg-white rounded-xl border border-jj-gray-02 px-5 py-4 flex flex-wrap items-center gap-3">
-              <div className="flex-1 min-w-52 max-w-sm relative">
-                <Icon src={searchIcon} className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4" style={{ filter: F.gray05 }} />
-                <input
-                  type="text"
-                  placeholder="Search users by name or email..."
-                  value={usersSearchTerm}
-                  onChange={(e) => setUsersSearchTerm(e.target.value)}
-                  className="w-full pl-9 pr-8 py-2 border border-jj-gray-03 rounded-lg text-sm font-johnson-text focus:outline-none focus:ring-1 focus:ring-jj-red text-jj-gray-08"
-                />
-                {usersSearchTerm && (
-                  <button onClick={() => setUsersSearchTerm('')} className="absolute right-3 top-1/2 -translate-y-1/2" aria-label="Clear search">
-                    <Icon src={closeIcon} className="w-3.5 h-3.5" style={{ filter: F.gray05 }} />
-                  </button>
-                )}
-              </div>
-
-              <div className="relative">
-                <select
-                  value={roleFilter}
-                  onChange={(e) => { setRoleFilter(e.target.value); setShowAssignedOnly(false); }}
-                  className={`pl-3 pr-8 py-2 border rounded-lg text-sm font-johnson-text bg-white appearance-none cursor-pointer focus:outline-none focus:ring-1 focus:ring-jj-red transition-all ${roleFilter ? 'border-jj-red text-jj-red font-bold' : 'border-jj-gray-03 text-jj-gray-07'}`}
-                >
-                  <option value="" style={{ color: '#312c2a' }}>All Roles</option>
-                  {Object.entries(allRoles).map(([roleId, role]) => (
-                    <option key={roleId} value={roleId} style={{ color: '#312c2a' }}>{role.name}</option>
-                  ))}
-                </select>
-                <svg className="pointer-events-none absolute right-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5" fill="none" stroke="#a39992" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
-                </svg>
-              </div>
-
-              <button
-                onClick={() => { setShowAssignedOnly(prev => !prev); setRoleFilter(''); }}
-                className={`flex items-center gap-2 px-4 py-2 rounded-lg border text-sm font-johnson-text transition-all ${showAssignedOnly ? 'bg-jj-red text-white border-jj-red' : 'bg-white text-jj-gray-07 border-jj-gray-03 hover:border-jj-red hover:text-jj-red'}`}
-              >
-                <Icon src={userPlusIcon} className="w-4 h-4" style={{ filter: showAssignedOnly ? F.white : F.black }} />
-                Assigned Only
-                {showAssignedOnly ? (
-                  <Icon src={closeIcon} className="w-3.5 h-3.5" style={{ filter: F.white }} />
-                ) : Object.keys(userOverrides).length > 0 ? (
-                  <span className="w-5 h-5 rounded-full bg-jj-red text-white text-xs font-bold flex items-center justify-center">
-                    {Object.keys(userOverrides).length}
-                  </span>
-                ) : null}
-              </button>
-
-              {!showAssignedOnly && !roleFilter && (
-                <p className="ml-auto text-sm font-johnson-text text-jj-gray-05">
-                  Page {usersPagination.currentPage} · {users.length} users
-                </p>
-              )}
-            </div>
-
-            {/* Users table */}
-            <div className="bg-white rounded-xl border border-jj-gray-02 overflow-hidden">
-              {usersLoading && !showAssignedOnly && !roleFilter ? (
-                <div className="py-16 flex flex-col items-center gap-4">
-                  <div className="w-10 h-10 border-2 border-jj-gray-02 border-t-jj-red rounded-full animate-spin" />
-                  <p className="text-sm font-johnson-text text-jj-gray-05">Loading users...</p>
-                </div>
-              ) : usersError && !showAssignedOnly && !roleFilter ? (
-                <div className="py-16 px-6 flex flex-col items-center gap-4 text-center">
-                  <Icon src={alertIcon} className="w-12 h-12" style={{ filter: F.red }} />
-                  <div>
-                    <p className="text-lg font-johnson-display text-jj-gray-08 mb-1">Failed to Load Users</p>
-                    <p className="text-sm font-johnson-text text-jj-gray-06 max-w-md">{usersError}</p>
-                  </div>
-                  <button onClick={() => fetchUsers('initial')} className="px-5 py-2 bg-jj-red text-white rounded-lg hover:bg-jj-maroon-05 transition-colors font-johnson-text text-sm">
-                    Try Again
-                  </button>
-                  <div className="w-full max-w-md p-4 bg-jj-gray-01 rounded-lg border border-jj-gray-03 text-left">
-                    <p className="text-sm font-johnson-text font-bold text-jj-gray-07 mb-2">Common Solutions</p>
-                    <ul className="text-sm font-johnson-text text-jj-gray-06 space-y-1 list-disc list-inside">
-                      <li>Log out and back in to refresh permissions</li>
-                      <li>Contact IT to grant User.Read.All permission</li>
-                      <li>Verify admin consent for this application</li>
-                    </ul>
-                  </div>
-                </div>
-              ) : (
-                <div className="overflow-x-auto">
-                  <table className="w-full">
-                    <thead>
-                      <tr className="bg-jj-gray-02 border-b border-jj-gray-03">
-                        <th className="px-6 py-3.5 text-left text-xs font-johnson-text font-bold text-jj-gray-07 uppercase tracking-wide">User</th>
-                        <th className="px-6 py-3.5 text-left text-xs font-johnson-text font-bold text-jj-gray-07 uppercase tracking-wide">Email</th>
-                        <th className="px-6 py-3.5 text-left text-xs font-johnson-text font-bold text-jj-gray-07 uppercase tracking-wide">Department</th>
-                        <th className="px-6 py-3.5 text-left text-xs font-johnson-text font-bold text-jj-gray-07 uppercase tracking-wide">Role</th>
-                        <th className="px-6 py-3.5 text-right text-xs font-johnson-text font-bold text-jj-gray-07 uppercase tracking-wide">Actions</th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-jj-gray-02">
-                      {(() => {
-                        const useLocalData = showAssignedOnly || !!roleFilter;
-
-                        if (useLocalData) {
-                          const overrideEntries = Object.entries(userOverrides)
-                            .filter(([, role]) => !roleFilter || role === roleFilter)
-                            .filter(([email]) => !usersSearchTerm || email.toLowerCase().includes(usersSearchTerm.toLowerCase()) || assignedUsersDetails[email]?.displayName?.toLowerCase().includes(usersSearchTerm.toLowerCase()));
-
-                          if (overrideEntries.length === 0) {
-                            return (
-                              <tr>
-                                <td colSpan={5} className="px-6 py-16 text-center">
-                                  <p className="text-sm font-johnson-text text-jj-gray-05">
-                                    {roleFilter ? `No users assigned to "${allRoles[roleFilter]?.name}".` : 'No manual role assignments yet.'}
-                                  </p>
-                                </td>
-                              </tr>
-                            );
-                          }
-
-                          return overrideEntries.map(([email, assignedRole]) => {
-                            const details = assignedUsersDetails[email];
-                            const photo = assignedUsersPhotos[email];
-                            return (
-                              <tr key={email} className="hover:bg-jj-gray-01 transition-colors cursor-pointer"
-                                onClick={(e) => {
-                                  if (!e.target.closest('button')) {
-                                    const u = details || { displayName: email, mail: email, userPrincipalName: email };
-                                    setSelectedUserDetail({ graphUser: u, assignedRole, photo: assignedUsersPhotos[email] });
-                                    if (u.id) fetchExtendedUserDetails(u.id);
-                                  }
-                                }}>
-                                <td className="px-6 py-4">
-                                  <div className="flex items-center gap-3">
-                                    <div className="w-9 h-9 rounded-full bg-jj-gray-02 flex items-center justify-center overflow-hidden flex-shrink-0 border border-jj-gray-03">
-                                      {photo ? (
-                                        <img src={photo} alt={details?.displayName || email} className="w-full h-full object-cover" />
-                                      ) : assignedUsersLoading && !details ? (
-                                        <div className="w-full h-full bg-jj-gray-03 animate-pulse rounded-full" />
-                                      ) : (
-                                        <Icon src={userPlusIcon} className="w-5 h-5" style={{ filter: F.black }} />
-                                      )}
-                                    </div>
-                                    <div>
-                                      {assignedUsersLoading && !details ? (
-                                        <div className="h-4 w-32 bg-jj-gray-02 rounded animate-pulse" />
-                                      ) : (
-                                        <p className="text-sm font-johnson-text text-jj-gray-08">{details?.displayName || email}</p>
-                                      )}
-                                      {details?.jobTitle && <p className="text-xs font-johnson-text text-jj-gray-05">{details.jobTitle}</p>}
-                                    </div>
-                                  </div>
-                                </td>
-                                <td className="px-6 py-4"><span className="text-sm font-johnson-text text-jj-gray-06">{details?.mail || details?.userPrincipalName || email}</span></td>
-                                <td className="px-6 py-4"><span className="text-sm font-johnson-text text-jj-gray-06">{details?.department || '—'}</span></td>
-                                <td className="px-6 py-4">
-                                  <span className="inline-block px-3 py-1 rounded-full text-white font-johnson-text text-xs" style={{ backgroundColor: getRoleBadgeColor(assignedRole) }}>
-                                    {getRoleDefinition(assignedRole).name}
-                                  </span>
-                                </td>
-                                <td className="px-6 py-4 text-right">
-                                  <div className="flex items-center justify-end gap-1">
-                                    <button
-                                      onClick={() => { setSelectedUserForRole(details || { displayName: email, mail: email, userPrincipalName: email }); setSelectedRoleForUser(assignedRole); }}
-                                      className="p-2 rounded-lg hover:bg-jj-gray-01 transition-colors border border-transparent hover:border-jj-gray-03" title="Change role">
-                                      <Icon src={editIcon} className="w-4 h-4" style={{ filter: F.black }} />
-                                    </button>
-                                    <button
-                                      onClick={async () => { const dn = details?.displayName || email; if (window.confirm(`Remove role from ${dn}?`)) { setRoleActionBusy(true); try { await removeUserRoleOverride(email); showNotification('Role removed successfully'); setRoleAssignmentTrigger(prev => prev + 1); } catch (err) { showNotification(err.message, 'error'); } finally { setRoleActionBusy(false); } } }}
-                                      disabled={roleActionBusy}
-                                      className="p-2 rounded-lg hover:bg-jj-gray-01 transition-colors border border-transparent hover:border-jj-gray-03 disabled:opacity-40 disabled:cursor-not-allowed" title="Remove role">
-                                      <Icon src={trashIcon} className="w-4 h-4" style={{ filter: F.red }} />
-                                    </button>
-                                  </div>
-                                </td>
-                              </tr>
-                            );
-                          });
-                        }
-
-                        return users.map((graphUser) => {
-                          const email = graphUser.mail || graphUser.userPrincipalName;
-                          const assignedRole = userOverrides[email?.toLowerCase()];
-                          return (
-                            <tr key={graphUser.id} className="hover:bg-jj-gray-01 transition-colors cursor-pointer"
-                              onClick={(e) => { if (!e.target.closest('button')) { setSelectedUserDetail({ graphUser, assignedRole, photo: null }); fetchExtendedUserDetails(graphUser.id); } }}>
-                              <td className="px-6 py-4">
-                                <div className="flex items-center gap-3">
-                                  <div className="w-9 h-9 rounded-full bg-jj-gray-02 flex items-center justify-center border border-jj-gray-03">
-                                    <Icon src={userPlusIcon} className="w-5 h-5" style={{ filter: F.black }} />
-                                  </div>
-                                  <div>
-                                    <p className="text-sm font-johnson-text text-jj-gray-08">{graphUser.displayName}</p>
-                                    {graphUser.jobTitle && <p className="text-xs font-johnson-text text-jj-gray-05">{graphUser.jobTitle}</p>}
-                                  </div>
-                                </div>
-                              </td>
-                              <td className="px-6 py-4"><span className="text-sm font-johnson-text text-jj-gray-06">{email}</span></td>
-                              <td className="px-6 py-4"><span className="text-sm font-johnson-text text-jj-gray-06">{graphUser.department || '—'}</span></td>
-                              <td className="px-6 py-4">
-                                {assignedRole ? (
-                                  <span className="inline-block px-3 py-1 rounded-full text-white font-johnson-text text-xs" style={{ backgroundColor: getRoleBadgeColor(assignedRole) }}>
-                                    {getRoleDefinition(assignedRole).name}
-                                  </span>
-                                ) : (
-                                  <span className="text-sm font-johnson-text text-jj-gray-04">No role assigned</span>
-                                )}
-                              </td>
-                              <td className="px-6 py-4 text-right">
-                                <div className="flex items-center justify-end gap-1">
-                                  <button
-                                    onClick={() => { setSelectedUserForRole(graphUser); setSelectedRoleForUser(assignedRole || 'viewer'); }}
-                                    className="p-2 rounded-lg hover:bg-jj-gray-01 transition-colors border border-transparent hover:border-jj-gray-03" title="Assign role">
-                                    <Icon src={editIcon} className="w-4 h-4" style={{ filter: F.black }} />
-                                  </button>
-                                  {assignedRole && (
-                                    <button
-                                      onClick={async () => { if (window.confirm(`Remove role from ${graphUser.displayName}?`)) { setRoleActionBusy(true); try { await removeUserRoleOverride(email); showNotification('Role removed successfully'); setRoleAssignmentTrigger(prev => prev + 1); } catch (err) { showNotification(err.message, 'error'); } finally { setRoleActionBusy(false); } } }}
-                                      disabled={roleActionBusy}
-                                      className="p-2 rounded-lg hover:bg-jj-gray-01 transition-colors border border-transparent hover:border-jj-gray-03 disabled:opacity-40 disabled:cursor-not-allowed" title="Remove role">
-                                      <Icon src={trashIcon} className="w-4 h-4" style={{ filter: F.red }} />
-                                    </button>
-                                  )}
-                                </div>
-                              </td>
-                            </tr>
-                          );
-                        });
-                      })()}
-                    </tbody>
-                  </table>
-                </div>
-              )}
-
-              {!usersError && !usersLoading && !showAssignedOnly && !roleFilter && (
-                <div className="bg-jj-gray-01 border-t border border-jj-gray-04 px-6 py-3 flex items-center justify-between">
-                  <button
-                    onClick={() => fetchUsers('previous', usersSearchTerm)}
-                    disabled={usersPagination.currentPage === 1 || usersLoading}
-                    className="flex items-center gap-2 px-4 py-2 border border-jj-gray-03 rounded-lg text-sm font-johnson-text text-jj-gray-07 hover:bg-white transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
-                  >
-                    <Icon src={chevronLeftIcon} className="w-4 h-4" style={{ filter: F.gray07 }} /> Previous
-                  </button>
-                  <span className="text-sm font-johnson-text text-jj-gray-06">Page {usersPagination.currentPage}</span>
-                  <button
-                    onClick={() => fetchUsers('next', usersSearchTerm)}
-                    disabled={!usersPagination.nextLink || usersLoading}
-                    className="flex items-center gap-2 px-4 py-2 border border-jj-gray-03 rounded-lg text-sm font-johnson-text text-jj-gray-07 hover:bg-white transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
-                  >
-                    Next <Icon src={chevronRightIcon} className="w-4 h-4" style={{ filter: F.gray07 }} />
-                  </button>
-                </div>
-              )}
-            </div>
-
-            {/* Assign Role Modal */}
-            {selectedUserForRole && ReactDOM.createPortal(
-              <div className="fixed inset-0 bg-black bg-opacity-40 flex items-center justify-center z-50 p-4">
-                <div className="bg-white rounded-2xl w-full max-w-sm shadow-2xl overflow-hidden">
-                  <div className="px-6 py-5 border-b-4 border-jj-red">
-                    <h3 className="text-lg font-johnson-display text-jj-gray-08">Assign Role</h3>
-                    <p className="text-sm font-johnson-text text-jj-gray-05 mt-0.5">{selectedUserForRole.displayName}</p>
-                  </div>
-                  <div className="px-6 py-5">
-                    <label className="block text-xs font-johnson-text font-bold text-jj-gray-07 uppercase tracking-wide mb-2">Select Role</label>
-                    <select
-                      value={selectedRoleForUser}
-                      onChange={(e) => setSelectedRoleForUser(e.target.value)}
-                      className="w-full px-4 py-2.5 border border-jj-gray-03 rounded-lg font-johnson-text text-jj-gray-08 focus:outline-none focus:ring-1 focus:ring-jj-red"
-                    >
-                      {Object.keys(allRoles).map(roleId => (
-                        <option key={roleId} value={roleId}>{allRoles[roleId].name}</option>
-                      ))}
-                    </select>
-                  </div>
-                  <div className="px-6 py-4 bg-jj-gray-01 border-t border-jj-gray-02 flex justify-end gap-3">
-                    <button onClick={() => { setSelectedUserForRole(null); setSelectedRoleForUser(''); }} disabled={roleActionBusy} className="px-4 py-2 border border-jj-gray-03 rounded-lg font-johnson-text text-sm text-jj-gray-07 hover:bg-white transition-colors disabled:opacity-50">Cancel</button>
-                    <button onClick={handleAssignRoleToUser} disabled={roleActionBusy} className="px-5 py-2 bg-jj-red text-white rounded-lg font-johnson-text text-sm hover:bg-jj-maroon-05 transition-colors disabled:opacity-50 flex items-center gap-2">
-                      {roleActionBusy && <span className="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin" />}
-                      {roleActionBusy ? 'Assigning…' : 'Assign Role'}
-                    </button>
-                  </div>
-                </div>
-              </div>,
-              document.body
-            )}
-
-            {selectedUserDetail && (
-              <UserDetailPanel
-                graphUser={selectedUserDetail.graphUser}
-                assignedRole={selectedUserDetail.assignedRole}
-                photo={selectedUserDetail.photo}
-                ext={extendedUserDetails[selectedUserDetail.graphUser?.id] || {}}
-                profileInfoOpen={profileInfoOpen}
-                setProfileInfoOpen={setProfileInfoOpen}
-                onFetchExtended={() => { if (!extendedUserDetails[selectedUserDetail.graphUser?.id] && selectedUserDetail.graphUser?.id) fetchExtendedUserDetails(selectedUserDetail.graphUser.id); }}
-                getRoleDefinition={getRoleDefinition}
-                onClose={() => setSelectedUserDetail(null)}
-                onAssignRole={() => { setSelectedUserForRole(selectedUserDetail.graphUser); setSelectedRoleForUser(selectedUserDetail.assignedRole || 'viewer'); setSelectedUserDetail(null); }}
-                onRemoveRole={async (email) => { if (window.confirm(`Remove role from ${selectedUserDetail.graphUser.displayName || email}?`)) { setRoleActionBusy(true); try { await removeUserRoleOverride(email); showNotification('Role removed successfully'); setRoleAssignmentTrigger(prev => prev + 1); setSelectedUserDetail(null); } catch (err) { showNotification(err.message, 'error'); } finally { setRoleActionBusy(false); } } }}
-                busy={roleActionBusy}
-              />
-            )}
-          </div>
-        )}
-
-        {/* ══ GROUPS TAB ══════════════════════════════════════ */}
-        {activeTab === 'groups' && (
-          <div className="space-y-5">
-            <p className="text-sm font-johnson-text text-jj-gray-05">{groups.length} mapped security group{groups.length !== 1 ? 's' : ''}</p>
-
-            {groupsLoading ? (
-              <div className="py-16 flex flex-col items-center gap-4">
-                <div className="w-10 h-10 border-2 border-jj-gray-02 border-t-jj-red rounded-full animate-spin" />
-                <p className="text-sm font-johnson-text text-jj-gray-05">Loading groups...</p>
-              </div>
-            ) : groups.length === 0 ? (
-              <div className="bg-white rounded-xl border border-jj-gray-02 py-16 flex flex-col items-center gap-3">
-                <Icon src={groupIcon} className="w-12 h-12" style={{ filter: F.gray04 }} />
-                <p className="text-sm font-johnson-text text-jj-gray-05">No mapped groups found</p>
-              </div>
-            ) : (
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                {groups.map((group) => (
-                  <div key={group.id} className="bg-white rounded-xl border border-jj-gray-02 p-5 hover:shadow-md transition-shadow">
-                    <div className="flex items-start justify-between gap-4">
-                      <div className="flex items-start gap-3 flex-1 min-w-0">
-                        <div className="w-10 h-10 bg-jj-gray-01 rounded-lg flex items-center justify-center flex-shrink-0 border border-jj-gray-02">
-                          <Icon src={groupIcon} className="w-5 h-5" style={{ filter: F.gray06 }} />
-                        </div>
-                        <div className="min-w-0">
-                          <h3 className="text-sm font-johnson-text font-bold text-jj-gray-08 truncate">{group.displayName}</h3>
-                          {group.description && <p className="text-xs font-johnson-text text-jj-gray-05 mt-0.5 truncate">{group.description}</p>}
-                          <div className="flex items-center gap-2 mt-2">
-                            <span className="text-xs font-johnson-text text-jj-gray-05">Role:</span>
-                            <span className="text-xs font-johnson-text text-white px-2.5 py-0.5 rounded-full" style={{ backgroundColor: getRoleBadgeColor(group.mappedRole) }}>
-                              {getRoleDefinition(group.mappedRole).name}
-                            </span>
-                          </div>
-                        </div>
-                      </div>
-                      <button
-                        onClick={() => { setSelectedGroup(group); fetchGroupMembers(group.id); }}
-                        className="flex-shrink-0 flex items-center gap-1.5 px-3 py-2 bg-jj-red text-white rounded-lg hover:bg-jj-maroon-05 transition-colors font-johnson-text text-xs"
-                      >
-                        <Icon src={groupIcon} className="w-3.5 h-3.5" style={{ filter: F.white }} />
-                        Members
-                      </button>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
-
-            {selectedGroup && ReactDOM.createPortal(
-              <div className="fixed inset-0 bg-black bg-opacity-40 flex items-center justify-center z-50 p-4">
-                <div className="bg-white rounded-2xl max-w-2xl w-full max-h-[80vh] overflow-hidden flex flex-col shadow-2xl">
-                  <div className="px-6 py-5 border-b-4 border-jj-red flex items-center justify-between flex-shrink-0">
-                    <div>
-                      <h3 className="text-lg font-johnson-display text-jj-gray-08">Group Members</h3>
-                      <p className="text-sm font-johnson-text text-jj-gray-05 mt-0.5">{selectedGroup.displayName}</p>
-                    </div>
-                    <button onClick={() => { setSelectedGroup(null); setGroupMembers([]); setGroupMemberPhotos({}); }} className="p-2 rounded-lg hover:bg-jj-gray-01 transition-colors">
-                      <Icon src={closeIcon} className="w-5 h-5" style={{ filter: F.gray06 }} />
-                    </button>
-                  </div>
-                  <div className="flex-1 overflow-y-auto p-5">
-                    {groupMembersLoading ? (
-                      <div className="py-10 flex flex-col items-center gap-3">
-                        <div className="w-8 h-8 border-2 border-jj-gray-02 border-t-jj-red rounded-full animate-spin" />
-                        <p className="text-sm font-johnson-text text-jj-gray-05">Loading members...</p>
-                      </div>
-                    ) : groupMembers.length === 0 ? (
-                      <p className="py-10 text-center text-sm font-johnson-text text-jj-gray-05">No members found</p>
-                    ) : (
-                      <div className="space-y-2">
-                        {groupMembers.map((member) => (
-                          <div key={member.id} className="flex items-center gap-3 px-4 py-3 rounded-lg border border-jj-gray-02 hover:bg-jj-gray-01 transition-colors">
-                            <div className="w-8 h-8 rounded-full bg-jj-gray-02 flex items-center justify-center border border-jj-gray-03 flex-shrink-0 overflow-hidden">
-                              {groupMemberPhotos[member.id] ? (
-                                <img src={groupMemberPhotos[member.id]} alt={member.displayName} className="w-full h-full object-cover" />
-                              ) : (
-                                <Icon src={userPlusIcon} className="w-4 h-4" style={{ filter: F.black }} />
-                              )}
-                            </div>
-                            <div className="flex-1 min-w-0">
-                              <p className="text-sm font-johnson-text text-jj-gray-08 truncate">{member.displayName}</p>
-                              <p className="text-xs font-johnson-text text-jj-gray-05 truncate">{member.mail || member.userPrincipalName}</p>
-                            </div>
-                            {member.jobTitle && (
-                              <span className="text-xs font-johnson-text text-jj-gray-06 bg-jj-gray-01 px-2.5 py-1 rounded-full border border-jj-gray-02 flex-shrink-0">
-                                {member.jobTitle}
-                              </span>
-                            )}
-                          </div>
-                        ))}
-                      </div>
-                    )}
-                  </div>
-                </div>
-              </div>,
-              document.body
-            )}
-          </div>
-        )}
-
-        {/* ══ ROLES TAB ══════════════════════════════════════ */}
-        {activeTab === 'roles' && (
-          <div className="space-y-6">
-
-            <div className="flex items-center justify-between">
-              <p className="text-sm font-johnson-text text-jj-gray-05">
-                {Object.keys(allRoles).length} role{Object.keys(allRoles).length !== 1 ? 's' : ''} configured
-              </p>
-              <button
-                onClick={() => { resetRoleForm(); setShowCreateRole(true); }}
-                className="flex items-center gap-2 px-4 py-2 bg-jj-red text-white rounded-lg hover:bg-jj-maroon-05 transition-colors font-johnson-text text-sm"
-              >
-                <Icon src={plusIcon} className="w-4 h-4" style={{ filter: F.white }} />
-                Create Role
-              </button>
-            </div>
-
-            {/* Create / Edit Role Modal */}
-            {(showCreateRole || editingRole) && ReactDOM.createPortal(
-              <div className="fixed inset-0 bg-black bg-opacity-40 flex items-center justify-center z-50 p-4">
-                <div className="bg-white rounded-2xl w-full max-w-4xl max-h-[90vh] flex flex-col shadow-2xl overflow-hidden">
-
-                  {/* Modal header */}
-                  <div className="px-6 py-5 border-b border-jj-gray-02 flex items-center justify-between flex-shrink-0 bg-white">
-                    <div className="flex items-center gap-3">
-                      <div className="w-9 h-9 rounded-lg bg-jj-red flex items-center justify-center flex-shrink-0">
-                        <Icon src={Shield} className="w-4 h-4" style={{ filter: F.white }} />
-                      </div>
-                      <div>
-                        <h3 className="text-lg font-johnson-display text-jj-gray-08">
-                          {editingRole ? 'Edit Role' : 'Create New Role'}
-                        </h3>
-                        {editingRole && (
-                          <p className="text-xs font-johnson-text text-jj-gray-05 mt-0.5">
-                            {newRoleName}
-                            {' · '}
-                            {BUILTIN_ROLE_IDS.includes(editingRole) ? 'Built-in role' : 'Custom role'}
-                          </p>
-                        )}
-                      </div>
-                    </div>
-                    <button
-                      onClick={() => { setShowCreateRole(false); setEditingRole(null); resetRoleForm(); }}
-                      className="p-2 rounded-lg hover:bg-jj-gray-01 transition-colors"
-                    >
-                      <Icon src={closeIcon} className="w-5 h-5" style={{ filter: F.gray06 }} />
-                    </button>
-                  </div>
-
-                  {/* Built-in notice — subtle, not alarming */}
-                  {editingRole && BUILTIN_ROLE_IDS.includes(editingRole) && (
-                    <div className="px-6 py-3 bg-jj-gray-01 border-b border-jj-gray-02 flex items-center gap-2 flex-shrink-0">
-                      <Icon src={alertIcon} className="w-4 h-4 flex-shrink-0" style={{ filter: F.gray06 }} />
-                      <p className="text-xs font-johnson-text text-jj-gray-06">
-                        Changes to built-in roles override defaults. You can reset from the role card at any time.
-                      </p>
-                    </div>
-                  )}
-
-                  {/* Scrollable form body */}
-                  <div className="flex-1 overflow-y-auto px-6 py-5 space-y-5">
-
-                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                      <div>
-                        <label className="block text-xs font-johnson-text font-bold text-jj-gray-07 uppercase tracking-wide mb-1.5">Role Name</label>
-                        <input
-                          type="text"
-                          value={newRoleName}
-                          onChange={(e) => handleRoleNameChange(e.target.value)}
-                          placeholder="e.g. Custom Analyst"
-                          className="w-full px-4 py-2.5 border border-jj-gray-03 rounded-lg font-johnson-text text-jj-gray-08 text-sm focus:outline-none focus:ring-1 focus:ring-jj-red"
-                          autoFocus
-                        />
-                      </div>
-                      <div>
-                        <label className="block text-xs font-johnson-text font-bold text-jj-gray-07 uppercase tracking-wide mb-1.5">Role ID (auto-generated)</label>
-                        <input
-                          type="text"
-                          value={newRoleId}
-                          readOnly
-                          className="w-full px-4 py-2.5 border border-jj-gray-03 rounded-lg font-johnson-text text-jj-gray-05 text-sm bg-jj-gray-01 cursor-not-allowed"
-                        />
-                        {!editingRole && newRoleId && (
-                          <p className="text-xs font-johnson-text text-jj-gray-04 mt-1">Auto-generated from role name</p>
-                        )}
-                      </div>
-                    </div>
-
-                    <div>
-                      <label className="block text-xs font-johnson-text font-bold text-jj-gray-07 uppercase tracking-wide mb-1.5">Description</label>
-                      <textarea
-                        value={newRoleDescription}
-                        onChange={(e) => setNewRoleDescription(e.target.value)}
-                        placeholder="Describe what this role can access..."
-                        rows={2}
-                        className="w-full px-4 py-2.5 border border-jj-gray-03 rounded-lg font-johnson-text text-jj-gray-08 text-sm focus:outline-none focus:ring-1 focus:ring-jj-red resize-none"
-                      />
-                    </div>
-
-                    <div>
-                      <label className="block text-xs font-johnson-text font-bold text-jj-gray-07 uppercase tracking-wide mb-1.5">Badge Color</label>
-                      <div className="flex items-center gap-3">
-                        <input
-                          type="color"
-                          value={newRoleColor}
-                          onChange={(e) => setNewRoleColor(e.target.value)}
-                          className="w-10 h-10 border border-jj-gray-03 rounded-lg cursor-pointer p-0.5"
-                        />
-                        <span className="px-4 py-1.5 rounded-full text-white font-johnson-text text-sm" style={{ backgroundColor: newRoleColor }}>
-                          {newRoleName || 'Preview'}
-                        </span>
-                      </div>
-                    </div>
-
-                    <div>
-                      <div className="flex items-center justify-between mb-3">
-                        <label className="text-xs font-johnson-text font-bold text-jj-gray-07 uppercase tracking-wide">Permissions</label>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            const allSelected = Object.values(newRolePermissions).every(Boolean);
-                            const updates = {};
-                            Object.keys(newRolePermissions).forEach(k => { updates[k] = !allSelected; });
-                            togglePermission(updates);
-                          }}
-                          className="text-xs font-johnson-text px-3 py-1 rounded-lg border border-jj-gray-03 text-jj-gray-07 hover:border-jj-red hover:text-jj-red transition-colors"
-                        >
-                          {Object.values(newRolePermissions).every(Boolean) ? 'Deselect all' : 'Select all'}
-                        </button>
-                      </div>
-                      <PermissionTree permissions={newRolePermissions} onChange={togglePermission} />
-                    </div>
-
-                  </div>
-
-                  {/* Modal footer */}
-                  <div className="px-6 py-4 bg-jj-gray-01 border-t border-jj-gray-02 flex justify-end gap-3 flex-shrink-0">
-                    <button
-                      onClick={() => { setShowCreateRole(false); setEditingRole(null); resetRoleForm(); }}
-                      disabled={roleActionBusy}
-                      className="px-5 py-2 border border-jj-gray-03 rounded-lg font-johnson-text text-sm text-jj-gray-07 hover:bg-white transition-colors disabled:opacity-50"
-                    >
-                      Cancel
-                    </button>
-                    <button
-                      onClick={editingRole ? handleUpdateRole : handleCreateRole}
-                      disabled={roleActionBusy}
-                      className="flex items-center gap-2 px-5 py-2.5 bg-jj-red text-white rounded-lg font-johnson-text text-sm hover:bg-jj-maroon-05 transition-colors disabled:opacity-50"
-                    >
-                      {roleActionBusy ? (
-                        <span className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
-                      ) : (
-                        <Icon src={saveIcon} className="w-4 h-4" style={{ filter: F.white }} />
-                      )}
-                      {roleActionBusy ? 'Saving…' : (editingRole ? 'Update Role' : 'Create Role')}
-                    </button>
-                  </div>
-
-                </div>
-              </div>,
-              document.body
-            )}
-
-
-            {/* Roles Grid */}
-            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-              {Object.entries(allRoles).map(([roleId, role]) => {
-                const isOriginallyBuiltIn = BUILTIN_ROLE_IDS.includes(roleId);
-                const isModified = isOriginallyBuiltIn && customRoles[roleId];
-                const isCustom = !isOriginallyBuiltIn;
-                const isADMapped = Object.values(AD_GROUP_ROLES).includes(roleId);
-                const enabledCount = Object.values(role.permissions || {}).filter(Boolean).length;
-
-                return (
-                  <div key={roleId} className="bg-white rounded-xl border border-jj-gray-02 overflow-hidden hover:shadow-md transition-shadow">
-                    <div className="h-1.5 w-full" style={{ backgroundColor: role.color || '#a39992' }} />
-                    <div className="p-5">
-                      <div className="flex items-start justify-between mb-3">
-                        <div className="flex items-center gap-3">
-                          <div className="w-10 h-10 rounded-lg flex items-center justify-center flex-shrink-0" style={{ backgroundColor: role.color || '#a39992' }}>
-                            <Icon src={Shield} className="w-5 h-5" style={{ filter: F.white }} />
-                          </div>
-                          <div>
-                            <h3 className="text-base font-johnson-display text-jj-gray-08">{role.name}</h3>
-                            <div className="flex items-center gap-1.5 mt-0.5 flex-wrap">
-                              {isOriginallyBuiltIn && !isModified && (
-                                <span className="text-xs font-johnson-text px-2 py-0.5 bg-jj-gray-02 text-jj-gray-06 rounded-full">{isADMapped ? 'AD Mapped' : 'Built-in'}</span>
-                              )}
-                              {isModified && <span className="text-xs font-johnson-text px-2 py-0.5 bg-jj-gray-02 text-jj-red rounded-full">Modified</span>}
-                              {isCustom && <span className="text-xs font-johnson-text px-2 py-0.5 bg-jj-gray-02 text-jj-gray-07 rounded-full">Custom</span>}
-                            </div>
-                          </div>
-                        </div>
-                        <div className="flex items-center gap-0.5 flex-shrink-0">
-                          <button onClick={() => startEditingRole(roleId)} disabled={roleActionBusy} className="p-1.5 rounded-lg hover:bg-jj-gray-01 transition-colors disabled:opacity-40 disabled:cursor-not-allowed" title="Edit">
-                            <Icon src={editIcon} className="w-4 h-4" style={{ filter: F.black }} />
-                          </button>
-                          {isCustom && (
-                            <button onClick={() => handleDeleteRole(roleId)} disabled={roleActionBusy} className="p-1.5 rounded-lg hover:bg-jj-gray-01 transition-colors disabled:opacity-40 disabled:cursor-not-allowed" title="Delete">
-                              {roleActionBusy ? (
-                                <span className="block w-4 h-4 border-2 border-jj-red border-t-transparent rounded-full animate-spin" />
-                              ) : (
-                                <Icon src={trashIcon} className="w-4 h-4" style={{ filter: F.red }} />
-                              )}
-                            </button>
-                          )}
-                          {isModified && (
-                            <button onClick={() => handleResetToDefault(roleId)} disabled={roleActionBusy} className="p-1.5 rounded-lg hover:bg-jj-gray-01 transition-colors disabled:opacity-40 disabled:cursor-not-allowed" title="Reset to default">
-                              {roleActionBusy ? (
-                                <span className="block w-4 h-4 border-2 border-jj-red border-t-transparent rounded-full animate-spin" />
-                              ) : (
-                                <Icon src={refreshSvgIcon} className="w-4 h-4" style={{ filter: F.red }} />
-                              )}
-                            </button>
-                          )}
-                        </div>
-                      </div>
-
-                      <p className="text-xs font-johnson-text text-jj-gray-06 mb-4 line-clamp-2">{role.description}</p>
-
-                      <div>
-                        <p className="text-xs font-johnson-text font-bold text-jj-gray-07 mb-2">
-                          {enabledCount} permission{enabledCount !== 1 ? 's' : ''} enabled
-                        </p>
-                        <div className="flex flex-wrap gap-1">
-                          {Object.entries(role.permissions).filter(([, v]) => v).slice(0, 5).map(([key]) => (
-                            <span key={key} className="text-xs font-johnson-text px-2 py-0.5 bg-jj-gray-01 text-jj-gray-07 rounded border border-jj-gray-02">
-                              {formatPerm(key)}
-                            </span>
-                          ))}
-                          {enabledCount > 5 && (() => {
-                            const remaining = Object.entries(role.permissions).filter(([, v]) => v).slice(5);
-                            return (
-                              <MorePermissionsTag remaining={remaining} />
-                            );
-                          })()}
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-
-            {/* AD Group Mappings */}
-            <div className="bg-white rounded-xl border border-jj-gray-04 overflow-hidden">
-              <div className="px-6 py-4 border-b border-jj-gray-04 bg-jj-gray-01 flex items-center gap-3">
-                <div className="w-8 h-8 rounded-lg bg-jj-red flex items-center justify-center flex-shrink-0">
-                  <Icon src={Shield} className="w-4 h-4" style={{ filter: F.white }} />
-                </div>
-                <div>
-                  <h3 className="text-sm font-johnson-text font-bold text-jj-gray-08">Active Directory Group Mappings</h3>
-                  <p className="text-xs font-johnson-text text-jj-gray-06">Automatic role assignments from AD groups</p>
-                </div>
-              </div>
-              <div className="divide-y divide-jj-gray-02">
-                {Object.entries(AD_GROUP_ROLES).map(([groupName, roleId]) => (
-                  <div key={groupName} className="flex items-center justify-between px-6 py-3 hover:bg-jj-gray-01 transition-colors">
-                    <span className="text-sm font-johnson-text text-jj-gray-07 flex-1 min-w-0 truncate mr-4">{groupName}</span>
-                    <div className="flex items-center gap-2 flex-shrink-0">
-                      <span className="text-xs font-johnson-text text-jj-gray-04">→</span>
-                      <span className="text-xs font-johnson-text text-white px-3 py-1 rounded-full" style={{ backgroundColor: getRoleBadgeColor(roleId) }}>
-                        {getRoleDefinition(roleId).name}
-                      </span>
-                    </div>
-                  </div>
-                ))}
-              </div>
-              <div className="px-6 py-3 bg-jj-gray-01 border-t border-jj-gray-04">
-                <p className="text-xs font-johnson-text text-jj-gray-06">
-                  Manual role assignments take precedence over AD group mappings.
-                </p>
-              </div>
-            </div>
-
-          </div>
-        )}
-
-      </div>
-    </div>
+    <Page>
+      <PageHeader icon="gear" title="User management" description="Who can see and do what across the monitoring tools." />
+      <Tabs label="User management" tabs={TABS} value={tab} onChange={(id) => setParams({ tab: id }, { replace: true })} />
+      {error ? (
+        <Alert tone="error" title="Couldn’t load access configuration" action={<Button size="sm" onClick={reload}>Retry</Button>}>{error}</Alert>
+      ) : !config ? <LoadingBlock /> : (
+        <>
+          {tab === 'users' && <UsersTab config={config} reload={reloadAll} canManage={hasPermission('manageUsers')} />}
+          {tab === 'roles' && <RolesTab config={config} reload={reloadAll} canManage={hasPermission('manageRoles')} />}
+          {tab === 'groups' && <GroupsTab config={config} />}
+        </>
+      )}
+    </Page>
   );
 }

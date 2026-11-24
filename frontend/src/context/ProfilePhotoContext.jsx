@@ -1,26 +1,33 @@
-import React, { createContext, useContext } from 'react';
+import React, { createContext, useContext, useEffect, useState } from 'react';
 import { useAuth } from './AuthContext';
-import { useProfilePhoto as _useProfilePhotoHook } from '../hooks/useProfilePhoto';
+import { apiFetch } from '../utils/apiClient';
 
-const ProfilePhotoContext = createContext(null);
+const ProfilePhotoContext = createContext({ profilePhoto: null, photoLoading: false });
 
+/** Fetches the signed-in user's photo once and shares it app-wide. */
 export function ProfilePhotoProvider({ children }) {
-  const { user, logout } = useAuth();
-  const { profilePhoto, photoLoading } = _useProfilePhotoHook(user, logout);
+  const { user } = useAuth();
+  const [state, setState] = useState({ profilePhoto: null, photoLoading: true });
 
-  return (
-    <ProfilePhotoContext.Provider value={{ profilePhoto, photoLoading }}>
-      {children}
-    </ProfilePhotoContext.Provider>
-  );
+  useEffect(() => {
+    if (!user) return undefined;
+    let url = null;
+    const controller = new AbortController();
+    apiFetch('/auth/user/photo', { signal: controller.signal, timeoutMs: 15_000 })
+      .then(async (res) => {
+        if (!res.ok) return null;
+        url = URL.createObjectURL(await res.blob());
+        return url;
+      })
+      .catch(() => null)
+      .then((photo) => { if (!controller.signal.aborted) setState({ profilePhoto: photo, photoLoading: false }); });
+    return () => {
+      controller.abort();
+      if (url) URL.revokeObjectURL(url);
+    };
+  }, [user]);
+
+  return <ProfilePhotoContext.Provider value={state}>{children}</ProfilePhotoContext.Provider>;
 }
 
-/**
- * Drop-in replacement for the old useProfilePhoto(user, logout) hook.
- * No arguments needed — photo is already fetched by the provider.
- */
-export function useProfilePhoto() {
-  const ctx = useContext(ProfilePhotoContext);
-  if (!ctx) throw new Error('useProfilePhoto must be used within a ProfilePhotoProvider');
-  return ctx;
-}
+export const useProfilePhoto = () => useContext(ProfilePhotoContext);

@@ -1,37 +1,20 @@
 import React from 'react';
 import { Navigate, useLocation } from 'react-router-dom';
-import { useAuth } from '../context/AuthContext';
+import { useAuth, POST_LOGIN_REDIRECT_KEY } from '../context/AuthContext';
+import { LoadingBlock } from './ui';
 
-const ProtectedRoute = ({ children }) => {
+export default function ProtectedRoute({ children }) {
   const { authenticated, loading } = useAuth();
   const location = useLocation();
 
-  // Show loading spinner while checking authentication
-  if (loading) {
-    return (
-      <div className="flex items-center justify-center min-h-screen bg-jj-gray-01">
-        <div className="text-center">
-          <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-jj-red mx-auto"></div>
-          <p className="mt-4 text-jj-gray-07 font-johnson-text">Verifying authentication...</p>
-        </div>
-      </div>
-    );
+  if (loading && !authenticated) {
+    return <div className="min-h-dvh flex items-center justify-center bg-jj-gray-01"><LoadingBlock label="Verifying your session…" /></div>;
   }
-
-  // Redirect to Log in if not authenticated
   if (!authenticated) {
     try {
-      if (location.pathname !== '/') {
-        sessionStorage.setItem('postLoginRedirect', location.pathname + location.search);
-      }
-    } catch {
-      // non-critical — worst case, login just falls back to /dashboard
-    }
+      if (location.pathname !== '/') sessionStorage.setItem(POST_LOGIN_REDIRECT_KEY, location.pathname + location.search);
+    } catch { /* storage unavailable: login falls back to the dashboard */ }
     return <Navigate to="/login" replace />;
   }
-
-  // User is authenticated, render the protected content
   return children;
-};
-
-export default ProtectedRoute;
+}

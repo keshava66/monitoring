@@ -1,223 +1,174 @@
-import React, { useRef, useEffect } from "react";
-import { BrowserRouter, Routes, Route, Navigate, useLocation } from "react-router-dom";
-import { AuthProvider, useAuth } from "./context/AuthContext";
-import { RBACProvider, useRBAC } from "./context/RBACContext";
-import { SessionTimeoutProvider } from "./context/SessionTimeoutContext";
-import { ProfilePhotoProvider } from "./context/ProfilePhotoContext";
-import { logAuditEvent } from "./utils/auditLog";
-import ProtectedRoute from "./components/ProtectedRoute";
-import LoginPage from "./LoginPage";
-import Sidebar from "./components/Sidebar";
-import Header from "./components/Header";
-import Dashboard from "./pages/Dashboard";
-import EPODStatsPage from "./pages/EPODStatsPage";
-import AuditPage from "./pages/AuditPage";
-import UserManagement from "./pages/UserManagement";
-import ServerMonitor from "./pages/ServerMonitor";
-import ServerManagePage from "./pages/ServerManagePage";
-import EPODNasScannerPage from "./pages/EPODNasScannerPage";
+import React, { Suspense, lazy, useCallback, useEffect, useRef, useState } from 'react';
+import { BrowserRouter, Navigate, Route, Routes, useLocation } from 'react-router-dom';
+import { AuthProvider, useAuth, POST_LOGIN_REDIRECT_KEY } from './context/AuthContext';
+import { RBACProvider, useRBAC } from './context/RBACContext';
+import { SessionTimeoutProvider } from './context/SessionTimeoutContext';
+import { ProfilePhotoProvider } from './context/ProfilePhotoContext';
+import { FeedbackProvider, Alert, Button, LoadingBlock, EmptyState } from './components/ui';
+import ProtectedRoute from './components/ProtectedRoute';
+import Sidebar from './components/Sidebar';
+import Header from './components/Header';
+import LoginPage from './LoginPage';
+import { logAuditEvent } from './utils/auditLog';
+import { PAGE_TITLES, PIPELINE_VIEW_PERMISSIONS, SERVER_MANAGER_PERMISSIONS, STATS_PERMISSIONS } from './navigation';
 
-// Module-level (not component-level) on purpose: React.StrictMode double-runs
-// effects with [] deps once in dev to test cleanup behaviour, and resets refs
-// /state on that simulated remount — but it doesn't re-import this module, so
-// a flag declared here survives that cycle and prevents a duplicate log. An
-// actual browser reload re-executes this module from scratch, resetting it.
-let refreshLogGuard = false;
+const Dashboard = lazy(() => import('./pages/Dashboard'));
+const IngestionStats = lazy(() => import('./pages/EPODStatsPage'));
+const ServerMonitor = lazy(() => import('./pages/ServerMonitor'));
+const ServerManagePage = lazy(() => import('./pages/ServerManagePage'));
+const NasScanner = lazy(() => import('./pages/EPODNasScannerPage'));
+const AuditPage = lazy(() => import('./pages/AuditPage'));
+const UserManagement = lazy(() => import('./pages/UserManagement'));
 
-const PAGE_LABELS = {
-  '/dashboard':        'Dashboard',
-  '/ingestion-stats':       'Ingestion Stats',
-  '/extraction-pipelines':   'Extraction Pipelines Monitor',
-  '/server-manager':   'Server Manager',
-  '/nas-scanner':      'NAS Scanner',
-  '/audit':            'Audit Log',
-  '/audit-edit':       'Audit Log (Edit Mode)',
-  '/audit-edit-force': 'Audit Log (Edit Mode)',
-  '/user-management':  'User Management',
-};
+// Module scope so StrictMode's double effect run doesn't log a reload twice.
+let refreshLogged = false;
 
-const RootRedirect = () => {
-  const targetRef = useRef(null);
-  if (targetRef.current === null) {
-    let target = '/dashboard';
-    try {
-      const saved = sessionStorage.getItem('postLoginRedirect');
-      if (saved) {
-        sessionStorage.removeItem('postLoginRedirect');
-        if (saved !== '/') target = saved;
-      }
-    } catch {
-      // non-critical — falls back to /dashboard
-    }
-    targetRef.current = target;
+class ErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { error: null };
   }
-  return <Navigate to={targetRef.current} replace />;
-};
-const PermissionRoute = ({ permission, permissions, children }) => {
-  const { loading: rbacLoading, hasPermission, hasAnyPermission } = useRBAC();
-  const { loading: authLoading } = useAuth();
-  if (authLoading || rbacLoading) {
+
+  static getDerivedStateFromError(error) {
+    return { error };
+  }
+
+  componentDidCatch(error, info) {
+    console.error('UI error:', error, info?.componentStack);
+  }
+
+  render() {
+    if (!this.state.error) return this.props.children;
+    const chunkFailed = /dynamically imported module|Loading chunk|Failed to fetch/i.test(String(this.state.error?.message));
     return (
-      <div className="h-full flex items-center justify-center">
-        <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-jj-red" />
-      </div>
+      <EmptyState
+        icon="error"
+        title={chunkFailed ? 'A new version is available' : 'Something went wrong on this page'}
+        description={chunkFailed ? 'Reload to get the latest version of the app.' : 'The error has been logged. Reload the page or go back to the dashboard.'}
+        action={(
+          <div className="flex flex-wrap gap-2 justify-center">
+            <Button variant="primary" icon="refresh" onClick={() => window.location.reload()}>Reload</Button>
+            {!chunkFailed && <Button onClick={() => { window.location.href = '/dashboard'; }}>Dashboard</Button>}
+          </div>
+        )}
+      />
     );
   }
+}
 
-  const allowed = permissions
-    ? hasAnyPermission(permissions)
-    : hasPermission(permission);
+function RootRedirect() {
+  const [target] = useState(() => {
+    let saved = null;
+    try {
+      saved = sessionStorage.getItem(POST_LOGIN_REDIRECT_KEY);
+      sessionStorage.removeItem(POST_LOGIN_REDIRECT_KEY);
+    } catch { /* storage unavailable */ }
+    return saved && saved.startsWith('/') && !saved.startsWith('//') && saved !== '/' ? saved : '/dashboard';
+  });
+  return <Navigate to={target} replace />;
+}
 
-  if (!allowed) return <Navigate to="/dashboard" replace />;
-  return <>{children}</>;
-};
+function PermissionRoute({ permission, permissions, children }) {
+  const { loading, hasPermission, hasAnyPermission } = useRBAC();
+  if (loading) return <LoadingBlock label="Checking access…" />;
+  const allowed = permissions ? hasAnyPermission(permissions) : hasPermission(permission);
+  return allowed ? children : <Navigate to="/dashboard" replace />;
+}
 
-const AppLayoutInner = () => {
+function useNavigationAudit() {
   const location = useLocation();
   const { user } = useAuth();
-  const isDashboard = location.pathname === "/dashboard" || location.pathname === "/";
-  const prevPathRef = useRef(null);
+  const prev = useRef(null);
 
   useEffect(() => {
     const path = location.pathname;
-    const prevPath = prevPathRef.current;
-    if (prevPath !== null && prevPath !== path) {
-      const email = user?.email || user?.username;
-      const fromLabel = PAGE_LABELS[prevPath] || prevPath;
-      const toLabel = PAGE_LABELS[path] || path;
-      logAuditEvent('page_access', email, path, `Switched from ${fromLabel} to ${toLabel}`);
+    if (prev.current !== null && prev.current !== path) {
+      logAuditEvent('page_access', user?.email, path, `Switched from ${PAGE_TITLES[prev.current] || prev.current} to ${PAGE_TITLES[path] || path}`);
     }
-    prevPathRef.current = path;
+    prev.current = path;
   }, [location.pathname, user]);
 
-  // Detect an actual browser refresh (F5 / Ctrl+R / reload button) using the
-  // Navigation Timing API. This effect runs once per real page load — unlike
-  // the one above, it does NOT fire on in-app route changes, since
-  // AppLayoutInner only remounts on a true reload, not on navigation.
   useEffect(() => {
-    if (refreshLogGuard) return;
-    refreshLogGuard = true;
-    try {
-      const [entry] = performance.getEntriesByType?.('navigation') || [];
-      const navType = entry?.type
-        || (performance.navigation?.type === 1 ? 'reload' : null);
-      if (navType === 'reload') {
-        const path = location.pathname;
-        const email = user?.email || user?.username;
-        const label = PAGE_LABELS[path] || path;
-        logAuditEvent('page_refreshed', email, path, `Refreshed ${label} page`);
-      }
-    } catch {
-      // Navigation Timing API unsupported — skip silently, non-critical
+    if (refreshLogged) return;
+    refreshLogged = true;
+    const [entry] = performance.getEntriesByType?.('navigation') || [];
+    if (entry?.type === 'reload') {
+      const path = window.location.pathname;
+      logAuditEvent('page_refreshed', user?.email, path, `Refreshed ${PAGE_TITLES[path] || path} page`);
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [user]);
+}
+
+function AppShell() {
+  const location = useLocation();
+  const { error: rbacError, refresh: refreshRbac, loading: rbacLoading } = useRBAC();
+  const [navOpen, setNavOpen] = useState(false);
+  const closeNav = useCallback(() => setNavOpen(false), []);
+  useNavigationAudit();
+
+  useEffect(() => {
+    const title = PAGE_TITLES[location.pathname];
+    document.title = title ? `${title} · RDI-AI Monitoring` : 'RDI-AI Monitoring';
+  }, [location.pathname]);
 
   return (
-    <div className="flex h-screen bg-jj-gray-01">
-      <Sidebar />
-      <div className="flex flex-col flex-grow overflow-hidden">
-        {isDashboard && <Header />}
-        <main className="flex-grow overflow-auto">
-          <Routes>
-            <Route path="/dashboard" element={<Dashboard />} />
-            <Route
-              path="/ingestion-stats"
-              element={
-                <PermissionRoute permissions={['viewEPODStatsEPOD', 'viewEPODStatsRIMDOCS']}>
-                  <EPODStatsPage />
-                </PermissionRoute>
-              }
-            />
-            <Route
-              path="/extraction-pipelines"
-              element={
-                <PermissionRoute permissions={['viewEPodDev', 'viewEPodQA', 'viewEPodProd']}>
-                  <ServerMonitor />
-                </PermissionRoute>
-              }
-            />
-            <Route
-              path="/server-manager"
-              element={
-                <PermissionRoute permissions={['viewServerManagerDev', 'viewServerManagerQA', 'viewServerManagerProd', 'viewServerManagerPOC']}>
-                  <ServerManagePage />
-                </PermissionRoute>
-              }
-            />
-            <Route
-              path="/audit"
-              element={
-                <PermissionRoute permission="viewAudit">
-                  <AuditPage />
-                </PermissionRoute>
-              }
-            />
-            <Route
-              path="/audit-edit"
-              element={
-                <PermissionRoute permission="viewAudit">
-                  <AuditPage editable />
-                </PermissionRoute>
-              }
-            />
-            <Route
-              path="/audit-edit-force"
-              element={
-                <PermissionRoute permission="viewAudit">
-                  <AuditPage editable forceSilent />
-                </PermissionRoute>
-              }
-            />
-            <Route
-              path="/user-management"
-              element={
-                <PermissionRoute permission="viewUserManagement">
-                  <UserManagement />
-                </PermissionRoute>
-              }
-            />
-            <Route
-              path="/nas-scanner"
-              element={
-                <PermissionRoute permission="viewNasScanner">
-                  <EPODNasScannerPage />
-                </PermissionRoute>
-              }
-            />
-            <Route path="/" element={<RootRedirect />} />
-          </Routes>
+    <div className="flex h-dvh bg-jj-gray-01 overflow-hidden">
+      <a href="#main" className="sr-only focus:not-sr-only focus:fixed focus:top-2 focus:left-2 focus:z-[90] focus:px-4 focus:py-2 focus:bg-white focus:rounded-lg focus:shadow-overlay font-johnson-text text-sm">Skip to content</a>
+      <Sidebar mobileOpen={navOpen} onMobileClose={closeNav} />
+      <div className="flex flex-col flex-1 min-w-0">
+        <Header onMenuClick={() => setNavOpen(true)} />
+        <main id="main" className="flex-1 min-h-0 overflow-y-auto overflow-x-hidden scroll-thin">
+          {rbacError && !rbacLoading && (
+            <div className="px-4 sm:px-6 lg:px-8 pt-4">
+              <Alert tone="error" title="Couldn’t load your permissions" action={<Button size="sm" onClick={refreshRbac}>Retry</Button>}>{rbacError}</Alert>
+            </div>
+          )}
+          <ErrorBoundary key={location.pathname}>
+            <Suspense fallback={<LoadingBlock />}>
+              <Routes>
+                <Route path="/dashboard" element={<PermissionRoute permission="viewDashboard"><Dashboard /></PermissionRoute>} />
+                <Route path="/ingestion-stats" element={<PermissionRoute permissions={STATS_PERMISSIONS}><IngestionStats /></PermissionRoute>} />
+                <Route path="/extraction-pipelines" element={<PermissionRoute permissions={PIPELINE_VIEW_PERMISSIONS}><ServerMonitor /></PermissionRoute>} />
+                <Route path="/server-manager" element={<PermissionRoute permissions={SERVER_MANAGER_PERMISSIONS}><ServerManagePage /></PermissionRoute>} />
+                <Route path="/nas-scanner" element={<PermissionRoute permission="viewNasScanner"><NasScanner /></PermissionRoute>} />
+                <Route path="/audit" element={<PermissionRoute permission="viewAudit"><AuditPage /></PermissionRoute>} />
+                <Route path="/audit-edit" element={<PermissionRoute permission="viewAudit"><AuditPage editable /></PermissionRoute>} />
+                <Route path="/audit-edit-force" element={<PermissionRoute permission="viewAudit"><AuditPage editable forceSilent /></PermissionRoute>} />
+                <Route path="/user-management" element={<PermissionRoute permission="viewUserManagement"><UserManagement /></PermissionRoute>} />
+                <Route path="/" element={<RootRedirect />} />
+                <Route path="*" element={<Navigate to="/dashboard" replace />} />
+              </Routes>
+            </Suspense>
+          </ErrorBoundary>
         </main>
       </div>
     </div>
   );
-};
-
-const AppLayout = () => (
-  <SessionTimeoutProvider>
-    <RBACProvider>
-      <ProfilePhotoProvider>
-        <AppLayoutInner />
-      </ProfilePhotoProvider>
-    </RBACProvider>
-  </SessionTimeoutProvider>
-);
+}
 
 export default function App() {
   return (
     <BrowserRouter>
       <AuthProvider>
-        <Routes>
-          <Route path="/login" element={<LoginPage />} />
-          <Route
-            path="/*"
-            element={
-              <ProtectedRoute>
-                <AppLayout />
-              </ProtectedRoute>
-            }
-          />
-        </Routes>
+        <FeedbackProvider>
+          <Routes>
+            <Route path="/login" element={<LoginPage />} />
+            <Route
+              path="/*"
+              element={(
+                <ProtectedRoute>
+                  <SessionTimeoutProvider>
+                    <RBACProvider>
+                      <ProfilePhotoProvider>
+                        <AppShell />
+                      </ProfilePhotoProvider>
+                    </RBACProvider>
+                  </SessionTimeoutProvider>
+                </ProtectedRoute>
+              )}
+            />
+          </Routes>
+        </FeedbackProvider>
       </AuthProvider>
     </BrowserRouter>
   );
