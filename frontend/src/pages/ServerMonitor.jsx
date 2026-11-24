@@ -68,7 +68,8 @@ export default function ServerMonitor() {
   if (!agents) return <LoadingBlock label="Loading pipelines…" />;
   if (!envs.length) return <Navigate to="/dashboard" replace />;
 
-  const active = envs.find((e) => e.id === params.get('tab')) || envs[0];
+  const firstOf = (product) => envs.find((e) => e.configured && (!product || e.product === product)) || envs.find((e) => !product || e.product === product);
+  const active = envs.find((e) => e.id === params.get('tab')) || firstOf();
   const products = PRODUCTS.filter((p) => envs.some((e) => e.product === p.id));
   const select = (id) => {
     if (id === active.id) return;
@@ -77,7 +78,10 @@ export default function ServerMonitor() {
     setParams((prev) => { const n = new URLSearchParams(prev); n.set('tab', id); n.delete('view'); return n; });
   };
 
-  const envTabs = envs.filter((e) => e.product === active.product).map((e) => ({
+  // Unconfigured environments only get a tab when the product has nothing else to show.
+  const productEnvs = envs.filter((e) => e.product === active.product);
+  const shown = productEnvs.some((e) => e.configured) ? productEnvs.filter((e) => e.configured || e.id === active.id) : productEnvs;
+  const envTabs = shown.map((e) => ({
     id: e.id,
     label: e.configured ? (names[e.id] || e.label) : `${e.label} (not configured)`,
     title: `${e.title}: ${e.configured ? status[e.id] || 'checking' : 'not configured'}`,
@@ -91,7 +95,7 @@ export default function ServerMonitor() {
           {products.length > 1 && (
             <Tabs variant="pill" label="Product" value={active.product}
               tabs={products.map((p) => ({ id: p.id, label: p.label }))}
-              onChange={(pid) => select(envs.find((e) => e.product === pid).id)} className="self-start md:mr-4 md:my-2" />
+              onChange={(pid) => select(firstOf(pid).id)} className="self-start shrink-0 md:mr-4 md:my-2" />
           )}
           <Tabs label="Environment" tabs={envTabs} value={active.id} onChange={select} className="border-b-0 -mx-1 md:mx-0" />
         </div>

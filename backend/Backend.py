@@ -248,7 +248,8 @@ def get_user_photo(authorization: Optional[str] = Header(None)):
     if resp.status_code == 404:
         resp = auth.graph_get("/me/photo/$value", token)
     if resp.status_code == 404:
-        raise HTTPException(status_code=404, detail="No profile photo found")
+        # No photo is a normal state, not an error: answer 204 so browsers stay quiet.
+        return Response(status_code=204, headers={"Cache-Control": "private, max-age=3600"})
     if resp.status_code in (401, 403):
         raise HTTPException(status_code=401, detail="Invalid or expired token")
     if not resp.is_success:

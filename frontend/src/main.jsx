@@ -5,6 +5,7 @@ import { MsalProvider } from '@azure/msal-react';
 import './index.css';
 import App from './App.jsx';
 import { msalConfig } from './msalConfig';
+import { bindMsal } from './context/AuthContext';
 
 const msalInstance = new PublicClientApplication(msalConfig);
 const root = ReactDOM.createRoot(document.getElementById('root'));
@@ -40,6 +41,7 @@ async function bootstrap() {
       const [first] = msalInstance.getAllAccounts();
       if (first) msalInstance.setActiveAccount(first);
     }
+    bindMsal(msalInstance);
     msalInstance.addEventCallback((event) => {
       if (event.eventType === EventType.LOGIN_SUCCESS && event.payload?.account) {
         msalInstance.setActiveAccount(event.payload.account);

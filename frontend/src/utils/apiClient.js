@@ -193,12 +193,15 @@ export async function graphPhoto(idOrUpn, token) {
   return pending;
 }
 
+/** Directory names carry suffixes like "[JNJ]"; strip them for display. */
+export const cleanDisplayName = (name) => (name || '').replace(/\s*\[.*?\]\s*/g, ' ').replace(/\s+/g, ' ').trim();
+
 /** Cached displayName lookup by email/UPN; null when not found. */
 export async function graphDisplayName(upn, token) {
   const key = `name:${upn.toLowerCase()}`;
   if (graphCache.has(key)) return graphCache.get(key);
   const pending = graphJson(`/users/${encodeURIComponent(upn)}?$select=displayName`, token)
-    .then((d) => d.displayName || null)
+    .then((d) => cleanDisplayName(d.displayName) || null)
     .catch(() => null);
   graphCache.set(key, pending);
   return pending;

@@ -234,8 +234,8 @@ export function Page({ children, className, wide = false }) {
 
 export function PageHeader({ icon, title, description, meta, actions }) {
   return (
-    <header className="flex flex-col gap-4 md:flex-row md:items-end md:justify-between">
-      <div className="flex items-start gap-3 sm:gap-4 min-w-0">
+    <header className="flex flex-wrap items-end justify-between gap-x-6 gap-y-4">
+      <div className="flex flex-1 items-start gap-3 sm:gap-4 min-w-0 basis-auto max-w-full">
         {icon && (
           <span className="hidden sm:flex w-11 h-11 rounded-xl bg-jj-red text-white items-center justify-center flex-shrink-0 shadow-sm">
             <Icon name={icon} className="w-5 h-5" />
@@ -246,7 +246,7 @@ export function PageHeader({ icon, title, description, meta, actions }) {
           {(description || meta) && (
             <p className="mt-1 font-johnson-text text-sm text-jj-gray-06 break-words">
               {description}
-              {meta && <span className="text-jj-gray-05">{description ? ' · ' : ''}{meta}</span>}
+              {meta && <span className="text-jj-gray-05">{description ? ' · ' : ''}<span className="whitespace-nowrap">{meta}</span></span>}
             </p>
           )}
         </div>
@@ -316,11 +316,13 @@ export function Badge({ children, color, tone = 'neutral', className }) {
   );
 }
 
-export function KpiTile({ label, value, hint, accent = '#312c2a', loading, title }) {
+export function KpiTile({ label, value, hint, accent, loading, title }) {
   return (
-    <div className="relative bg-white rounded-xl border border-jj-gray-02 shadow-card px-4 py-3.5 sm:px-5 sm:py-4 overflow-hidden min-w-0">
-      <span className="absolute inset-x-0 top-0 h-1" style={{ background: accent }} aria-hidden="true" />
-      <p className="font-johnson-text text-xs text-jj-gray-06 truncate">{label}</p>
+    <div className="h-full bg-white rounded-xl border border-jj-gray-02 shadow-card px-4 py-3.5 sm:px-5 sm:py-4 min-w-0">
+      <p className="flex items-center gap-1.5 font-johnson-text text-xs text-jj-gray-06 min-w-0">
+        {accent && <span className="w-2 h-2 rounded-full shrink-0" style={{ background: accent }} aria-hidden="true" />}
+        <span className="truncate">{label}</span>
+      </p>
       {loading ? (
         <Skeleton className="h-7 w-20 mt-2" />
       ) : (
@@ -329,6 +331,11 @@ export function KpiTile({ label, value, hint, accent = '#312c2a', loading, title
       {hint && !loading && <p className="mt-0.5 font-johnson-text text-xs text-jj-gray-05 truncate">{hint}</p>}
     </div>
   );
+}
+
+/** Grid for KpiTile rows; a lone tile on the last row spans the full width on small screens. */
+export function KpiGrid({ className, children }) {
+  return <div className={cx('grid grid-cols-2 gap-3 sm:gap-4 max-sm:[&>*:last-child:nth-child(odd)]:col-span-2', className)}>{children}</div>;
 }
 
 export function ProgressBar({ value, color = '#eb1700', className = 'h-1.5', label }) {
@@ -457,7 +464,7 @@ export function Tabs({ tabs, value, onChange, label, variant = 'underline', clas
         {tabs.map((t) => (
           <button key={t.id} ref={(el) => { refs.current[t.id] = el; }} role="tab" type="button" aria-selected={value === t.id} tabIndex={value === t.id ? 0 : -1}
             onClick={() => onChange(t.id)} title={t.title}
-            className={cx('flex items-center gap-1.5 px-3.5 h-8 rounded-full font-johnson-text text-xs sm:text-sm font-semibold whitespace-nowrap transition-colors focus-ring',
+            className={cx('shrink-0 flex items-center gap-1.5 px-3.5 h-8 rounded-full font-johnson-text text-xs sm:text-sm font-semibold whitespace-nowrap transition-colors focus-ring',
               value === t.id ? 'bg-white text-jj-gray-08 shadow-sm' : 'text-jj-gray-06 hover:text-jj-gray-08')}>
             {t.dot && <Dot color={t.dot} className="w-1.5 h-1.5" />}
             {t.label}
@@ -471,7 +478,7 @@ export function Tabs({ tabs, value, onChange, label, variant = 'underline', clas
       {tabs.map((t) => (
         <button key={t.id} ref={(el) => { refs.current[t.id] = el; }} role="tab" type="button" aria-selected={value === t.id} tabIndex={value === t.id ? 0 : -1}
           onClick={() => onChange(t.id)} title={t.title}
-          className={cx('relative flex items-center gap-2 px-4 sm:px-5 h-11 font-johnson-text text-sm whitespace-nowrap transition-colors focus-ring-inset',
+          className={cx('relative shrink-0 flex items-center gap-2 px-4 sm:px-5 h-11 font-johnson-text text-sm whitespace-nowrap transition-colors focus-ring-inset',
             value === t.id ? 'text-jj-gray-08 font-semibold' : 'text-jj-gray-06 hover:text-jj-gray-08')}>
           {t.icon && <Icon name={t.icon} className="w-4 h-4" />}
           {t.dot && <Dot color={t.dot} className="w-2 h-2" />}

@@ -7,7 +7,7 @@ import { useAuth } from '../context/AuthContext';
 import { apiJson, isAbort } from '../utils/apiClient';
 import { logAuditEvent } from '../utils/auditLog';
 import {
-  Alert, Button, EmptyState, KpiTile, Page, PageHeader, Panel, SearchInput, Skeleton, SortTh, TableShell, Tabs, Td, Toggle,
+  Alert, Button, EmptyState, KpiGrid, KpiTile, Page, PageHeader, Panel, SearchInput, Skeleton, SortTh, TableShell, Tabs, Td, Toggle,
   fmtBytes, fmtCompact, fmtNum, useDebouncedValue, usePolling, useSortedRows,
 } from '../components/ui';
 
@@ -339,14 +339,14 @@ export default function NasScannerPage() {
       />
       {error && <Alert tone="error" title="Some data failed to load" action={<Button size="sm" onClick={refresh}>Retry</Button>}>{error}</Alert>}
 
-      <div className="grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-6 gap-3 sm:gap-4">
+      <KpiGrid className="sm:grid-cols-3 xl:grid-cols-6">
         <KpiTile label="Segments" value={fmtNum(k?.segments)} accent="#0f68b2" loading={loading.overview && !k} />
         <KpiTile label="Total files" value={fmtCompact(k?.total_files)} hint={fmtNum(k?.total_files)} loading={loading.overview && !k} />
         <KpiTile label="PDF files" value={fmtCompact(k?.pdf_files)} hint={k?.pdf_size} accent={C.pdf} loading={loading.overview && !k} />
         <KpiTile label="XML files" value={fmtCompact(k?.xml_files)} hint={k?.xml_size} accent={C.xml} loading={loading.overview && !k} />
         <KpiTile label="Other files" value={fmtCompact(k?.other_files)} hint={k?.other_size} accent={C.other} loading={loading.overview && !k} />
         <KpiTile label="Total size" value={k?.total_size} accent="#8c3bbb" loading={loading.overview && !k} />
-      </div>
+      </KpiGrid>
 
       <div className="flex flex-col gap-4">
         <Tabs label="NAS views" tabs={TABS} value={tab} onChange={selectTab} />

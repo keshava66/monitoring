@@ -6,7 +6,7 @@ import { useAuth } from '../context/AuthContext';
 import { logAuditEvent } from '../utils/auditLog';
 import { apiJson, isAbort, streamNdjson } from '../utils/apiClient';
 import {
-  Alert, Button, Dot, EmptyState, KpiTile, Page, PageHeader, Panel, ProgressBar, Section, Select, Skeleton,
+  Alert, Button, Dot, EmptyState, KpiGrid, KpiTile, Page, PageHeader, Panel, ProgressBar, Section, Select, Skeleton,
   SortTh, TableShell, Tabs, Td, Toggle, cx, fmtCompact, fmtNum, fmtPct, usePolling, useSortedRows,
 } from '../components/ui';
 
@@ -60,7 +60,10 @@ const SUMMARY_GETTERS = {
 };
 
 function SummaryTable({ rows, available, showAvailable, skeletons }) {
-  const data = useMemo(() => rows.map((r) => ({ ...r, available: available[r.table] ?? (available.__failed ? null : undefined) })), [rows, available]);
+  const data = useMemo(() => rows.map((r) => {
+    if (Object.hasOwn(available, r.table)) return { ...r, available: available[r.table] };
+    return { ...r, available: available.__settled ? null : undefined };
+  }), [rows, available]);
   const { sorted, sort, toggle } = useSortedRows(data, 'label', { getters: SUMMARY_GETTERS });
   const cols = showAvailable ? 8 : 7;
   return (
@@ -280,8 +283,8 @@ function ProductStats({ product }) {
     setAvailable({});
     if (product.chunks) {
       apiJson(`/api/${product.id}/available-counts`, { signal: ctrl.signal, timeoutMs: 120_000 })
-        .then((d) => setAvailable(d.available || {}))
-        .catch((e) => { if (!isAbort(e)) setAvailable({ __failed: true }); });
+        .then((d) => setAvailable({ ...(d.available || {}), __settled: true }))
+        .catch((e) => { if (!isAbort(e)) setAvailable({ __settled: true }); });
     }
     try {
       await streamNdjson(`/api/${product.id}/dashboard/stream`, {
@@ -328,13 +331,13 @@ function ProductStats({ product }) {
 
       {error && <Alert tone="error" title="Failed to load ingestion data" action={<Button size="sm" onClick={load}>Retry</Button>}>{error}</Alert>}
 
-      <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-5 gap-3 sm:gap-4">
+      <KpiGrid className="md:grid-cols-3 xl:grid-cols-5">
         <KpiTile label="Total documents" value={fmtCompact(k?.total_docs)} title={fmtNum(k?.total_docs)} hint="discovered so far" loading={loadingKpis} />
         <KpiTile label="Completed" value={fmtCompact(k?.success)} title={fmtNum(k?.success)} hint={k ? `${k.success_pct}% ingested` : null} accent="#328714" loading={loadingKpis} />
         <KpiTile label="Failed" value={fmtCompact(k?.error)} title={fmtNum(k?.error)} accent="#eb1700" loading={loadingKpis} />
         <KpiTile label="Running" value={fmtCompact(k?.running)} title={fmtNum(k?.running)} hint="in flight now" accent="#0f68b2" loading={loadingKpis} />
         <KpiTile label="Total storage" value={k?.total_size} hint={k ? `${k.ingested_size} ingested` : null} accent="#8c3bbb" loading={loadingKpis} />
-      </div>
+      </KpiGrid>
 
       <StallAlert stalls={stalls} onToggle={(o) => logAuditEvent('stats_stall_alert_toggled', email, product.id, `Stalled ingestion details ${o ? 'expanded' : 'collapsed'} on ${product.label} Stats`)} />
 

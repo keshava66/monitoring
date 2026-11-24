@@ -6,7 +6,7 @@ import { logAuditEvent } from '../utils/auditLog';
 import { apiFetch, apiJson, downloadBlob, errorMessage, graphDisplayName, graphPhoto, isAbort, mapLimit } from '../utils/apiClient';
 import { Avatar } from '../components/Header';
 import {
-  Alert, Badge, Button, Drawer, EmptyState, Icon, IconButton, KpiTile, Page, PageHeader, SearchInput, Select, Skeleton, Tabs, TextField,
+  Alert, Badge, Button, Drawer, EmptyState, Icon, IconButton, KpiGrid, KpiTile, Page, PageHeader, SearchInput, Select, Skeleton, Tabs, TextField,
   cx, fmtNum, formatDateTime, relativeTime, useDebouncedValue, useFeedback, usePolling,
 } from '../components/ui';
 
@@ -245,17 +245,17 @@ export default function AuditPage({ editable = false, forceSilent = false }) {
         </Alert>
       )}
 
-      <div className="grid grid-cols-2 lg:grid-cols-5 gap-3 sm:gap-4">
+      <KpiGrid className="sm:grid-cols-3 lg:grid-cols-5">
         <KpiTile label="Total events" value={fmtNum(stats?.total)} accent="#0f68b2" loading={!stats} />
         <KpiTile label="Today" value={fmtNum(stats?.today)} accent="#328714" loading={!stats} />
         <KpiTile label="Role changes" value={fmtNum(stats?.role_changes)} accent="#eb1700" loading={!stats} />
         <button type="button" onClick={() => openPeople('all')} className="text-left rounded-xl focus-ring">
           <KpiTile label="Unique users" value={fmtNum(stats?.unique_users)} hint="View list" accent="#8c3bbb" loading={!stats} />
         </button>
-        <button type="button" onClick={() => openPeople('active')} className="text-left rounded-xl focus-ring col-span-2 lg:col-span-1">
+        <button type="button" onClick={() => openPeople('active')} className="text-left rounded-xl focus-ring">
           <KpiTile label="Active now" value={active ? fmtNum(active.count) : '—'} hint={active ? `in the last ${active.timeout_minutes} min · view` : null} accent="#328714" loading={!active} />
         </button>
-      </div>
+      </KpiGrid>
 
       <div className="bg-white rounded-xl border border-jj-gray-02 shadow-card p-3 sm:p-4 flex flex-col gap-3">
         <div className="flex flex-col lg:flex-row lg:items-center gap-2 sm:gap-3">
@@ -302,7 +302,7 @@ export default function AuditPage({ editable = false, forceSilent = false }) {
               action={hasFilters ? <Button onClick={clearFilters}>Clear filters</Button> : null} />
           ) : (
             <>
-              <div className={cx('hidden md:block overflow-x-auto scroll-thin transition-opacity', loading && 'opacity-60')}>
+              <div className={cx('hidden lg:block overflow-x-auto scroll-thin transition-opacity', loading && 'opacity-60')}>
                 <table className="w-full text-sm font-johnson-text">
                   <thead>
                     <tr className="bg-jj-gray-01 border-b border-jj-gray-02 text-left text-xs text-jj-gray-06">
@@ -330,7 +330,7 @@ export default function AuditPage({ editable = false, forceSilent = false }) {
                   </tbody>
                 </table>
               </div>
-              <ul className={cx('md:hidden divide-y divide-jj-gray-02', loading && 'opacity-60')}>
+              <ul className={cx('lg:hidden divide-y divide-jj-gray-02', loading && 'opacity-60')}>
                 {logs.map((l) => (
                   <li key={l.id} className="p-4 flex flex-col gap-2">
                     <div className="flex items-center justify-between gap-3">

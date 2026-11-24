@@ -72,7 +72,7 @@ function LogBox({ lines, firstLineNo, path, total, showTs, stampedAt }) {
 
 function Metric({ label, value, sub, gauge, color }) {
   return (
-    <div className="px-4 py-3 sm:px-5 sm:py-4 bg-white min-w-0">
+    <div className="flex-1 basis-40 px-4 py-3 sm:px-5 sm:py-4 bg-white min-w-0">
       <p className="font-johnson-text text-xs text-jj-gray-06">{label}</p>
       <p className="mt-1 font-johnson-display text-lg sm:text-xl text-jj-gray-08 tabular-nums truncate" style={color ? { color } : undefined}>{value}</p>
       {gauge != null && <ProgressBar value={gauge} color={gaugeColor(gauge)} className="h-1 mt-2" label={label} />}
@@ -213,8 +213,9 @@ export default function EPodAgentPage({ agentId, title, canControl }) {
   };
 
   const running = !!status?.running;
-  const state = busy === 'start' ? 'Starting…' : busy === 'stop' ? 'Stopping…' : status == null ? 'Checking…' : running ? 'Running' : 'Stopped';
-  const stateColor = busy === 'start' || busy === 'stop' ? '#c4a000' : status == null ? '#857a73' : running ? '#328714' : '#eb1700';
+  const unreachable = status == null && !!statusError;
+  const state = busy === 'start' ? 'Starting…' : busy === 'stop' ? 'Stopping…' : unreachable ? 'Unreachable' : status == null ? 'Checking…' : running ? 'Running' : 'Stopped';
+  const stateColor = busy === 'start' || busy === 'stop' ? '#c4a000' : unreachable ? '#eb1700' : status == null ? '#857a73' : running ? '#328714' : '#eb1700';
   const cores = info?.cpu_count || 1;
   const memPct = status?.memory_bytes && info?.total_memory ? (status.memory_bytes / info.total_memory) * 100 : null;
   const cpuPct = status?.cpu_percent != null ? Math.min(100, status.cpu_percent / cores) : null;
@@ -246,7 +247,7 @@ export default function EPodAgentPage({ agentId, title, canControl }) {
           </div>
         </div>
         {statusError && <div className="px-4 sm:px-6 pb-4"><Alert tone="error" title="Agent unreachable">{statusError}</Alert></div>}
-        <div className="grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-5 gap-px bg-jj-gray-02 border-t border-jj-gray-02">
+        <div className="flex flex-wrap gap-px bg-jj-gray-02 border-t border-jj-gray-02">
           <Metric label="Process ID" value={status?.pid ?? '—'} sub={status?.processes > 1 ? `${status.processes} processes` : null} />
           <Metric label="Uptime" value={status?.uptime ?? '—'} sub={status?.started_at ? `since ${new Date(status.started_at).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}` : null} />
           <Metric label="Memory" value={status?.memory_bytes != null ? fmtBytes(status.memory_bytes) : '—'} gauge={memPct}

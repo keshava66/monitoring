@@ -82,8 +82,9 @@ function useNavigationAudit() {
 
   useEffect(() => {
     const path = location.pathname;
-    if (prev.current !== null && prev.current !== path) {
-      logAuditEvent('page_access', user?.email, path, `Switched from ${PAGE_TITLES[prev.current] || prev.current} to ${PAGE_TITLES[path] || path}`);
+    // Only real moves between pages: redirects out of "/" or unknown paths are not visits.
+    if (prev.current !== path && PAGE_TITLES[prev.current] && PAGE_TITLES[path]) {
+      logAuditEvent('page_access', user?.email, path, `Switched from ${PAGE_TITLES[prev.current]} to ${PAGE_TITLES[path]}`);
     }
     prev.current = path;
   }, [location.pathname, user]);

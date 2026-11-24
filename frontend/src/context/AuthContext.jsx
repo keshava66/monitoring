@@ -1,9 +1,9 @@
-import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
+import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
 import { InteractionRequiredAuthError, InteractionStatus } from '@azure/msal-browser';
 import { useMsal } from '@azure/msal-react';
 import { API_SCOPES } from '../msalConfig';
 import { logAuditEvent } from '../utils/auditLog';
-import { registerTokenGetter, registerUnauthorizedHandler } from '../utils/apiClient';
+import { cleanDisplayName, registerTokenGetter, registerUnauthorizedHandler } from '../utils/apiClient';
 import { useHeartbeat } from '../hooks/useHeartbeat';
 
 const AuthContext = createContext(null);
@@ -11,63 +11,75 @@ const LOGOUT_SIGNAL_KEY = 'rdi-monitoring:logout';
 const LOGIN_LOGGED_KEY = 'rdi-monitoring:login-logged';
 export const POST_LOGIN_REDIRECT_KEY = 'postLoginRedirect';
 
-export const cleanDisplayName = (name) => (name || '').replace(/\s*\[.*?\]\s*/g, ' ').replace(/\s+/g, ' ').trim();
+let msal = null;
+let forceRefresh = false;
+const inflight = new Map();
+
+const currentAccount = () => (msal ? msal.getActiveAccount() || msal.getAllAccounts()[0] || null : null);
+
+// Single-flight token acquisition: silent first, then popup, then a full
+// redirect when popups are blocked. Lives outside React so the API client can
+// attach a bearer token on the very first request any provider makes.
+export function acquireToken(scopes = API_SCOPES) {
+  const account = currentAccount();
+  if (!account) return Promise.reject(new Error('Not signed in'));
+  const key = scopes.slice().sort().join(' ');
+  if (inflight.has(key)) return inflight.get(key);
+  const run = (async () => {
+    try {
+      const res = await msal.acquireTokenSilent({ scopes, account, forceRefresh });
+      forceRefresh = false;
+      return res.accessToken;
+    } catch (err) {
+      if (!(err instanceof InteractionRequiredAuthError)) throw err;
+      try {
+        const res = await msal.acquireTokenPopup({ scopes, account });
+        return res.accessToken;
+      } catch {
+        try {
+          sessionStorage.setItem(POST_LOGIN_REDIRECT_KEY, window.location.pathname + window.location.search);
+        } catch { /* storage unavailable */ }
+        await msal.acquireTokenRedirect({ scopes, account });
+        throw err;
+      }
+    } finally {
+      inflight.delete(key);
+    }
+  })();
+  inflight.set(key, run);
+  return run;
+}
+
+export function bindMsal(instance) {
+  msal = instance;
+  registerTokenGetter(() => (currentAccount() ? acquireToken(API_SCOPES) : null));
+  registerUnauthorizedHandler(() => { forceRefresh = true; });
+}
 
 export const AuthProvider = ({ children }) => {
   const { instance, accounts, inProgress } = useMsal();
   const account = instance.getActiveAccount() || accounts[0] || null;
-  const inflight = useRef(new Map());
-  const forceRefresh = useRef(false);
   const [loggingOut, setLoggingOut] = useState(false);
 
+  // Keyed on primitives: MSAL hands back a fresh account object on every
+  // cache event, which would otherwise refetch everything that depends on user.
+  const username = account?.username || '';
+  const accountName = account?.name || '';
+  const accountId = account?.localAccountId || '';
+  const tenantId = account?.tenantId || '';
   const user = useMemo(() => {
-    if (!account) return null;
-    const email = (account.username || '').toLowerCase();
-    return {
-      username: account.username,
-      email,
-      name: cleanDisplayName(account.name) || email,
-      id: account.localAccountId,
-      tenantId: account.tenantId,
-    };
-  }, [account]);
+    if (!username) return null;
+    const email = username.toLowerCase();
+    return { username, email, name: cleanDisplayName(accountName) || email, id: accountId, tenantId };
+  }, [username, accountName, accountId, tenantId]);
 
-  const acquire = useCallback(async (scopes = API_SCOPES) => {
-    if (!account) throw new Error('Not signed in');
-    const key = scopes.slice().sort().join(' ');
-    if (inflight.current.has(key)) return inflight.current.get(key);
-    const run = (async () => {
-      try {
-        const res = await instance.acquireTokenSilent({ scopes, account, forceRefresh: forceRefresh.current });
-        forceRefresh.current = false;
-        return res.accessToken;
-      } catch (err) {
-        if (!(err instanceof InteractionRequiredAuthError)) throw err;
-        try {
-          const res = await instance.acquireTokenPopup({ scopes, account });
-          return res.accessToken;
-        } catch {
-          try {
-            sessionStorage.setItem(POST_LOGIN_REDIRECT_KEY, window.location.pathname + window.location.search);
-          } catch { /* storage unavailable */ }
-          await instance.acquireTokenRedirect({ scopes, account });
-          throw err;
-        }
-      } finally {
-        inflight.current.delete(key);
-      }
-    })();
-    inflight.current.set(key, run);
-    return run;
-  }, [account, instance]);
+  const signedIn = !!user;
+  const acquire = useCallback((scopes = API_SCOPES) => {
+    if (!signedIn) return Promise.reject(new Error('Not signed in'));
+    return acquireToken(scopes);
+  }, [signedIn]);
 
   const getAccessToken = useCallback(() => acquire(API_SCOPES), [acquire]);
-
-  useEffect(() => {
-    registerTokenGetter(account ? getAccessToken : null);
-    registerUnauthorizedHandler(() => { forceRefresh.current = true; });
-    return () => registerTokenGetter(null);
-  }, [account, getAccessToken]);
 
   useHeartbeat(user?.email || null);
 

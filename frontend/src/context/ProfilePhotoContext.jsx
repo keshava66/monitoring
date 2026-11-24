@@ -15,7 +15,7 @@ export function ProfilePhotoProvider({ children }) {
     const controller = new AbortController();
     apiFetch('/auth/user/photo', { signal: controller.signal, timeoutMs: 15_000 })
       .then(async (res) => {
-        if (!res.ok) return null;
+        if (!res.ok || res.status === 204) return null;
         url = URL.createObjectURL(await res.blob());
         return url;
       })

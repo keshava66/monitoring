@@ -3,7 +3,7 @@ import { useSearchParams } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 import { useRBAC } from '../context/RBACContext';
 import { DIRECTORY_SCOPES } from '../msalConfig';
-import { apiJson, graphJson, graphPhoto, isAbort, mapLimit, odata } from '../utils/apiClient';
+import { apiJson, cleanDisplayName, graphJson, graphPhoto, isAbort, mapLimit, odata } from '../utils/apiClient';
 import { Avatar } from '../components/Header';
 import {
   Alert, Badge, Button, Drawer, EmptyState, Icon, IconButton, LoadingBlock, Modal, Page, PageHeader, SearchInput, Select, Skeleton, Tabs, TextField,
@@ -381,7 +381,7 @@ function UsersTab({ config, reload, canManage }) {
     withToken((t) => mapLimit(missing, 6, async (email) => {
       try {
         const u = await graphJson(`/users/${encodeURIComponent(email)}?$select=${USER_FIELDS}`, t);
-        if (!cancelled) setDetails((d) => ({ ...d, [email]: { id: u.id, name: u.displayName, jobTitle: u.jobTitle, department: u.department } }));
+        if (!cancelled) setDetails((d) => ({ ...d, [email]: { id: u.id, name: cleanDisplayName(u.displayName), jobTitle: u.jobTitle, department: u.department } }));
       } catch {
         if (!cancelled) setDetails((d) => ({ ...d, [email]: { missing: true } }));
       }
@@ -409,7 +409,7 @@ function UsersTab({ config, reload, canManage }) {
   }, [mode, q, loadDirectory]);
 
   const rows = mode === 'assigned' ? assigned : directory.users.map((u) => ({
-    email: userEmail(u), id: u.id, name: u.displayName, jobTitle: u.jobTitle, department: u.department, role: config.user_role_overrides[userEmail(u)],
+    email: userEmail(u), id: u.id, name: cleanDisplayName(u.displayName), jobTitle: u.jobTitle, department: u.department, role: config.user_role_overrides[userEmail(u)],
   }));
   const photos = usePhotos(rows.map((r) => r.email));
 
@@ -561,9 +561,9 @@ function GroupsTab({ config }) {
           <ul className="divide-y divide-jj-gray-02">
             {members.map((m) => (
               <li key={m.id} className="flex items-center gap-3 px-5 py-3">
-                <Avatar src={photos[m.id?.toLowerCase()]} name={m.displayName} className="w-9 h-9" />
+                <Avatar src={photos[m.id?.toLowerCase()]} name={cleanDisplayName(m.displayName)} className="w-9 h-9" />
                 <span className="min-w-0">
-                  <span className="block font-johnson-text text-sm text-jj-gray-08 truncate">{m.displayName}</span>
+                  <span className="block font-johnson-text text-sm text-jj-gray-08 truncate">{cleanDisplayName(m.displayName)}</span>
                   <span className="block font-johnson-text text-xs text-jj-gray-06 truncate">{[m.mail || m.userPrincipalName, m.jobTitle].filter(Boolean).join(' · ')}</span>
                 </span>
               </li>

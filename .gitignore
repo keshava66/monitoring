@@ -1,0 +1,9 @@
+# Local copies made from the *.example templates
+start.sh
+start.bat
+config.ini
+.env
+*.pid
+*.log
+__pycache__/
+venv/

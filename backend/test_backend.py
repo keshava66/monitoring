@@ -63,6 +63,7 @@ USERS = {
     "ops-token": {"mail": "ops@corp.com", "groups": [{"id": "g2", "displayName": "GRP-OPS"}]},
     "viewer-token": {"mail": "viewer@corp.com", "groups": []},
     "paged-token": {"mail": "paged@corp.com", "groups": "paged"},
+    "nophoto-token": {"mail": "nophoto@corp.com", "groups": []},
 }
 
 
@@ -83,6 +84,8 @@ def _graph_handler(request: httpx.Request) -> httpx.Response:
                                              "@odata.nextLink": "https://graph.test/v1.0/me/memberOf?page2=1"})
         return httpx.Response(200, json={"value": user["groups"]})
     if "photo" in path:
+        if token == "nophoto-token":
+            return httpx.Response(404)
         return httpx.Response(200, content=b"\x89PNG fake", headers={"content-type": "image/png"})
     return httpx.Response(404)
 
@@ -258,6 +261,11 @@ def test_graph_outage_returns_503(monkeypatch):
 def test_photo_proxy():
     resp = client.get("/auth/user/photo", headers=VIEWER)
     assert resp.status_code == 200 and resp.headers["content-type"] == "image/png"
+
+
+def test_photo_missing_is_no_content():
+    resp = client.get("/auth/user/photo", headers={"Authorization": "Bearer nophoto-token"})
+    assert resp.status_code == 204 and not resp.content
 
 
 # ============================================================================

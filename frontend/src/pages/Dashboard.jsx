@@ -27,7 +27,6 @@ export default function Dashboard() {
   return (
     <Page>
       <section className="bg-white rounded-2xl border border-jj-gray-02 shadow-card overflow-hidden">
-        <div className="h-1 bg-jj-red" aria-hidden="true" />
         <div className="flex flex-col gap-5 sm:flex-row sm:items-center sm:justify-between px-5 py-5 sm:px-8 sm:py-7">
           <div className="flex items-center gap-4 sm:gap-5 min-w-0">
             <Avatar src={profilePhoto} name={user?.name} className="w-14 h-14 sm:w-16 sm:h-16 text-base" />

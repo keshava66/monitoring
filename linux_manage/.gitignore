@@ -7,3 +7,4 @@ venv/
 /service_directories.json
 /manager.pid
 /manager.log
+/start.sh
