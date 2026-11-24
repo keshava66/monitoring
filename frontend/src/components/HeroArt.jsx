@@ -107,8 +107,8 @@ export function ToolOrbit({ tools, onLaunch, status = {} }) {
   const hold = (id) => { paused.current = !!id; setActive(id); };
 
   return (
-    <div ref={wrap} className="relative w-full pb-12">
-      <div className="relative w-full aspect-[5/4] sm:aspect-[3/2] max-h-[28rem] mx-auto">
+    <div ref={wrap} className="relative w-full max-w-[34rem] mx-auto pb-11">
+      <div className="relative w-full aspect-[5/4] sm:aspect-[16/9] mx-auto">
       <OrbitBackdrop />
       <CoreDisc title="RDI" sub="AI · Monitoring" size={small ? 92 : 132} />
       {tools.map((tool, i) => {
@@ -177,7 +177,7 @@ export function RingGauge({ value, segments = [], center, sub, caption, loading,
   const R = 76;
   const C = 2 * Math.PI * R;
   return (
-    <div className="relative w-full max-w-[24rem] aspect-square mx-auto">
+    <div className={cx('relative h-full aspect-square', segments.length ? 'mr-auto' : 'mx-auto')}>
       <div aria-hidden="true" className="absolute inset-[8%] rounded-full animate-halo"
         style={{ background: 'radial-gradient(circle, rgba(235,23,0,0.10), rgba(15,104,178,0.06) 45%, transparent 70%)' }} />
       <svg viewBox="0 0 200 200" className="relative w-full h-full overflow-visible" role="img" aria-label={caption || `${pct}%`}>
@@ -215,12 +215,12 @@ export function RingGauge({ value, segments = [], center, sub, caption, loading,
         {loading ? (
           <span className="w-16 h-7 rounded-md bg-jj-gray-02 animate-pulse" />
         ) : (
-          <span className="font-johnson-display font-light text-[2.6rem] sm:text-5xl leading-none tracking-[-0.03em] text-jj-gray-08 tabular-nums">{center}</span>
+          <span className="font-johnson-display font-light text-[1.9rem] lg:text-[2.2rem] leading-none tracking-[-0.03em] text-jj-gray-08 tabular-nums">{center}</span>
         )}
-        {sub && <span className="mt-2 font-johnson-text font-medium text-[13px] text-jj-gray-06">{sub}</span>}
+        {sub && <span className="mt-1.5 font-johnson-text font-medium text-[12px] text-jj-gray-06">{sub}</span>}
       </div>
       {arcs.length > 0 && (
-        <ul className="absolute -bottom-2 left-1/2 -translate-x-1/2 flex flex-wrap justify-center gap-x-4 gap-y-1 w-max max-w-full">
+        <ul className="absolute top-1/2 -translate-y-1/2 left-full ml-3 flex flex-col gap-1.5 w-max">
           {arcs.slice(0, 4).map((s) => (
             <li key={s.label} className="flex items-center gap-1.5 font-johnson-text text-[12px] text-jj-gray-07 whitespace-nowrap">
               <span className="w-2 h-2 rounded-full" style={{ background: s.color }} />{s.label}
@@ -245,7 +245,7 @@ export function ClockDial({ count, label, loading }) {
   const m = now.getMinutes() * 6 + now.getSeconds() * 0.1;
   const sec = now.getSeconds() * 6;
   return (
-    <div className="relative w-full max-w-[22rem] aspect-square mx-auto">
+    <div className="relative h-full aspect-square mx-auto">
       <svg viewBox="0 0 200 200" className="w-full h-full overflow-visible" aria-hidden="true">
         <circle cx="100" cy="100" r="96" fill="none" stroke="rgba(110,98,89,0.22)" strokeWidth="0.6" />
         <circle cx="100" cy="100" r="80" fill="none" stroke="rgba(235,23,0,0.25)" strokeWidth="0.6" strokeDasharray="2 3" className="origin-center animate-spin-slow" style={{ transformBox: 'view-box' }} />
@@ -272,7 +272,7 @@ export function ClockDial({ count, label, loading }) {
       </svg>
       <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none">
         {loading ? <span className="w-12 h-7 rounded bg-jj-gray-02 animate-pulse" /> : (
-          <span className="font-johnson-display font-light text-4xl leading-none tabular-nums text-jj-gray-08">{count}</span>
+          <span className="font-johnson-display font-light text-3xl leading-none tabular-nums text-jj-gray-08">{count}</span>
         )}
         <span className="mt-1.5 font-johnson-text font-medium text-[12px] text-jj-gray-06">{label}</span>
       </div>
@@ -303,7 +303,7 @@ export function PipelineFlow({ nodes, stages, running }) {
   const colorOf = (node, st) => (st === 'error' ? '#eb1700' : st === 'idle' ? '#d5cfc9' : st === 'halted' ? '#857a73' : node.color);
   const done = nodes.filter((nd) => stateOf(nd.id) === 'done').length;
   return (
-    <div ref={wrap} className="relative w-full aspect-[16/11] max-h-[24rem]">
+    <div ref={wrap} className="relative w-full h-full">
       <svg viewBox="0 0 100 100" preserveAspectRatio="none" className="absolute inset-0 w-full h-full overflow-visible" aria-hidden="true">
         <path d={`M ${pos[perRow - 1].x} 30 C ${pos[perRow - 1].x + 7} 30, ${pos[perRow - 1].x + 7} 74, ${pos[perRow]?.x ?? 90} 74`} fill="none" stroke="#d5cfc9" strokeWidth="3" vectorEffect="non-scaling-stroke" />
         {pos.slice(1).map((p, i) => {
@@ -352,10 +352,9 @@ export function PipelineFlow({ nodes, stages, running }) {
           </div>
         );
       })}
-      <div className="absolute left-1/2 -top-1 -translate-x-1/2 text-center">
-        <p className="font-johnson-display font-light text-4xl leading-none tabular-nums text-jj-gray-08">{done}<span className="text-jj-gray-05 text-2xl">/{n}</span></p>
-        <p className="mt-1 font-johnson-text font-medium text-[12px] text-jj-gray-06">stages done</p>
-      </div>
+      <p className="absolute left-1/2 top-0 -translate-x-1/2 whitespace-nowrap font-johnson-text font-medium text-[12px] text-jj-gray-06">
+        <span className="font-johnson-display font-light text-xl text-jj-gray-08 tabular-nums">{done}/{n}</span> stages done
+      </p>
     </div>
   );
 }
@@ -367,7 +366,7 @@ function Trace({ load, color, live }) {
   let d = 'M 0 20';
   for (let x = 0; x < 200; x += 25) d += ` L ${x + 8} 20 ${beat(x + 8)}`;
   return (
-    <svg viewBox="0 0 100 40" preserveAspectRatio="none" className="w-full h-12 overflow-hidden" aria-hidden="true">
+    <svg viewBox="0 0 100 40" preserveAspectRatio="none" className="w-full h-7 my-1 overflow-hidden" aria-hidden="true">
       <g className={live ? 'animate-[trace_4s_linear_infinite]' : ''}>
         <path d={d} fill="none" stroke={color} strokeWidth="1.6" strokeLinejoin="round" vectorEffect="non-scaling-stroke" opacity={live ? 1 : 0.35} />
       </g>
@@ -378,22 +377,22 @@ function Trace({ load, color, live }) {
 /** One lane per service: live trace driven by CPU, plus memory and uptime. */
 export function ServicePulse({ services }) {
   return (
-    <div className="w-full flex flex-col gap-3">
+    <div className="w-full h-full flex flex-col justify-center gap-2">
       {services.map((s, i) => (
-        <div key={s.id} className="rounded-2xl bg-white/85 border border-jj-gray-02 px-5 py-4 animate-rise" style={{ animationDelay: `${0.15 + i * 0.1}s` }}>
+        <div key={s.id} className="rounded-2xl bg-white/85 border border-jj-gray-02 px-4 py-2.5 animate-rise" style={{ animationDelay: `${0.15 + i * 0.1}s` }}>
           <div className="flex items-center justify-between gap-3">
-            <p className="flex items-center gap-2 min-w-0 font-johnson-display font-medium text-[15px] text-jj-gray-08">
+            <p className="flex items-center gap-2 min-w-0 font-johnson-display font-medium text-[14px] text-jj-gray-08">
               <span className="w-2 h-2 rounded-full shrink-0" style={{ background: s.color }} />
               <span className="truncate">{s.label}</span>
             </p>
             <span className="font-johnson-text font-medium text-[13px] shrink-0" style={{ color: s.color }}>{s.state}</span>
           </div>
           <Trace load={s.cpu} color={s.color} live={s.live} />
-          <dl className="grid grid-cols-3 gap-3 font-johnson-text">
-            {[['CPU', s.cpu != null ? `${s.cpu}%` : '—'], ['Memory', s.mem != null ? `${s.mem}%` : '—'], ['Uptime', s.uptime || '—']].map(([k, v]) => (
-              <div key={k} className="min-w-0">
-                <dt className="text-[12px] text-jj-gray-06">{k}</dt>
-                <dd className="font-johnson-display text-lg leading-tight tabular-nums text-jj-gray-08 truncate">{v}</dd>
+          <dl className="flex gap-4 font-johnson-text text-[12px]">
+            {[['CPU', s.cpu != null ? `${s.cpu}%` : '—'], ['Mem', s.mem != null ? `${s.mem}%` : '—'], ['Up', s.uptime || '—']].map(([k, v]) => (
+              <div key={k} className="flex gap-1.5 min-w-0">
+                <dt className="text-jj-gray-06">{k}</dt>
+                <dd className="tabular-nums text-jj-gray-08 font-medium truncate">{v}</dd>
               </div>
             ))}
           </dl>
@@ -409,29 +408,29 @@ export function AccessGraph({ groups, roles, links }) {
   const gy = Object.fromEntries(groups.map((g, i) => [g.id, rowY(i, groups.length)]));
   const ry = Object.fromEntries(roles.map((r, i) => [r.id, rowY(i, roles.length)]));
   return (
-    <div className="relative w-full aspect-[16/11] max-h-[24rem]">
+    <div className="relative w-full h-full">
       <svg viewBox="0 0 100 100" preserveAspectRatio="none" className="absolute inset-0 w-full h-full" aria-hidden="true">
         {links.filter(([g, r]) => gy[g] != null && ry[r] != null).map(([g, r], i) => {
           const color = roles.find((x) => x.id === r)?.color || '#6e6259';
           return (
             <g key={`${g}-${r}`} className="animate-fade-in" style={{ animationDelay: `${0.3 + i * 0.15}s`, animationFillMode: 'both' }}>
-              <path d={`M 30 ${gy[g]} C 50 ${gy[g]}, 50 ${ry[r]}, 70 ${ry[r]}`} fill="none" stroke={color} strokeOpacity="0.35" strokeWidth="6" vectorEffect="non-scaling-stroke" />
-              <path d={`M 30 ${gy[g]} C 50 ${gy[g]}, 50 ${ry[r]}, 70 ${ry[r]}`} fill="none" stroke={color} strokeWidth="2" strokeDasharray="4 10" vectorEffect="non-scaling-stroke" className="animate-dash" />
+              <path d={`M 38 ${gy[g]} C 50 ${gy[g]}, 50 ${ry[r]}, 62 ${ry[r]}`} fill="none" stroke={color} strokeOpacity="0.35" strokeWidth="6" vectorEffect="non-scaling-stroke" />
+              <path d={`M 38 ${gy[g]} C 50 ${gy[g]}, 50 ${ry[r]}, 62 ${ry[r]}`} fill="none" stroke={color} strokeWidth="2" strokeDasharray="4 10" vectorEffect="non-scaling-stroke" className="animate-dash" />
             </g>
           );
         })}
       </svg>
       {groups.map((g) => (
-        <div key={g.id} className="absolute left-0 w-[30%] -translate-y-1/2 flex justify-end" style={{ top: `${gy[g.id]}%` }}>
-          <span className="inline-flex items-center gap-2 max-w-full h-9 pl-3 pr-3.5 rounded-xl bg-white border border-jj-gray-02 font-johnson-text font-medium text-[12.5px] text-jj-gray-08">
+        <div key={g.id} className="absolute left-0 w-[38%] -translate-y-1/2 flex justify-end" style={{ top: `${gy[g.id]}%` }}>
+          <span className="inline-flex items-center gap-2 max-w-full h-8 pl-2.5 pr-3 rounded-xl bg-white border border-jj-gray-02 font-johnson-text font-medium text-[12.5px] text-jj-gray-08">
             <span className="w-1.5 h-1.5 rounded-full bg-jj-blue-03 shrink-0" />
             <span className="truncate" title={g.label}>{g.label}</span>
           </span>
         </div>
       ))}
       {roles.map((r) => (
-        <div key={r.id} className="absolute right-0 w-[30%] -translate-y-1/2" style={{ top: `${ry[r.id]}%` }}>
-          <span className="inline-flex items-center gap-2 max-w-full h-9 pl-3 pr-3.5 rounded-xl font-johnson-text font-medium text-[12.5px] text-white"
+        <div key={r.id} className="absolute right-0 w-[38%] -translate-y-1/2" style={{ top: `${ry[r.id]}%` }}>
+          <span className="inline-flex items-center gap-2 max-w-full h-8 pl-2.5 pr-3 rounded-xl font-johnson-text font-medium text-[12.5px] text-white"
             style={{ background: r.color || '#6e6259' }}>
             <span className="truncate" title={r.label}>{r.label}</span>
             {r.count > 0 && <span className="shrink-0 tabular-nums text-white/80">{r.count}</span>}

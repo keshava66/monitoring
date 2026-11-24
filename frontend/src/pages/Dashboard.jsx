@@ -190,12 +190,12 @@ export default function Dashboard() {
 
   return (
     <Page>
-      <header className="relative isolate grid items-center gap-x-10 gap-y-8 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)] min-h-[min(34rem,70vh)]">
+      <header className="relative isolate grid items-center gap-x-10 gap-y-6 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
         <div aria-hidden="true" className="pointer-events-none absolute -z-10 -inset-x-10 -top-10 -bottom-4 hero-grid" />
         <div aria-hidden="true" className="pointer-events-none absolute -z-10 -top-32 right-[-6rem] w-[46rem] max-w-[120%] aspect-square rounded-full animate-halo"
           style={{ background: 'radial-gradient(circle, rgba(235,23,0,0.12) 0%, rgba(140,59,187,0.09) 40%, rgba(255,255,255,0) 70%)' }} />
         <div className="min-w-0">
-          <div className="flex flex-wrap gap-2 mb-6 animate-rise">
+          <div className="flex flex-wrap gap-2 mb-4 animate-rise">
             <StatusChip color={roleColor} live>{roleName}</StatusChip>
             {tools.length > 0 && (
               <StatusChip color={attention ? WARN : GOOD} live={!!attention}>
@@ -203,7 +203,7 @@ export default function Dashboard() {
               </StatusChip>
             )}
           </div>
-          <h1 className="font-johnson-display font-bold text-[2.5rem] sm:text-[3.25rem] 2xl:text-[3.9rem] leading-[0.98] tracking-[-0.035em] text-jj-gray-08 text-balance">
+          <h1 className="font-johnson-display font-bold text-[2.1rem] sm:text-[2.75rem] 2xl:text-[3.25rem] leading-[1] tracking-[-0.035em] text-jj-gray-08 text-balance">
             <span className="inline-block animate-word-in">{greeting(now)},</span>{' '}
             <span className="inline-block animate-word-in [animation-delay:0.08s] bg-clip-text text-transparent animate-sweep"
               style={{ backgroundImage: 'linear-gradient(100deg,#312c2a 0%,#312c2a 40%,#eb1700 50%,#312c2a 60%,#312c2a 100%)', backgroundSize: '300% 100%' }}>
@@ -215,15 +215,15 @@ export default function Dashboard() {
               ))}
             </span>
           </h1>
-          <p className="mt-5 max-w-lg font-johnson-text font-light text-base sm:text-[17px] leading-relaxed text-jj-gray-07 text-pretty animate-rise [animation-delay:0.25s]">
+          <p className="mt-3 max-w-lg font-johnson-text font-light text-[15px] sm:text-base leading-relaxed text-jj-gray-07 text-pretty animate-rise [animation-delay:0.25s]">
             Ingestion runs, extraction pipelines, servers and the archive, live from the platform. Pick a tool, or jump straight to one.
           </p>
-          <div className="mt-7 animate-rise [animation-delay:0.35s]">
+          <div className="mt-5 animate-rise [animation-delay:0.35s]">
             <ToolSearch tools={tools} />
           </div>
         </div>
         {tools.length > 0 && (
-          <div className="animate-fade-in [animation-duration:1.4s]">
+          <div className="hidden md:block animate-fade-in [animation-duration:1.4s]">
             <ToolOrbit tools={tools} status={pulse} onLaunch={(t) => navigate(t.path)} />
           </div>
         )}

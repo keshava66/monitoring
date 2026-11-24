@@ -270,35 +270,40 @@ function AnimatedWords({ text, delay = 0 }) {
 }
 
 /**
- * Page hero: a bold display line with a light italic red second line, a lede,
- * live chips and actions on the left, and a data-driven illustration on the right.
+ * Page hero, kept compact so the working surface starts above the fold: a bold
+ * display line with a light italic red ending, a lede, live chips and actions,
+ * and a small data-driven illustration on the right (hidden on phones).
  */
-export function PageHeader({ title, accent, description, meta, actions, chips, art, compact = false }) {
+export function PageHeader({ title, accent, description, meta, actions, chips, art }) {
   return (
-    <header className={cx('relative isolate grid items-center gap-x-10 gap-y-6', art ? 'lg:grid-cols-[minmax(0,1.05fr)_minmax(0,0.95fr)]' : '')}>
-      <div aria-hidden="true" className="pointer-events-none absolute -z-10 -inset-x-10 -top-10 -bottom-6 hero-grid" />
-      <div aria-hidden="true" className="pointer-events-none absolute -z-10 -top-24 right-0 w-[38rem] max-w-full aspect-square rounded-full animate-halo"
-        style={{ background: 'radial-gradient(circle, rgba(235,23,0,0.10) 0%, rgba(140,59,187,0.08) 40%, rgba(255,255,255,0) 70%)' }} />
+    <header className={cx('relative isolate grid items-center gap-x-8 gap-y-4', art && 'md:grid-cols-[minmax(0,1fr)_auto]')}>
+      <div aria-hidden="true" className="pointer-events-none absolute -z-10 -inset-x-10 -top-8 -bottom-4 hero-grid" />
+      <div aria-hidden="true" className="pointer-events-none absolute -z-10 -top-20 right-0 w-[28rem] max-w-full aspect-square rounded-full animate-halo"
+        style={{ background: 'radial-gradient(circle, rgba(235,23,0,0.09) 0%, rgba(140,59,187,0.07) 40%, rgba(255,255,255,0) 70%)' }} />
       <div className="min-w-0">
-        {chips && <div className="flex flex-wrap items-center gap-2 mb-5 animate-rise">{chips}</div>}
-        <h1 className={cx('font-johnson-display font-bold text-jj-gray-08 tracking-[-0.035em] leading-[1.02] text-balance',
-          compact ? 'text-[2rem] sm:text-[2.5rem]' : 'text-[2.25rem] sm:text-[3rem] xl:text-[3.5rem]')}>
+        {chips && <div className="flex flex-wrap items-center gap-2 mb-3 animate-rise">{chips}</div>}
+        <h1 className="font-johnson-display font-bold text-jj-gray-08 text-[1.75rem] sm:text-[2.25rem] xl:text-[2.6rem] tracking-[-0.03em] leading-[1.05] text-balance">
           <AnimatedWords text={title} />
           {accent && (
-            <span className="block font-light italic text-jj-red mt-1">
-              <AnimatedWords text={accent} delay={0.25} />
-            </span>
+            <>
+              {' '}
+              <span className="font-light italic text-jj-red"><AnimatedWords text={accent} delay={0.2} /></span>
+            </>
           )}
         </h1>
         {(description || meta) && (
-          <p className="mt-4 max-w-xl font-johnson-text font-light text-[15px] sm:text-base leading-relaxed text-jj-gray-07 text-pretty animate-rise [animation-delay:0.2s]">
+          <p className="mt-2 max-w-2xl font-johnson-text font-light text-[15px] leading-relaxed text-jj-gray-07 text-pretty animate-rise [animation-delay:0.15s]">
             {description}
             {meta && <span className="text-jj-gray-05 whitespace-nowrap">{description ? ' · ' : ''}{meta}</span>}
           </p>
         )}
-        {actions && <div className="mt-6 flex flex-wrap items-center gap-2.5 animate-rise [animation-delay:0.3s]">{actions}</div>}
+        {actions && <div className="mt-4 flex flex-wrap items-center gap-2.5 animate-rise [animation-delay:0.25s]">{actions}</div>}
       </div>
-      {art && <div className="relative min-w-0 w-full max-w-[20rem] sm:max-w-md lg:max-w-none mx-auto animate-fade-in [animation-duration:1.2s]">{art}</div>}
+      {art && (
+        <div className="relative hidden md:block w-[16rem] lg:w-[20rem] xl:w-[23rem] h-[11rem] lg:h-[12.5rem] xl:h-[13.5rem] animate-fade-in [animation-duration:1.2s]">
+          {art}
+        </div>
+      )}
     </header>
   );
 }
