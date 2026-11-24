@@ -5,8 +5,9 @@ import { useRBAC } from '../context/RBACContext';
 import { DIRECTORY_SCOPES } from '../msalConfig';
 import { apiJson, cleanDisplayName, graphJson, graphPhoto, isAbort, mapLimit, odata } from '../utils/apiClient';
 import { Avatar } from '../components/Header';
+import { AccessGraph } from '../components/HeroArt';
 import {
-  Alert, Badge, Button, Drawer, EmptyState, Icon, IconButton, LoadingBlock, Modal, Page, PageHeader, SearchInput, Select, Skeleton, Tabs, TextField,
+  Alert, Badge, Button, Drawer, EmptyState, Icon, IconButton, LoadingBlock, Modal, Page, PageHeader, SearchInput, Select, Skeleton, StatusChip, Tabs, TextField,
   cx, fmtNum, useDebouncedValue, useFeedback,
 } from '../components/ui';
 
@@ -208,7 +209,7 @@ function RolesTab({ config, reload, canManage }) {
           const modified = builtin && config.custom_roles[id];
           const granted = Object.entries(role.permissions).filter(([, v]) => v).map(([k]) => k);
           return (
-            <li key={id} className="bg-white rounded-xl border border-jj-gray-02 shadow-card flex flex-col">
+            <li key={id} className="surface flex flex-col">
               <div className="flex items-start justify-between gap-3 p-4 sm:p-5">
                 <div className="min-w-0">
                   <div className="flex flex-wrap items-center gap-2">
@@ -238,7 +239,7 @@ function RolesTab({ config, reload, canManage }) {
           );
         })}
       </ul>
-      <section className="bg-white rounded-xl border border-jj-gray-02 shadow-card overflow-hidden">
+      <section className="surface overflow-hidden">
         <div className="px-4 sm:px-5 py-4 border-b border-jj-gray-02">
           <h3 className="font-johnson-display text-base text-jj-gray-08">AD group mappings</h3>
           <p className="font-johnson-text text-xs text-jj-gray-06">Members of these groups get the role automatically. Configured on the backend (AD_GROUP_*).</p>
@@ -430,7 +431,7 @@ function UsersTab({ config, reload, canManage }) {
 
   return (
     <div className="flex flex-col gap-4">
-      <div className="bg-white rounded-xl border border-jj-gray-02 shadow-card p-3 sm:p-4 flex flex-col lg:flex-row lg:items-center gap-3">
+      <div className="surface p-3 sm:p-4 flex flex-col lg:flex-row lg:items-center gap-3">
         <Tabs variant="pill" label="User list" value={mode} onChange={setMode}
           tabs={[{ id: 'assigned', label: `Assigned · ${Object.keys(config.user_role_overrides).length}` }, { id: 'directory', label: 'Directory' }]} />
         <SearchInput value={search} onChange={setSearch} placeholder={mode === 'assigned' ? 'Filter by name or email' : 'Search the directory (starts with)'} className="flex-1 lg:max-w-sm" />
@@ -448,7 +449,7 @@ function UsersTab({ config, reload, canManage }) {
         </Alert>
       )}
 
-      <div className="bg-white rounded-xl border border-jj-gray-02 shadow-card overflow-hidden">
+      <div className="surface overflow-hidden">
         {loading && !rows.length ? <LoadingBlock label="Searching the directory…" /> : rows.length === 0 ? (
           <EmptyState icon="person" title={mode === 'assigned' ? 'No manual assignments' : 'No users found'}
             description={mode === 'assigned' ? 'Switch to Directory to find someone and assign them a role.' : 'Try a different name or email prefix.'} />
@@ -545,7 +546,7 @@ function GroupsTab({ config }) {
     <>
       <ul className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         {groups.map((g) => (
-          <li key={g.ref} className="bg-white rounded-xl border border-jj-gray-02 shadow-card p-4 sm:p-5 flex flex-col sm:flex-row sm:items-center gap-4">
+          <li key={g.ref} className="surface p-4 sm:p-5 flex flex-col sm:flex-row sm:items-center gap-4">
             <span className="w-11 h-11 rounded-xl bg-jj-gray-01 border border-jj-gray-02 text-jj-gray-07 flex items-center justify-center flex-shrink-0"><Icon name="community" className="w-5 h-5" /></span>
             <div className="flex-1 min-w-0">
               <p className="font-johnson-display text-base text-jj-gray-08 break-words">{g.displayName || g.ref}</p>
@@ -592,8 +593,25 @@ export default function UserManagement() {
 
   return (
     <Page>
-      <PageHeader icon="gear" title="User management" description="Who can see and do what across the monitoring tools." />
-      <Tabs label="User management" tabs={TABS} value={tab} onChange={(id) => setParams({ tab: id }, { replace: true })} />
+      <PageHeader title="Who can see what," accent="and why."
+        description="AD groups and manual assignments decide each person's role; roles decide which tools and actions they get. Every change is audited."
+        chips={config && (
+          <>
+            <StatusChip color="#328714">{Object.keys(config.roles).length} roles</StatusChip>
+            <StatusChip color="#0f68b2">{Object.keys(config.ad_group_roles).length} AD groups</StatusChip>
+            <StatusChip color="#8c3bbb">{Object.keys(config.user_role_overrides).length} manual assignments</StatusChip>
+          </>
+        )}
+        art={config && (
+          <AccessGraph
+            groups={Object.keys(config.ad_group_roles).map((g) => ({ id: g, label: g }))}
+            roles={Object.entries(config.roles).map(([id, r]) => ({
+              id, label: r.name, color: r.color,
+              count: Object.values(config.user_role_overrides).filter((x) => x === id).length,
+            }))}
+            links={Object.entries(config.ad_group_roles)} />
+        )} />
+      <Tabs variant="pill" label="User management" tabs={TABS} value={tab} onChange={(id) => setParams({ tab: id }, { replace: true })} className="self-start" />
       {error ? (
         <Alert tone="error" title="Couldn’t load access configuration" action={<Button size="sm" onClick={reload}>Retry</Button>}>{error}</Alert>
       ) : !config ? <LoadingBlock /> : (

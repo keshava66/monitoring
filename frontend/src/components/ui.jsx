@@ -12,7 +12,7 @@ export const fmtNum = (n) => (n == null || Number.isNaN(Number(n)) ? '—' : Num
 
 export const fmtCompact = (n) => {
   if (n == null || Number.isNaN(Number(n))) return '—';
-  return new Intl.NumberFormat('en-US', { notation: 'compact', maximumFractionDigits: 2 }).format(Number(n));
+  return new Intl.NumberFormat('en-US', { notation: 'compact', maximumFractionDigits: 1 }).format(Number(n));
 };
 
 export const fmtBytes = (b) => {
@@ -118,7 +118,7 @@ const ICONS = {
   menu: 'JJ_Icon_Unfold_All_More', help: 'JJ_Icon_Help', error: 'JJ_Icon_New_Error',
 };
 
-export function Icon({ name, className = 'w-4 h-4', label }) {
+export function Icon({ name, className = 'w-4 h-4', label, style }) {
   const file = ICONS[name] || name;
   const url = `url("/icons/${file}.svg")`;
   return (
@@ -127,23 +127,23 @@ export function Icon({ name, className = 'w-4 h-4', label }) {
       aria-label={label}
       aria-hidden={label ? undefined : true}
       className={cx('inline-block flex-shrink-0 bg-current', className)}
-      style={{ WebkitMaskImage: url, maskImage: url, WebkitMaskSize: 'contain', maskSize: 'contain', WebkitMaskRepeat: 'no-repeat', maskRepeat: 'no-repeat', WebkitMaskPosition: 'center', maskPosition: 'center' }}
+      style={{ WebkitMaskImage: url, maskImage: url, WebkitMaskSize: 'contain', maskSize: 'contain', WebkitMaskRepeat: 'no-repeat', maskRepeat: 'no-repeat', WebkitMaskPosition: 'center', maskPosition: 'center', ...style }}
     />
   );
 }
 
 // ── Buttons ───────────────────────────────────────────────────────────────────
 
-const BTN_BASE = 'inline-flex items-center justify-center gap-2 font-johnson-text font-semibold rounded-lg transition-colors duration-150 select-none whitespace-nowrap disabled:opacity-50 disabled:cursor-not-allowed focus-ring';
+const BTN_BASE = 'inline-flex items-center justify-center gap-2 font-johnson-text font-medium rounded-xl transition-[background-color,border-color,color,box-shadow,transform] duration-200 ease-out select-none whitespace-nowrap active:scale-[0.97] disabled:opacity-50 disabled:cursor-not-allowed disabled:active:scale-100 focus-ring';
 const BTN_VARIANTS = {
-  primary: 'bg-jj-red text-white hover:bg-jj-maroon-05 active:bg-jj-maroon-05 shadow-sm',
-  secondary: 'bg-white text-jj-gray-08 border border-jj-gray-03 hover:border-jj-gray-05 hover:bg-jj-gray-01',
-  ghost: 'text-jj-gray-07 hover:bg-jj-gray-02 hover:text-jj-gray-08',
-  danger: 'bg-jj-red text-white hover:bg-jj-maroon-05 shadow-sm',
-  dangerOutline: 'bg-white text-jj-red border border-jj-red/60 hover:bg-red-50',
-  dark: 'bg-jj-gray-08 text-white hover:bg-jj-gray-07 shadow-sm',
+  primary: 'bg-jj-red text-white shadow-glow hover:bg-[#d41500] hover:shadow-glow-lg',
+  secondary: 'bg-white text-jj-gray-08 border border-jj-gray-02 shadow-[0_8px_20px_-16px_rgba(49,44,42,0.6)] hover:border-jj-gray-04',
+  ghost: 'text-jj-gray-07 hover:bg-white hover:text-jj-gray-08',
+  danger: 'bg-jj-red text-white shadow-glow hover:bg-[#d41500]',
+  dangerOutline: 'bg-white text-jj-red border border-jj-red/40 hover:border-jj-red hover:bg-red-50/60',
+  dark: 'bg-jj-gray-08 text-white shadow-[0_10px_24px_-12px_rgba(49,44,42,0.8)] hover:bg-[#1f1b18]',
 };
-const BTN_SIZES = { xs: 'h-7 px-2.5 text-xs', sm: 'h-8 px-3 text-xs', md: 'h-10 px-4 text-sm', lg: 'h-11 px-5 text-sm' };
+const BTN_SIZES = { xs: 'h-7 px-2.5 text-xs rounded-lg', sm: 'h-9 px-3.5 text-[13px]', md: 'h-10 px-4 text-sm', lg: 'h-12 px-6 text-[15px]' };
 
 export const Button = React.forwardRef(function Button(
   { variant = 'secondary', size = 'md', icon, iconRight, loading = false, className, children, type = 'button', disabled, ...rest },
@@ -159,7 +159,7 @@ export const Button = React.forwardRef(function Button(
 });
 
 export function IconButton({ icon, label, variant = 'ghost', size = 'md', className, iconClassName, ...rest }) {
-  const dims = { sm: 'w-8 h-8', md: 'w-10 h-10' }[size];
+  const dims = { sm: 'w-9 h-9', md: 'w-10 h-10' }[size];
   return (
     <button type="button" aria-label={label} title={label} className={cx(BTN_BASE, BTN_VARIANTS[variant], dims, 'px-0', className)} {...rest}>
       <Icon name={icon} className={iconClassName || 'w-4 h-4'} />
@@ -176,26 +176,32 @@ export function Spinner({ className = 'w-5 h-5', label }) {
 }
 
 export function Skeleton({ className = 'h-4 w-24' }) {
-  return <span aria-hidden="true" className={cx('block rounded bg-jj-gray-02 animate-pulse', className)} />;
+  return (
+    <span aria-hidden="true" className={cx('relative block overflow-hidden rounded-md bg-jj-gray-02/80', className)}>
+      <span className="absolute inset-y-0 left-0 w-1/2 bg-gradient-to-r from-transparent via-white/70 to-transparent animate-shimmer" />
+    </span>
+  );
 }
 
 const TONES = {
-  error: { box: 'bg-red-50 border-red-200 text-jj-maroon-05', icon: 'alert', iconColor: 'text-jj-red' },
-  warning: { box: 'bg-amber-50 border-amber-200 text-amber-900', icon: 'alert', iconColor: 'text-amber-600' },
-  info: { box: 'bg-sky-50 border-sky-200 text-jj-blue-05', icon: 'info', iconColor: 'text-jj-blue-03' },
-  success: { box: 'bg-green-50 border-green-200 text-jj-green-05', icon: 'check', iconColor: 'text-jj-green-03' },
+  error: { box: 'bg-[#fff6f4] border-jj-red/20 text-jj-maroon-05', icon: 'alert', iconColor: 'text-jj-red', ring: 'bg-jj-red/10' },
+  warning: { box: 'bg-[#fffaf0] border-amber-300/50 text-amber-900', icon: 'alert', iconColor: 'text-amber-600', ring: 'bg-amber-500/10' },
+  info: { box: 'bg-[#f5f9fd] border-jj-blue-03/20 text-jj-blue-05', icon: 'info', iconColor: 'text-jj-blue-03', ring: 'bg-jj-blue-03/10' },
+  success: { box: 'bg-[#f6fbf3] border-jj-green-03/20 text-jj-green-05', icon: 'check', iconColor: 'text-jj-green-03', ring: 'bg-jj-green-03/10' },
 };
 
 export function Alert({ tone = 'info', title, children, action, className }) {
   const t = TONES[tone];
   return (
-    <div role={tone === 'error' ? 'alert' : 'status'} className={cx('flex items-start gap-3 rounded-xl border px-4 py-3', t.box, className)}>
-      <Icon name={t.icon} className={cx('w-5 h-5 mt-0.5', t.iconColor)} />
-      <div className="flex-1 min-w-0 font-johnson-text text-sm">
+    <div role={tone === 'error' ? 'alert' : 'status'} className={cx('flex items-start gap-3 rounded-2xl border px-4 py-3.5 animate-rise', t.box, className)}>
+      <span className={cx('w-8 h-8 rounded-full flex items-center justify-center flex-shrink-0', t.ring)}>
+        <Icon name={t.icon} className={cx('w-4 h-4', t.iconColor)} />
+      </span>
+      <div className="flex-1 min-w-0 font-johnson-text text-sm pt-1">
         {title && <p className="font-semibold">{title}</p>}
         {children && <div className={cx(title && 'mt-0.5', 'opacity-90 break-words')}>{children}</div>}
       </div>
-      {action && <div className="flex-shrink-0">{action}</div>}
+      {action && <div className="flex-shrink-0 self-center">{action}</div>}
     </div>
   );
 }
@@ -203,21 +209,29 @@ export function Alert({ tone = 'info', title, children, action, className }) {
 export function EmptyState({ icon = 'info', title, description, action, className }) {
   return (
     <div className={cx('flex flex-col items-center justify-center text-center px-6 py-14', className)}>
-      <span className="w-12 h-12 rounded-full bg-jj-gray-01 border border-jj-gray-02 flex items-center justify-center mb-4 text-jj-gray-05">
-        <Icon name={icon} className="w-6 h-6" />
+      <span className="relative w-24 h-24 mb-5 flex items-center justify-center" aria-hidden="true">
+        <span className="absolute inset-0 rounded-full border border-dashed border-jj-red/30 animate-spin-slow" />
+        <span className="absolute inset-3 rounded-full border border-jj-red/15" />
+        <span className="w-11 h-11 rounded-full bg-white shadow-soft flex items-center justify-center text-jj-red">
+          <Icon name={icon} className="w-5 h-5" />
+        </span>
       </span>
-      <p className="font-johnson-display text-lg text-jj-gray-08">{title}</p>
-      {description && <p className="mt-1 max-w-md font-johnson-text text-sm text-jj-gray-06">{description}</p>}
-      {action && <div className="mt-5">{action}</div>}
+      <p className="font-johnson-display text-xl text-jj-gray-08">{title}</p>
+      {description && <p className="mt-1.5 max-w-md font-johnson-text font-light text-sm text-jj-gray-06 text-pretty">{description}</p>}
+      {action && <div className="mt-6">{action}</div>}
     </div>
   );
 }
 
 export function LoadingBlock({ label = 'Loading…', className }) {
   return (
-    <div className={cx('flex flex-col items-center justify-center gap-3 py-16 text-jj-red', className)}>
-      <Spinner className="w-8 h-8" />
-      <p className="font-johnson-text text-sm text-jj-gray-06">{label}</p>
+    <div className={cx('flex flex-col items-center justify-center gap-4 py-20', className)}>
+      <span className="relative w-14 h-14" aria-hidden="true">
+        <span className="absolute inset-0 rounded-full border border-jj-red/30 animate-ring" />
+        <span className="absolute inset-0 rounded-full border-2 border-jj-red/15 border-t-jj-red animate-spin" />
+        <span className="absolute inset-[22px] rounded-full bg-jj-red animate-breathe" />
+      </span>
+      <p role="status" className="font-johnson-text text-sm text-jj-gray-06">{label}</p>
     </div>
   );
 }
@@ -226,44 +240,81 @@ export function LoadingBlock({ label = 'Loading…', className }) {
 
 export function Page({ children, className, wide = false }) {
   return (
-    <div className={cx('w-full mx-auto px-4 sm:px-6 lg:px-8 py-5 sm:py-6 flex flex-col gap-5 sm:gap-6', wide ? 'max-w-none' : 'max-w-screen-2xl', className)}>
+    <div className={cx('w-full mx-auto px-4 sm:px-6 lg:px-10 pt-5 sm:pt-8 pb-10 flex flex-col gap-6 sm:gap-8', wide ? 'max-w-none' : 'max-w-[1600px]', className)}>
       {children}
     </div>
   );
 }
 
-export function PageHeader({ icon, title, description, meta, actions }) {
+/** Live status chip: a breathing dot plus tracked caps. */
+export function StatusChip({ color = '#328714', live = false, children, className }) {
   return (
-    <header className="flex flex-wrap items-end justify-between gap-x-6 gap-y-4">
-      <div className="flex flex-1 items-start gap-3 sm:gap-4 min-w-0 basis-auto max-w-full">
-        {icon && (
-          <span className="hidden sm:flex w-11 h-11 rounded-xl bg-jj-red text-white items-center justify-center flex-shrink-0 shadow-sm">
-            <Icon name={icon} className="w-5 h-5" />
-          </span>
-        )}
-        <div className="min-w-0">
-          <h1 className="font-johnson-display text-2xl sm:text-[1.75rem] leading-tight text-jj-gray-08 text-balance">{title}</h1>
-          {(description || meta) && (
-            <p className="mt-1 font-johnson-text text-sm text-jj-gray-06 break-words">
-              {description}
-              {meta && <span className="text-jj-gray-05">{description ? ' · ' : ''}<span className="whitespace-nowrap">{meta}</span></span>}
-            </p>
+    <span className={cx('chip', className)}>
+      <span className="relative flex w-1.5 h-1.5" aria-hidden="true">
+        {live && <span className="absolute inset-0 rounded-full animate-ping opacity-60" style={{ background: color }} />}
+        <span className="relative w-full h-full rounded-full" style={{ background: color, boxShadow: `0 0 8px ${color}` }} />
+      </span>
+      {children}
+    </span>
+  );
+}
+
+function AnimatedWords({ text, delay = 0 }) {
+  const words = String(text).split(' ');
+  return words.map((w, i) => (
+    <React.Fragment key={i}>
+      <span className="inline-block animate-word-in" style={{ animationDelay: `${delay + i * 0.06}s` }}>{w}</span>
+      {i < words.length - 1 ? ' ' : ''}
+    </React.Fragment>
+  ));
+}
+
+/**
+ * Page hero: a bold display line with a light italic red second line, a lede,
+ * live chips and actions on the left, and a data-driven illustration on the right.
+ */
+export function PageHeader({ title, accent, description, meta, actions, chips, art, compact = false }) {
+  return (
+    <header className={cx('relative isolate grid items-center gap-x-10 gap-y-6', art ? 'lg:grid-cols-[minmax(0,1.05fr)_minmax(0,0.95fr)]' : '')}>
+      <div aria-hidden="true" className="pointer-events-none absolute -z-10 -inset-x-10 -top-10 -bottom-6 hero-grid" />
+      <div aria-hidden="true" className="pointer-events-none absolute -z-10 -top-24 right-0 w-[38rem] max-w-full aspect-square rounded-full animate-halo"
+        style={{ background: 'radial-gradient(circle, rgba(235,23,0,0.10) 0%, rgba(140,59,187,0.08) 40%, rgba(255,255,255,0) 70%)' }} />
+      <div className="min-w-0">
+        {chips && <div className="flex flex-wrap items-center gap-2 mb-5 animate-rise">{chips}</div>}
+        <h1 className={cx('font-johnson-display font-bold text-jj-gray-08 tracking-[-0.035em] leading-[1.02] text-balance',
+          compact ? 'text-[2rem] sm:text-[2.5rem]' : 'text-[2.25rem] sm:text-[3rem] xl:text-[3.5rem]')}>
+          <AnimatedWords text={title} />
+          {accent && (
+            <span className="block font-light italic text-jj-red mt-1">
+              <AnimatedWords text={accent} delay={0.25} />
+            </span>
           )}
-        </div>
+        </h1>
+        {(description || meta) && (
+          <p className="mt-4 max-w-xl font-johnson-text font-light text-[15px] sm:text-base leading-relaxed text-jj-gray-07 text-pretty animate-rise [animation-delay:0.2s]">
+            {description}
+            {meta && <span className="text-jj-gray-05 whitespace-nowrap">{description ? ' · ' : ''}{meta}</span>}
+          </p>
+        )}
+        {actions && <div className="mt-6 flex flex-wrap items-center gap-2.5 animate-rise [animation-delay:0.3s]">{actions}</div>}
       </div>
-      {actions && <div className="flex flex-wrap items-center gap-2 sm:gap-3">{actions}</div>}
+      {art && <div className="relative min-w-0 w-full max-w-[20rem] sm:max-w-md lg:max-w-none mx-auto animate-fade-in [animation-duration:1.2s]">{art}</div>}
     </header>
   );
 }
 
-export function Section({ title, description, actions, children, className }) {
+export function Section({ title, accent, description, actions, children, className }) {
   return (
-    <section className={cx('flex flex-col gap-3', className)}>
+    <section className={cx('flex flex-col gap-4', className)}>
       {(title || actions) && (
-        <div className="flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
           <div className="min-w-0">
-            {title && <h2 className="font-johnson-display text-lg sm:text-xl text-jj-gray-08">{title}</h2>}
-            {description && <p className="mt-0.5 font-johnson-text text-xs text-jj-gray-06">{description}</p>}
+            {title && (
+              <h2 className="font-johnson-display text-2xl sm:text-[1.75rem] text-jj-gray-08 tracking-[-0.02em]">
+                {title}{accent && <> <span className="font-light italic text-jj-red">{accent}</span></>}
+              </h2>
+            )}
+            {description && <p className="mt-1 font-johnson-text font-light text-sm text-jj-gray-06">{description}</p>}
           </div>
           {actions && <div className="flex flex-wrap items-center gap-2">{actions}</div>}
         </div>
@@ -275,14 +326,14 @@ export function Section({ title, description, actions, children, className }) {
 
 export function Panel({ title, actions, children, className, bodyClassName }) {
   return (
-    <div className={cx('bg-white rounded-xl border border-jj-gray-02 shadow-card', className)}>
+    <div className={cx('surface', className)}>
       {(title || actions) && (
-        <div className="flex items-center justify-between gap-3 px-4 sm:px-5 pt-4">
-          {title && <h3 className="font-johnson-display text-base text-jj-gray-08">{title}</h3>}
+        <div className="flex items-center justify-between gap-3 px-5 sm:px-6 pt-5">
+          {title && <h3 className="font-johnson-display text-lg text-jj-gray-08">{title}</h3>}
           {actions}
         </div>
       )}
-      <div className={cx('p-4 sm:p-5', bodyClassName)}>{children}</div>
+      <div className={cx('p-5 sm:p-6', bodyClassName)}>{children}</div>
     </div>
   );
 }
@@ -300,16 +351,16 @@ export function Dot({ color, className = 'w-2.5 h-2.5', pulse = false }) {
 
 export function Badge({ children, color, tone = 'neutral', className }) {
   const tones = {
-    neutral: 'bg-jj-gray-01 text-jj-gray-07 border-jj-gray-03',
-    success: 'bg-green-50 text-jj-green-03 border-green-200',
-    danger: 'bg-red-50 text-jj-red border-red-200',
-    warning: 'bg-amber-50 text-amber-800 border-amber-200',
-    info: 'bg-sky-50 text-jj-blue-03 border-sky-200',
+    neutral: 'bg-jj-gray-01 text-jj-gray-07 border-jj-gray-02',
+    success: 'bg-[#f2f9ee] text-jj-green-03 border-jj-green-03/20',
+    danger: 'bg-[#fff3f1] text-jj-red border-jj-red/20',
+    warning: 'bg-[#fff8e8] text-amber-800 border-amber-300/50',
+    info: 'bg-[#f1f7fd] text-jj-blue-03 border-jj-blue-03/20',
   };
   return (
     <span
-      className={cx('inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full border text-xs font-johnson-text font-semibold whitespace-nowrap', !color && tones[tone], className)}
-      style={color ? { backgroundColor: color, borderColor: color, color: '#fff' } : undefined}
+      className={cx('inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full border text-xs font-johnson-text font-medium whitespace-nowrap', !color && tones[tone], className)}
+      style={color ? { backgroundColor: `${color}14`, borderColor: `${color}40`, color } : undefined}
     >
       {children}
     </span>
@@ -318,49 +369,51 @@ export function Badge({ children, color, tone = 'neutral', className }) {
 
 export function KpiTile({ label, value, hint, accent, loading, title }) {
   return (
-    <div className="h-full bg-white rounded-xl border border-jj-gray-02 shadow-card px-4 py-3.5 sm:px-5 sm:py-4 min-w-0">
-      <p className="flex items-center gap-1.5 font-johnson-text text-xs text-jj-gray-06 min-w-0">
-        {accent && <span className="w-2 h-2 rounded-full shrink-0" style={{ background: accent }} aria-hidden="true" />}
+    <div className="group relative h-full overflow-hidden bg-white rounded-2xl border border-jj-gray-02 shadow-card px-5 py-4 sm:py-5 min-w-0 transition-[box-shadow,transform] duration-300 ease-out hover:-translate-y-0.5 hover:shadow-lift">
+      <p className="flex items-center gap-2 font-johnson-text text-xs text-jj-gray-06 min-w-0">
+        {accent && <span className="w-1.5 h-1.5 rounded-full shrink-0" style={{ background: accent }} aria-hidden="true" />}
         <span className="truncate">{label}</span>
       </p>
       {loading ? (
-        <Skeleton className="h-7 w-20 mt-2" />
+        <Skeleton className="h-8 w-24 mt-2.5" />
       ) : (
-        <p className="mt-1 font-johnson-display text-2xl text-jj-gray-08 tabular-nums truncate" title={title}>{value ?? '—'}</p>
+        <p className="mt-1.5 font-johnson-display text-[1.75rem] sm:text-[2rem] leading-none tracking-[-0.02em] text-jj-gray-08 tabular-nums truncate" title={title}>{value ?? '—'}</p>
       )}
-      {hint && !loading && <p className="mt-0.5 font-johnson-text text-xs text-jj-gray-05 truncate">{hint}</p>}
+      {hint && !loading && <p className="mt-2 font-johnson-text text-xs text-jj-gray-05 truncate">{hint}</p>}
     </div>
   );
 }
 
 /** Grid for KpiTile rows; a lone tile on the last row spans the full width on small screens. */
 export function KpiGrid({ className, children }) {
-  return <div className={cx('grid grid-cols-2 gap-3 sm:gap-4 max-sm:[&>*:last-child:nth-child(odd)]:col-span-2', className)}>{children}</div>;
+  return <div className={cx('grid grid-cols-2 gap-3 sm:gap-4 stagger max-sm:[&>*:last-child:nth-child(odd)]:col-span-2', className)}>{children}</div>;
 }
 
 export function ProgressBar({ value, color = '#eb1700', className = 'h-1.5', label }) {
   const pct = Math.max(0, Math.min(100, Number(value) || 0));
   return (
     <div className={cx('w-full rounded-full bg-jj-gray-02 overflow-hidden', className)} role="progressbar" aria-valuenow={Math.round(pct)} aria-valuemin={0} aria-valuemax={100} aria-label={label}>
-      <div className="h-full rounded-full transition-[width] duration-500 ease-out" style={{ width: `${pct}%`, background: color }} />
+      <div className="h-full rounded-full transition-[width] duration-700 ease-out" style={{ width: `${pct}%`, background: `linear-gradient(90deg, ${color}99, ${color})` }} />
     </div>
   );
 }
 
 export function TableShell({ children, footer, className }) {
   return (
-    <div className={cx('bg-white rounded-xl border border-jj-gray-02 shadow-card overflow-hidden', className)}>
+    <div className={cx('bg-white rounded-3xl border border-jj-gray-02 shadow-soft overflow-hidden', className)}>
       <div className="overflow-x-auto scroll-thin">
         <table className="w-full text-sm font-johnson-text">{children}</table>
       </div>
-      {footer && <div className="px-4 py-2.5 border-t border-jj-gray-02 bg-jj-gray-01 text-xs font-johnson-text text-jj-gray-06">{footer}</div>}
+      {footer && <div className="px-5 py-3 border-t border-jj-gray-02 bg-[#faf9f7] text-xs font-johnson-text text-jj-gray-06">{footer}</div>}
     </div>
   );
 }
 
+const TH_BASE = 'bg-[#faf9f7] border-b border-jj-gray-02 text-[12.5px] font-medium text-jj-gray-06 whitespace-nowrap';
+
 export function Th({ children, align = 'left', className }) {
   return (
-    <th scope="col" className={cx('px-4 py-3 bg-jj-gray-01 border-b border-jj-gray-02 text-xs font-semibold text-jj-gray-06 whitespace-nowrap', align === 'right' ? 'text-right' : 'text-left', className)}>
+    <th scope="col" className={cx('px-5 py-3.5', TH_BASE, align === 'right' ? 'text-right' : 'text-left', className)}>
       {children}
     </th>
   );
@@ -369,13 +422,12 @@ export function Th({ children, align = 'left', className }) {
 export function SortTh({ label, sortKey, sort, onSort, align = 'left', className }) {
   const active = sort.key === sortKey;
   return (
-    <th scope="col" aria-sort={active ? (sort.asc ? 'ascending' : 'descending') : 'none'}
-      className={cx('px-0 py-0 bg-jj-gray-01 border-b border-jj-gray-02', className)}>
+    <th scope="col" aria-sort={active ? (sort.asc ? 'ascending' : 'descending') : 'none'} className={cx('px-0 py-0', TH_BASE, className)}>
       <button type="button" onClick={() => onSort(sortKey)}
-        className={cx('w-full px-4 py-3 flex items-center gap-1 text-xs font-semibold whitespace-nowrap transition-colors focus-ring-inset',
-          align === 'right' ? 'justify-end' : 'justify-start', active ? 'text-jj-gray-08' : 'text-jj-gray-06 hover:text-jj-gray-08')}>
+        className={cx('w-full px-5 py-3.5 flex items-center gap-1.5 transition-colors focus-ring-inset',
+          align === 'right' ? 'justify-end' : 'justify-start', active ? 'text-jj-red' : 'hover:text-jj-gray-08')}>
         {label}
-        <svg aria-hidden="true" viewBox="0 0 10 10" className={cx('w-2.5 h-2.5 transition-transform', active ? 'opacity-100' : 'opacity-30', active && !sort.asc && 'rotate-180')}>
+        <svg aria-hidden="true" viewBox="0 0 10 10" className={cx('w-2.5 h-2.5 transition-transform duration-200', active ? 'opacity-100' : 'opacity-30', active && !sort.asc && 'rotate-180')}>
           <path d="M2 6.5 5 3.5 8 6.5" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
         </svg>
       </button>
@@ -384,18 +436,20 @@ export function SortTh({ label, sortKey, sort, onSort, align = 'left', className
 }
 
 export function Td({ children, align = 'left', className, ...rest }) {
-  return <td className={cx('px-4 py-3 align-middle', align === 'right' && 'text-right tabular-nums', className)} {...rest}>{children}</td>;
+  return <td className={cx('px-5 py-3.5 align-middle', align === 'right' && 'text-right tabular-nums', className)} {...rest}>{children}</td>;
 }
 
 // ── Inputs ────────────────────────────────────────────────────────────────────
+
+const FIELD = 'border border-jj-gray-02 bg-white/95 text-jj-gray-08 placeholder:text-jj-gray-05 shadow-[0_10px_24px_-22px_rgba(49,44,42,0.7)] transition-[border-color,box-shadow] duration-200 focus:outline-none focus:border-jj-red/50 focus:shadow-[0_0_0_4px_rgba(235,23,0,0.08),0_16px_34px_-24px_rgba(235,23,0,0.45)]';
 
 export function Toggle({ checked, onChange, label, disabled = false, className }) {
   return (
     <button type="button" role="switch" aria-checked={checked} disabled={disabled}
       onClick={() => !disabled && onChange(!checked)}
-      className={cx('inline-flex items-center gap-2 select-none rounded-full focus-ring disabled:opacity-40 disabled:cursor-not-allowed', className)}>
-      <span className={cx('relative inline-flex h-5 w-9 flex-shrink-0 rounded-full transition-colors duration-200', checked ? 'bg-jj-red' : 'bg-jj-gray-04')}>
-        <span className={cx('absolute top-0.5 left-0.5 h-4 w-4 rounded-full bg-white shadow transition-transform duration-200', checked && 'translate-x-4')} />
+      className={cx('inline-flex items-center gap-2.5 select-none rounded-full focus-ring disabled:opacity-40 disabled:cursor-not-allowed', className)}>
+      <span className={cx('relative inline-flex h-6 w-11 flex-shrink-0 rounded-full transition-colors duration-300', checked ? 'bg-jj-red shadow-glow' : 'bg-jj-gray-03')}>
+        <span className={cx('absolute top-0.5 left-0.5 h-5 w-5 rounded-full bg-white shadow transition-transform duration-300 ease-out', checked && 'translate-x-5')} />
       </span>
       {label && <span className="font-johnson-text text-sm text-jj-gray-07 whitespace-nowrap">{label}</span>}
     </button>
@@ -405,10 +459,10 @@ export function Toggle({ checked, onChange, label, disabled = false, className }
 export function SearchInput({ value, onChange, placeholder = 'Search…', className, label }) {
   return (
     <div className={cx('relative', className)}>
-      <Icon name="search" className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-jj-gray-05 pointer-events-none" />
+      <Icon name="search" className="absolute left-3.5 top-1/2 -translate-y-1/2 w-4 h-4 text-jj-red pointer-events-none" />
       <input type="search" value={value} onChange={(e) => onChange(e.target.value)} placeholder={placeholder}
         aria-label={label || placeholder}
-        className="w-full h-10 pl-9 pr-3 rounded-lg border border-jj-gray-03 bg-white font-johnson-text text-sm text-jj-gray-08 placeholder:text-jj-gray-05 focus:outline-none focus:border-jj-red focus:ring-2 focus:ring-jj-red/20 transition-colors" />
+        className={cx('w-full h-11 pl-10 pr-3 rounded-xl font-johnson-text text-sm', FIELD)} />
     </div>
   );
 }
@@ -417,11 +471,10 @@ export function Select({ value, onChange, children, className, label, size = 'md
   return (
     <div className={cx('relative inline-flex', className)}>
       <select value={value} onChange={(e) => onChange(e.target.value)} aria-label={label}
-        className={cx('w-full appearance-none rounded-lg border border-jj-gray-03 bg-white pl-3 pr-8 font-johnson-text text-jj-gray-08 focus:outline-none focus:border-jj-red focus:ring-2 focus:ring-jj-red/20 cursor-pointer',
-          size === 'sm' ? 'h-8 text-xs' : 'h-10 text-sm')} {...rest}>
+        className={cx('w-full appearance-none pl-3.5 pr-9 font-johnson-text cursor-pointer', FIELD, size === 'sm' ? 'h-9 text-xs rounded-lg' : 'h-11 text-sm rounded-xl')} {...rest}>
         {children}
       </select>
-      <Icon name="chevronDown" className="absolute right-2.5 top-1/2 -translate-y-1/2 w-3 h-3 text-jj-gray-05 pointer-events-none" />
+      <Icon name="chevronDown" className="absolute right-3 top-1/2 -translate-y-1/2 w-3 h-3 text-jj-gray-05 pointer-events-none" />
     </div>
   );
 }
@@ -431,10 +484,10 @@ export function TextField({ label, hint, error, className, inputClassName, multi
   const Comp = multiline ? 'textarea' : 'input';
   return (
     <div className={cx('flex flex-col gap-1.5', className)}>
-      {label && <label htmlFor={id} className="font-johnson-text text-xs font-semibold text-jj-gray-07">{label}</label>}
+      {label && <label htmlFor={id} className="font-johnson-text text-xs font-medium text-jj-gray-07">{label}</label>}
       <Comp id={id} aria-invalid={!!error} aria-describedby={hint || error ? `${id}-hint` : undefined}
-        className={cx('w-full rounded-lg border bg-white px-3 font-johnson-text text-sm text-jj-gray-08 placeholder:text-jj-gray-05 focus:outline-none focus:ring-2 transition-colors read-only:bg-jj-gray-01 read-only:text-jj-gray-06',
-          multiline ? 'py-2 resize-none' : 'h-10', error ? 'border-jj-red focus:ring-jj-red/20' : 'border-jj-gray-03 focus:border-jj-red focus:ring-jj-red/20', inputClassName)}
+        className={cx('w-full rounded-xl px-3.5 font-johnson-text text-sm read-only:bg-jj-gray-01 read-only:text-jj-gray-06 read-only:shadow-none',
+          FIELD, multiline ? 'py-2.5 resize-none' : 'h-11', error && '!border-jj-red', inputClassName)}
         {...rest} />
       {(hint || error) && <p id={`${id}-hint`} className={cx('font-johnson-text text-xs', error ? 'text-jj-red' : 'text-jj-gray-05')}>{error || hint}</p>}
     </div>
@@ -460,33 +513,43 @@ export function Tabs({ tabs, value, onChange, label, variant = 'underline', clas
   };
   if (variant === 'pill') {
     return (
-      <div role="tablist" aria-label={label} onKeyDown={onKeyDown} className={cx('inline-flex max-w-full overflow-x-auto scroll-none bg-jj-gray-02 rounded-full p-1 gap-0.5', className)}>
-        {tabs.map((t) => (
-          <button key={t.id} ref={(el) => { refs.current[t.id] = el; }} role="tab" type="button" aria-selected={value === t.id} tabIndex={value === t.id ? 0 : -1}
-            onClick={() => onChange(t.id)} title={t.title}
-            className={cx('shrink-0 flex items-center gap-1.5 px-3.5 h-8 rounded-full font-johnson-text text-xs sm:text-sm font-semibold whitespace-nowrap transition-colors focus-ring',
-              value === t.id ? 'bg-white text-jj-gray-08 shadow-sm' : 'text-jj-gray-06 hover:text-jj-gray-08')}>
-            {t.dot && <Dot color={t.dot} className="w-1.5 h-1.5" />}
-            {t.label}
-          </button>
-        ))}
+      <div role="tablist" aria-label={label} onKeyDown={onKeyDown}
+        className={cx('inline-flex max-w-full overflow-x-auto scroll-none bg-white/90 border border-jj-gray-02 rounded-2xl p-1 gap-1 shadow-[0_12px_30px_-24px_rgba(49,44,42,0.7)]', className)}>
+        {tabs.map((t) => {
+          const on = value === t.id;
+          return (
+            <button key={t.id} ref={(el) => { refs.current[t.id] = el; }} role="tab" type="button" aria-selected={on} tabIndex={on ? 0 : -1}
+              onClick={() => onChange(t.id)} title={t.title}
+              className={cx('shrink-0 flex items-center gap-2 px-4 h-9 rounded-xl font-johnson-text text-[13px] sm:text-sm whitespace-nowrap transition-[background-color,color,box-shadow] duration-300 ease-out focus-ring',
+                on ? 'bg-jj-red text-white shadow-glow' : 'text-jj-gray-07 hover:text-jj-gray-08 hover:bg-jj-gray-01')}>
+              {t.icon && <Icon name={t.icon} className="w-3.5 h-3.5" />}
+              {t.dot && <Dot color={on ? '#fff' : t.dot} className="w-1.5 h-1.5" />}
+              {t.label}
+              {t.count != null && <span className={cx('text-[11px] tabular-nums', on ? 'text-white/80' : 'text-jj-gray-05')}>{t.count}</span>}
+            </button>
+          );
+        })}
       </div>
     );
   }
   return (
     <div role="tablist" aria-label={label} onKeyDown={onKeyDown} className={cx('flex overflow-x-auto scroll-none border-b border-jj-gray-02', className)}>
-      {tabs.map((t) => (
-        <button key={t.id} ref={(el) => { refs.current[t.id] = el; }} role="tab" type="button" aria-selected={value === t.id} tabIndex={value === t.id ? 0 : -1}
-          onClick={() => onChange(t.id)} title={t.title}
-          className={cx('relative shrink-0 flex items-center gap-2 px-4 sm:px-5 h-11 font-johnson-text text-sm whitespace-nowrap transition-colors focus-ring-inset',
-            value === t.id ? 'text-jj-gray-08 font-semibold' : 'text-jj-gray-06 hover:text-jj-gray-08')}>
-          {t.icon && <Icon name={t.icon} className="w-4 h-4" />}
-          {t.dot && <Dot color={t.dot} className="w-2 h-2" />}
-          {t.label}
-          {t.count != null && <span className="ml-0.5 px-1.5 rounded-full bg-jj-gray-02 text-[11px] text-jj-gray-07 tabular-nums">{t.count}</span>}
-          <span className={cx('absolute left-2 right-2 bottom-0 h-0.5 rounded-full transition-colors', value === t.id ? 'bg-jj-red' : 'bg-transparent')} />
-        </button>
-      ))}
+      {tabs.map((t) => {
+        const on = value === t.id;
+        return (
+          <button key={t.id} ref={(el) => { refs.current[t.id] = el; }} role="tab" type="button" aria-selected={on} tabIndex={on ? 0 : -1}
+            onClick={() => onChange(t.id)} title={t.title}
+            className={cx('relative shrink-0 flex items-center gap-2 px-4 sm:px-5 h-12 font-johnson-text text-sm whitespace-nowrap transition-colors focus-ring-inset',
+              on ? 'text-jj-gray-08 font-medium' : 'text-jj-gray-06 hover:text-jj-gray-08')}>
+            {t.icon && <Icon name={t.icon} className={cx('w-4 h-4', on && 'text-jj-red')} />}
+            {t.dot && <Dot color={t.dot} className="w-2 h-2" />}
+            {t.label}
+            {t.count != null && <span className="ml-0.5 px-1.5 rounded-full bg-jj-gray-02 text-[11px] text-jj-gray-07 tabular-nums">{t.count}</span>}
+            <span className={cx('absolute left-3 right-3 bottom-0 h-[3px] rounded-full transition-[background-color,box-shadow,transform] duration-300 ease-out origin-center',
+              on ? 'bg-jj-red shadow-[0_0_10px_rgba(235,23,0,0.5)] scale-x-100' : 'bg-transparent scale-x-50')} />
+          </button>
+        );
+      })}
     </div>
   );
 }
@@ -533,18 +596,18 @@ export function Modal({ open, onClose, title, description, children, footer, siz
   const widths = { sm: 'sm:max-w-md', md: 'sm:max-w-xl', lg: 'sm:max-w-3xl', xl: 'sm:max-w-5xl' };
   return createPortal(
     <div className="fixed inset-0 z-[70] flex items-end sm:items-center justify-center sm:p-4">
-      <div className="absolute inset-0 bg-jj-gray-08/50 backdrop-blur-[2px] animate-fade-in" onClick={dismissable ? onClose : undefined} aria-hidden="true" />
+      <div className="absolute inset-0 bg-[#1f1b18]/45 backdrop-blur-[3px] animate-fade-in" onClick={dismissable ? onClose : undefined} aria-hidden="true" />
       <div ref={ref} role="dialog" aria-modal="true" aria-labelledby={titleId} tabIndex={-1}
-        className={cx('relative w-full bg-white shadow-overlay flex flex-col max-h-[92dvh] rounded-t-2xl sm:rounded-2xl animate-dialog-in outline-none', widths[size])}>
-        <div className="flex items-start justify-between gap-4 px-5 sm:px-6 pt-5 pb-4 border-b border-jj-gray-02">
+        className={cx('relative w-full bg-white shadow-overlay flex flex-col max-h-[92dvh] rounded-t-[28px] sm:rounded-[28px] animate-dialog-in outline-none', widths[size])}>
+        <div className="flex items-start justify-between gap-4 px-6 sm:px-7 pt-6 pb-4 border-b border-jj-gray-02">
           <div className="min-w-0">
-            <h2 id={titleId} className="font-johnson-display text-lg sm:text-xl text-jj-gray-08">{title}</h2>
+            <h2 id={titleId} className="font-johnson-display text-xl sm:text-2xl tracking-[-0.02em] text-jj-gray-08">{title}</h2>
             {description && <p className="mt-0.5 font-johnson-text text-sm text-jj-gray-06 break-words">{description}</p>}
           </div>
           {dismissable && <IconButton icon="close" label="Close" size="sm" onClick={onClose} className="-mr-2 -mt-1" />}
         </div>
-        <div className="flex-1 overflow-y-auto scroll-thin px-5 sm:px-6 py-5">{children}</div>
-        {footer && <div className="flex flex-col-reverse sm:flex-row sm:justify-end gap-2 px-5 sm:px-6 py-4 border-t border-jj-gray-02 bg-jj-gray-01 rounded-b-none sm:rounded-b-2xl pb-[max(1rem,env(safe-area-inset-bottom))]">{footer}</div>}
+        <div className="flex-1 overflow-y-auto scroll-thin px-6 sm:px-7 py-6">{children}</div>
+        {footer && <div className="flex flex-col-reverse sm:flex-row sm:justify-end gap-2 px-6 sm:px-7 py-4 border-t border-jj-gray-02 bg-[#faf9f7] rounded-b-none sm:rounded-b-[28px] pb-[max(1rem,env(safe-area-inset-bottom))]">{footer}</div>}
       </div>
     </div>,
     document.body,
@@ -558,12 +621,12 @@ export function Drawer({ open, onClose, title, description, children, footer, wi
   if (!open) return null;
   return createPortal(
     <div className="fixed inset-0 z-[70] flex justify-end">
-      <div className="absolute inset-0 bg-jj-gray-08/40 animate-fade-in" onClick={onClose} aria-hidden="true" />
+      <div className="absolute inset-0 bg-[#1f1b18]/40 backdrop-blur-[2px] animate-fade-in" onClick={onClose} aria-hidden="true" />
       <div ref={ref} role="dialog" aria-modal="true" aria-labelledby={titleId} tabIndex={-1}
-        className={cx('relative h-full w-full bg-white shadow-overlay flex flex-col animate-drawer-in outline-none', width)}>
+        className={cx('relative h-full w-full bg-white shadow-overlay flex flex-col animate-drawer-in outline-none sm:rounded-l-[28px] overflow-hidden', width)}>
         <div className="flex items-start justify-between gap-4 px-5 py-4 border-b border-jj-gray-02 pt-[max(1rem,env(safe-area-inset-top))]">
           <div className="min-w-0">
-            <h2 id={titleId} className="font-johnson-display text-lg text-jj-gray-08 truncate">{title}</h2>
+            <h2 id={titleId} className="font-johnson-display text-xl tracking-[-0.02em] text-jj-gray-08 truncate">{title}</h2>
             {description && <p className="font-johnson-text text-xs text-jj-gray-06 truncate">{description}</p>}
           </div>
           <IconButton icon="close" label="Close" size="sm" onClick={onClose} className="-mr-2" />
@@ -596,7 +659,7 @@ export function Menu({ trigger, children, align = 'right', className, open, onOp
     <div ref={ref} className="relative">
       {trigger}
       {open && (
-        <div role="menu" className={cx('absolute z-50 mt-2 min-w-[14rem] max-w-[calc(100vw-2rem)] bg-white rounded-xl border border-jj-gray-02 shadow-overlay py-1 animate-pop-in', align === 'right' ? 'right-0' : 'left-0', className)}>
+        <div role="menu" className={cx('absolute z-50 mt-2 min-w-[14rem] max-w-[calc(100vw-2rem)] bg-white rounded-2xl border border-jj-gray-02 shadow-overlay p-1.5 animate-pop-in', align === 'right' ? 'right-0' : 'left-0', className)}>
           {children}
         </div>
       )}
@@ -607,7 +670,7 @@ export function Menu({ trigger, children, align = 'right', className, open, onOp
 export function MenuItem({ children, onClick, active, tone, title }) {
   return (
     <button type="button" role="menuitem" onClick={onClick} title={title}
-      className={cx('w-full text-left px-4 py-2 font-johnson-text text-sm transition-colors focus-ring-inset',
+      className={cx('w-full text-left px-3 py-2 rounded-xl font-johnson-text text-sm transition-colors focus-ring-inset',
         tone === 'danger' ? 'text-jj-red hover:bg-red-50' : 'text-jj-gray-07 hover:bg-jj-gray-01',
         active && 'text-jj-red font-semibold')}>
       {children}
@@ -648,7 +711,7 @@ export function FeedbackProvider({ children }) {
         <div aria-live="polite" className="fixed z-[80] bottom-4 right-4 left-4 sm:left-auto flex flex-col gap-2 items-stretch sm:items-end pointer-events-none pb-[env(safe-area-inset-bottom)]">
           {toasts.map((t) => (
             <div key={t.id} role={t.tone === 'error' ? 'alert' : 'status'}
-              className="pointer-events-auto flex items-start gap-3 sm:min-w-[18rem] sm:max-w-sm bg-jj-gray-08 text-white rounded-xl shadow-overlay px-4 py-3 animate-toast-in">
+              className="pointer-events-auto flex items-start gap-3 sm:min-w-[18rem] sm:max-w-sm bg-[#1f1b18]/95 backdrop-blur text-white rounded-2xl shadow-overlay px-4 py-3.5 animate-toast-in">
               <Icon name={t.tone === 'error' ? 'alert' : t.tone === 'success' ? 'check' : 'info'}
                 className={cx('w-4 h-4 mt-0.5', t.tone === 'error' ? 'text-red-300' : t.tone === 'success' ? 'text-jj-green-01' : 'text-jj-blue-01')} />
               <p className="flex-1 font-johnson-text text-sm break-words">{t.message}</p>
@@ -669,7 +732,7 @@ export function FeedbackProvider({ children }) {
             </Button>
           </>
         )}>
-        <p className="font-johnson-text text-sm text-jj-gray-07 break-words">{confirmState?.message}</p>
+        <p className="font-johnson-text font-light text-[15px] leading-relaxed text-jj-gray-07 break-words">{confirmState?.message}</p>
       </Modal>
     </FeedbackContext.Provider>
   );

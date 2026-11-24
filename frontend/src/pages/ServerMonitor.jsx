@@ -3,11 +3,11 @@ import { Navigate, useSearchParams } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 import { apiJson } from '../utils/apiClient';
 import { logAuditEvent } from '../utils/auditLog';
-import { Alert, Button, LoadingBlock, Tabs, usePolling } from '../components/ui';
+import { Alert, Button, LoadingBlock, Page, PageHeader, Tabs, usePolling } from '../components/ui';
 import EPodAgentPage from './EPodAgentPage';
 
 const STATUS_POLL_MS = 10_000;
-const DOT = { online: '#328714', offline: '#eb1700', unknown: '#cbc4bc' };
+const DOT = { online: '#328714', offline: '#857a73', unknown: '#eb1700' };
 
 const ENVIRONMENTS = [
   { id: 'rimdocs-dev', product: 'rimdocs', label: 'DEV' },
@@ -88,27 +88,26 @@ export default function ServerMonitor() {
     dot: e.configured ? DOT[status[e.id] || 'unknown'] : DOT.unknown,
   }));
 
-  return (
-    <div className="flex flex-col min-h-full">
-      <div className="sticky top-0 z-20 bg-white border-b border-jj-gray-02">
-        <div className="flex flex-col gap-2 md:flex-row md:items-center px-3 sm:px-6 pt-3 md:pt-0">
-          {products.length > 1 && (
-            <Tabs variant="pill" label="Product" value={active.product}
-              tabs={products.map((p) => ({ id: p.id, label: p.label }))}
-              onChange={(pid) => select(firstOf(pid).id)} className="self-start shrink-0 md:mr-4 md:my-2" />
-          )}
-          <Tabs label="Environment" tabs={envTabs} value={active.id} onChange={select} className="border-b-0 -mx-1 md:mx-0" />
-        </div>
-      </div>
-      {active.configured ? (
-        <EPodAgentPage key={active.id} agentId={active.id} title={names[active.id] || active.title} canControl={active.can_control} />
-      ) : (
-        <div className="p-4 sm:p-6 lg:p-8">
-          <Alert tone="info" title={`${active.title} has no agent configured`}>
-            Set {active.id.toUpperCase().replace('-', '_AGENT_')}_URL and _TOKEN on the backend to enable this environment.
-          </Alert>
-        </div>
+  const switcher = (
+    <>
+      {products.length > 1 && (
+        <Tabs variant="pill" label="Product" value={active.product}
+          tabs={products.map((p) => ({ id: p.id, label: p.label }))}
+          onChange={(pid) => select(firstOf(pid).id)} />
       )}
-    </div>
+      {envTabs.length > 1 && <Tabs variant="pill" label="Environment" tabs={envTabs} value={active.id} onChange={select} />}
+    </>
   );
+  if (!active.configured) {
+    return (
+      <Page>
+        <PageHeader title="Extraction" accent="pipelines." chips={switcher}
+          description="Start, stop and follow every extraction agent stage by stage, straight from its live terminal stream." />
+        <Alert tone="info" title={`${active.title} has no agent configured`}>
+          Set {active.id.toUpperCase().replace('-', '_AGENT_')}_URL and _TOKEN on the backend to enable this environment.
+        </Alert>
+      </Page>
+    );
+  }
+  return <EPodAgentPage key={active.id} agentId={active.id} title={names[active.id] || active.title} canControl={active.can_control} chips={switcher} />;
 }

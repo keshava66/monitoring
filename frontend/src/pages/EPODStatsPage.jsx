@@ -5,9 +5,10 @@ import { useRBAC } from '../context/RBACContext';
 import { useAuth } from '../context/AuthContext';
 import { logAuditEvent } from '../utils/auditLog';
 import { apiJson, isAbort, streamNdjson } from '../utils/apiClient';
+import { RingGauge } from '../components/HeroArt';
 import {
   Alert, Button, Dot, EmptyState, KpiGrid, KpiTile, Page, PageHeader, Panel, ProgressBar, Section, Select, Skeleton,
-  SortTh, TableShell, Tabs, Td, Toggle, cx, fmtCompact, fmtNum, fmtPct, usePolling, useSortedRows,
+  SortTh, StatusChip, TableShell, Tabs, Td, Toggle, cx, fmtCompact, fmtNum, fmtPct, usePolling, useSortedRows,
 } from '../components/ui';
 
 const REFRESH_MS = 5 * 60 * 1000;
@@ -115,7 +116,7 @@ function SizePanels({ rows, skeletons }) {
   return (
     <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4 gap-4">
       {rows.map((t) => (
-        <div key={t.table} className="bg-white rounded-xl border border-jj-gray-02 shadow-card p-4 sm:p-5">
+        <div key={t.table} className="surface p-4 sm:p-5">
           <p className="flex items-center gap-2 font-johnson-display text-base text-jj-gray-08 truncate"><Dot color={t.color} />{t.label}</p>
           <div className="mt-3 flex items-baseline justify-between font-johnson-text text-xs text-jj-gray-06">
             <span>Ingested by size</span><span className="font-semibold text-jj-gray-08 tabular-nums">{fmtPct(t.sizes.pct_ingested)}</span>
@@ -137,7 +138,7 @@ function SizePanels({ rows, skeletons }) {
         </div>
       ))}
       {Array.from({ length: skeletons }).map((_, i) => (
-        <div key={`sk-${i}`} className="bg-white rounded-xl border border-jj-gray-02 p-5 flex flex-col gap-3">
+        <div key={`sk-${i}`} className="surface p-5 flex flex-col gap-3">
           <Skeleton className="h-5 w-32" /><Skeleton className="h-2 w-full" />
           <div className="grid grid-cols-2 gap-3">{[0, 1, 2, 3].map((j) => <Skeleton key={j} className="h-8 w-full" />)}</div>
         </div>
@@ -181,8 +182,8 @@ function TimelineTable({ rows, unit, skeletons }) {
               </Td>
               <Td>
                 {notStarted ? <span className="text-jj-gray-05">Not started</span>
-                  : r.counts.running ? <span className="inline-flex items-center gap-1.5 text-jj-blue-03 font-semibold"><Dot color="#0f68b2" pulse className="w-2 h-2" />In progress</span>
-                    : <span className="inline-flex items-center gap-1.5 text-jj-green-03 font-semibold"><Dot color="#328714" className="w-2 h-2" />Complete</span>}
+                  : r.counts.running ? <span className="inline-flex items-center gap-1.5 whitespace-nowrap text-jj-blue-03 font-semibold"><Dot color="#0f68b2" pulse className="w-2 h-2" />In progress</span>
+                    : <span className="inline-flex items-center gap-1.5 whitespace-nowrap text-jj-green-03 font-semibold"><Dot color="#328714" className="w-2 h-2" />Complete</span>}
               </Td>
               <Td align="right" className="font-semibold text-jj-gray-08 whitespace-nowrap">{notStarted ? '—' : r.timeline.duration}</Td>
               <Td align="right" className="whitespace-nowrap">{r.rate != null ? `${fmtNum(Math.round(r.rate))}${RATE[unit][1]}` : '—'}</Td>
@@ -258,7 +259,7 @@ function Charts({ bar, donut, loading }) {
 
 // ── Product tab ───────────────────────────────────────────────────────────────
 
-function ProductStats({ product }) {
+function ProductStats({ product, switcher }) {
   const { user } = useAuth();
   const email = user?.email;
   const [tables, setTables] = useState([]);
@@ -317,9 +318,22 @@ function ProductStats({ product }) {
   return (
     <Page>
       <PageHeader
-        icon="database"
         title={product.title}
-        description={product.subtitle}
+        accent="in flight."
+        description={`${product.subtitle}, read straight from the production database.`}
+        chips={(
+          <>
+            {switcher}
+            {summary && (stalls.length
+              ? <StatusChip color="#e8a317" live>{stalls.length} stalled {stalls.length === 1 ? 'table' : 'tables'}</StatusChip>
+              : <StatusChip color="#328714" live={!!k?.running}>{k?.running ? 'Ingesting now' : 'Idle'}</StatusChip>)}
+          </>
+        )}
+        art={(
+          <RingGauge color="#328714" value={k?.success_pct} loading={loadingKpis} center={k ? `${k.success_pct}%` : '—'} sub="ingested"
+            caption={k ? `${k.success_pct}% of ${fmtNum(k.total_docs)} documents ingested` : undefined}
+            segments={summary?.chart_donut ? Object.entries(STATUS).map(([key, v]) => ({ label: v.label, color: v.color, value: summary.chart_donut[key] || 0 })) : []} />
+        )}
         meta={updatedAt ? `updated ${updatedAt.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', second: '2-digit' })}` : null}
         actions={(
           <>
@@ -384,12 +398,10 @@ export default function IngestionStatsPage() {
 
   return (
     <div className="flex flex-col min-h-full">
-      {products.length > 1 && (
-        <div className="sticky top-0 z-20 bg-white border-b border-jj-gray-02 px-2 sm:px-6">
-          <Tabs label="Product" tabs={products.map((p) => ({ id: p.id, label: p.label }))} value={active.id} onChange={change} className="border-b-0" />
-        </div>
-      )}
-      <ProductStats key={active.id} product={active} />
+      <ProductStats key={active.id} product={active}
+        switcher={products.length > 1 && (
+          <Tabs variant="pill" label="Product" tabs={products.map((p) => ({ id: p.id, label: p.label }))} value={active.id} onChange={change} />
+        )} />
     </div>
   );
 }

@@ -5,8 +5,9 @@ import { useAuth } from '../context/AuthContext';
 import { ApiError, requestJson } from '../utils/apiClient';
 import { logAuditEvent } from '../utils/auditLog';
 import {
-  Alert, Badge, Button, Dot, EmptyState, Icon, Menu, MenuItem, Page, PageHeader, ProgressBar, Tabs, cx, useFeedback, usePolling,
+  Alert, Badge, Button, Dot, EmptyState, Icon, Menu, MenuItem, Page, PageHeader, ProgressBar, StatusChip, Tabs, cx, useFeedback, usePolling,
 } from '../components/ui';
+import { ServicePulse } from '../components/HeroArt';
 
 const Terminal = lazy(() => import('./Terminal'));
 
@@ -40,14 +41,16 @@ function ServiceCard({ svc, config, status, stats, busy, canAdmin, onAction, dir
   const st = STATE[status] || STATE.loading;
   const [menuOpen, setMenuOpen] = useState(false);
   return (
-    <div className="bg-white rounded-xl border border-jj-gray-02 shadow-card flex flex-col">
-      <div className="flex items-start gap-3 p-4 sm:p-5">
-        <span className="w-11 h-11 rounded-xl bg-jj-gray-01 border border-jj-gray-02 text-jj-gray-07 flex items-center justify-center flex-shrink-0">
+    <div className="group relative overflow-hidden surface flex flex-col transition-[box-shadow,transform] duration-500 ease-out hover:-translate-y-0.5 hover:shadow-lift">
+      <div className="relative flex items-start gap-4 p-5 sm:p-6">
+        <span className="relative w-12 h-12 rounded-2xl grid place-items-center flex-shrink-0 text-white"
+          style={{ background: `linear-gradient(140deg, ${st.color}, color-mix(in srgb, ${st.color} 70%, #000))`, boxShadow: `0 14px 28px -14px ${st.color}` }}>
+          {status === 'running' && <span className="absolute -inset-1 rounded-[1.1rem] border animate-ring" style={{ borderColor: st.color }} />}
           <Icon name={svc.icon} className="w-5 h-5" />
         </span>
         <div className="flex-1 min-w-0">
           <div className="flex flex-wrap items-center gap-2">
-            <p className="font-johnson-display text-lg text-jj-gray-08 truncate">{config.name || svc.label}</p>
+            <p className="font-johnson-display font-medium text-xl tracking-[-0.01em] text-jj-gray-08 truncate">{config.name || svc.label}</p>
             <Badge tone={st.tone}><Dot color={st.color} pulse={status === 'running'} className="w-1.5 h-1.5" />{st.label}</Badge>
           </div>
           {canAdmin && dirOptions.length > 0 ? (
@@ -71,12 +74,12 @@ function ServiceCard({ svc, config, status, stats, busy, canAdmin, onAction, dir
           )}
         </div>
       </div>
-      <dl className="grid grid-cols-3 gap-3 px-4 sm:px-5 font-johnson-text">
+      <dl className="relative grid grid-cols-3 gap-px mx-5 sm:mx-6 rounded-2xl overflow-hidden bg-jj-gray-02 border border-jj-gray-02 font-johnson-text">
         {[['Port', config.port], ['PID', stats.pid], ['Uptime', stats.uptime]].map(([k, v]) => (
-          <div key={k} className="min-w-0"><dt className="text-xs text-jj-gray-06">{k}</dt><dd className="mt-0.5 text-sm font-semibold text-jj-gray-08 tabular-nums truncate">{v || '—'}</dd></div>
+          <div key={k} className="min-w-0 bg-[#fbfaf8] px-3.5 py-3"><dt className="text-[12px] font-medium text-jj-gray-06">{k}</dt><dd className="mt-1 font-johnson-display font-light text-xl leading-none text-jj-gray-08 tabular-nums truncate">{v || '—'}</dd></div>
         ))}
       </dl>
-      <div className="grid grid-cols-2 gap-4 px-4 sm:px-5 mt-4">
+      <div className="relative grid grid-cols-2 gap-5 px-5 sm:px-6 mt-5">
         {[['CPU', stats.cpu, '#0f68b2'], ['Memory', stats.mem, '#8c3bbb']].map(([k, v, c]) => (
           <div key={k}>
             <div className="flex justify-between font-johnson-text text-xs"><span className="text-jj-gray-06">{k}</span><span className="text-jj-gray-08 tabular-nums">{v != null ? `${v}%` : '—'}</span></div>
@@ -84,7 +87,7 @@ function ServiceCard({ svc, config, status, stats, busy, canAdmin, onAction, dir
           </div>
         ))}
       </div>
-      <div className="mt-auto flex flex-wrap gap-2 p-4 sm:p-5">
+      <div className="relative mt-auto flex flex-wrap gap-2 p-5 sm:p-6">
         {canAdmin && (status === 'running' ? (
           <>
             <Button size="sm" icon="sync" onClick={() => onAction(svc.id, 'restart')} loading={busy === 'restart'} disabled={!!busy}>Restart</Button>
@@ -232,11 +235,25 @@ function ServerPanel({ server, tabs }) {
 
   return (
     <Page>
-      <PageHeader icon="server" title="Server control" description={server.alias}
-        meta={lastSync ? `synced ${lastSync.toLocaleTimeString('en-US')}` : 'syncing…'}
-        actions={(
+      <PageHeader title="Server" accent="control."
+        description={`Start, stop and deploy the monitoring services on ${server.alias}, then follow every command live.`}
+        chips={(
           <>
             {tabs}
+            <StatusChip color={Object.values(statuses).includes('error') ? '#eb1700' : '#328714'} live={!!lastSync}>
+              {lastSync ? `Synced ${lastSync.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', second: '2-digit' })}` : 'Syncing…'}
+            </StatusChip>
+          </>
+        )}
+        art={(
+          <ServicePulse services={SERVICES.map((svc) => {
+            const st = STATE[statuses[svc.id]] || STATE.loading;
+            const x = stats[svc.id] || {};
+            return { id: svc.id, label: (config[svc.id] || {}).name || svc.label, color: st.color, state: st.label, cpu: x.cpu, mem: x.mem, uptime: x.uptime, live: statuses[svc.id] === 'running' };
+          })} />
+        )}
+        actions={(
+          <>
             {canAdmin && <Button icon="server" onClick={() => setTerminal(true)}>Terminal</Button>}
             {canAdmin && (
               <div className="flex">
@@ -267,26 +284,35 @@ function ServerPanel({ server, tabs }) {
 
       {panelError && <Alert tone="error" title={`Can’t reach ${server.alias} fully`}>{panelError}</Alert>}
 
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-5 stagger">
         {SERVICES.map((svc) => (
           <ServiceCard key={svc.id} svc={svc} config={config[svc.id] || {}} status={statuses[svc.id]} stats={stats[svc.id] || {}}
             busy={busy[svc.id]} canAdmin={canAdmin} onAction={runAction} dirOptions={dirs[svc.id] || []} onChangeDir={changeDir} />
         ))}
       </div>
 
-      <section className="bg-white rounded-xl border border-jj-gray-02 shadow-card overflow-hidden">
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 px-2 sm:px-3 border-b border-jj-gray-02">
-          <Tabs label="Activity" value={activity} onChange={setActivity} className="border-b-0"
+      <section className="surface overflow-hidden">
+        <div className="flex items-center justify-between gap-2 pl-1 pr-3 sm:px-4 border-b border-jj-gray-02">
+          <Tabs label="Activity" value={activity} onChange={setActivity} className="border-b-0 min-w-0"
             tabs={[{ id: 'console', label: 'Console' }, ...SERVICES.map((s) => ({ id: s.id, label: `${s.id}.log` }))]} />
-          <div className="px-2 pb-2 sm:pb-0">
+          <div className="shrink-0">
             {activity === 'console'
               ? <Button size="sm" variant="ghost" onClick={() => setConsoleLines([])} disabled={!consoleLines.length}>Clear</Button>
               : <Button size="sm" variant="ghost" icon="refresh" onClick={() => loadLog(activity)}>Reload</Button>}
           </div>
         </div>
-        <div ref={outRef} tabIndex={0} aria-label="Activity output" className="h-80 sm:h-96 overflow-auto terminal-scroll bg-terminal px-4 py-3 font-mono text-xs leading-5 focus-ring-inset">
+        <div ref={outRef} tabIndex={0} aria-label="Activity output"
+          className={cx('overflow-auto terminal-scroll bg-terminal px-5 py-4 font-mono text-xs leading-5 focus-ring-inset', activity === 'console' && consoleLines.length === 0 ? 'h-44' : 'h-80 sm:h-96')}>
           {activity === 'console' ? (
-            consoleLines.length === 0 ? <p className="text-[#8b949e]">Output from start, stop, restart and git pull appears here.</p>
+            consoleLines.length === 0 ? (
+              <div className="h-full flex flex-col items-center justify-center gap-3 text-center font-johnson-text">
+                <span className="flex items-center gap-2 text-[#8b949e] text-[13px]">
+                  <span className="w-2 h-4 bg-[#7ee787] animate-blink" aria-hidden="true" />
+                  Ready for commands
+                </span>
+                <span className="text-[#6e7681] text-xs max-w-sm">Output from start, stop, restart and git pull streams in here as it happens.</span>
+              </div>
+            )
               : consoleLines.map((l) => (
                 <div key={l.id} className={cx('whitespace-pre-wrap break-words',
                   { cmd: 'text-[#79c0ff] font-semibold mt-2 first:mt-0', ok: 'text-[#7ee787]', err: 'text-[#ff7b72]', out: 'text-[#c9d1d9]' }[l.tone])}>{l.text}</div>

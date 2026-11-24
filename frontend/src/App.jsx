@@ -113,7 +113,7 @@ function AppShell() {
   }, [location.pathname]);
 
   return (
-    <div className="flex h-dvh bg-jj-gray-01 overflow-hidden">
+    <div className="flex h-dvh paper overflow-hidden">
       <a href="#main" className="sr-only focus:not-sr-only focus:fixed focus:top-2 focus:left-2 focus:z-[90] focus:px-4 focus:py-2 focus:bg-white focus:rounded-lg focus:shadow-overlay font-johnson-text text-sm">Skip to content</a>
       <Sidebar mobileOpen={navOpen} onMobileClose={closeNav} />
       <div className="flex flex-col flex-1 min-w-0">

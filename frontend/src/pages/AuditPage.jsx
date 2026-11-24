@@ -5,8 +5,9 @@ import { DIRECTORY_SCOPES } from '../msalConfig';
 import { logAuditEvent } from '../utils/auditLog';
 import { apiFetch, apiJson, downloadBlob, errorMessage, graphDisplayName, graphPhoto, isAbort, mapLimit } from '../utils/apiClient';
 import { Avatar } from '../components/Header';
+import { ClockDial } from '../components/HeroArt';
 import {
-  Alert, Badge, Button, Drawer, EmptyState, Icon, IconButton, KpiGrid, KpiTile, Page, PageHeader, SearchInput, Select, Skeleton, Tabs, TextField,
+  Alert, Badge, Button, Drawer, EmptyState, Icon, IconButton, KpiGrid, KpiTile, Page, PageHeader, SearchInput, Select, Skeleton, StatusChip, Tabs, TextField,
   cx, fmtNum, formatDateTime, relativeTime, useDebouncedValue, useFeedback, usePolling,
 } from '../components/ui';
 
@@ -231,7 +232,15 @@ export default function AuditPage({ editable = false, forceSilent = false }) {
 
   return (
     <Page>
-      <PageHeader icon="audit" title="Audit log" description="Every sign-in, role change and operational action across the platform."
+      <PageHeader title="Every action," accent="on the record."
+        description="Sign-ins, role changes and every operational action across the platform. Search it, slice it, export it."
+        chips={(
+          <>
+            <StatusChip color="#328714" live>Recording · live</StatusChip>
+            {active && <StatusChip color="#8c3bbb">{fmtNum(active.count)} active now</StatusChip>}
+          </>
+        )}
+        art={<ClockDial count={fmtNum(stats?.today)} label="Events today" loading={!stats} />}
         actions={(
           <>
             <Button icon="refresh" onClick={() => { fetchLogs(page); fetchMeta(); }} loading={loading}>Refresh</Button>
@@ -249,15 +258,15 @@ export default function AuditPage({ editable = false, forceSilent = false }) {
         <KpiTile label="Total events" value={fmtNum(stats?.total)} accent="#0f68b2" loading={!stats} />
         <KpiTile label="Today" value={fmtNum(stats?.today)} accent="#328714" loading={!stats} />
         <KpiTile label="Role changes" value={fmtNum(stats?.role_changes)} accent="#eb1700" loading={!stats} />
-        <button type="button" onClick={() => openPeople('all')} className="text-left rounded-xl focus-ring">
+        <button type="button" onClick={() => openPeople('all')} className="text-left rounded-2xl focus-ring">
           <KpiTile label="Unique users" value={fmtNum(stats?.unique_users)} hint="View list" accent="#8c3bbb" loading={!stats} />
         </button>
-        <button type="button" onClick={() => openPeople('active')} className="text-left rounded-xl focus-ring">
+        <button type="button" onClick={() => openPeople('active')} className="text-left rounded-2xl focus-ring">
           <KpiTile label="Active now" value={active ? fmtNum(active.count) : '—'} hint={active ? `in the last ${active.timeout_minutes} min · view` : null} accent="#328714" loading={!active} />
         </button>
       </KpiGrid>
 
-      <div className="bg-white rounded-xl border border-jj-gray-02 shadow-card p-3 sm:p-4 flex flex-col gap-3">
+      <div className="surface p-3 sm:p-4 flex flex-col gap-3 relative z-10">
         <div className="flex flex-col lg:flex-row lg:items-center gap-2 sm:gap-3">
           <SearchInput value={search} onChange={setSearch} placeholder="Search user, action, target or details" className="flex-1 lg:max-w-md" />
           <div className="flex flex-wrap items-center gap-2">
@@ -294,7 +303,7 @@ export default function AuditPage({ editable = false, forceSilent = false }) {
       {error ? (
         <Alert tone="error" title="Couldn’t load audit events" action={<Button size="sm" onClick={() => fetchLogs(page)}>Retry</Button>}>{error}</Alert>
       ) : (
-        <div className="bg-white rounded-xl border border-jj-gray-02 shadow-card overflow-hidden">
+        <div className="surface overflow-hidden">
           {loading && !logs.length ? (
             <div className="divide-y divide-jj-gray-02">{Array.from({ length: 6 }).map((_, i) => <div key={i} className="flex gap-4 p-4"><Skeleton className="h-6 w-28" /><Skeleton className="h-6 flex-1" /></div>)}</div>
           ) : !logs.length ? (

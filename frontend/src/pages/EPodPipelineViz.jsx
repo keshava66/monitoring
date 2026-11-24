@@ -146,6 +146,7 @@ const STATUS_STYLE = {
   active: { label: 'Running', text: 'text-jj-blue-03' },
   done: { label: 'Done', text: 'text-jj-green-03' },
   error: { label: 'Failed', text: 'text-jj-red' },
+  halted: { label: 'Halted', text: 'text-jj-gray-06' },
 };
 
 function StageCard({ node, stage, onOpen }) {
@@ -153,32 +154,41 @@ function StageCard({ node, stage, onOpen }) {
   const active = stage.status === 'active';
   return (
     <button type="button" onClick={() => onOpen(node.id)}
-      className={cx('w-full text-left rounded-xl border bg-white p-3.5 transition-all focus-ring hover:-translate-y-px hover:shadow-overlay',
-        stage.status === 'error' ? 'border-red-300 bg-red-50/50' : active ? 'border-transparent ring-2 shadow-overlay' : 'border-jj-gray-02 shadow-card')}
-      style={active ? { '--tw-ring-color': node.color } : undefined}>
-      <div className="flex items-center justify-between gap-2">
-        <span className="font-johnson-text text-[11px] font-semibold" style={{ color: stage.status === 'idle' ? '#857a73' : node.color }}>{node.step}</span>
-        <span className={cx('inline-flex items-center gap-1.5 font-johnson-text text-[11px] font-semibold', st.text)}>
-          {stage.status !== 'idle' && <Dot color={stage.status === 'error' ? '#eb1700' : stage.status === 'done' ? '#328714' : node.color} pulse={active} className="w-1.5 h-1.5" />}
+      className={cx('group relative w-full h-full overflow-hidden text-left rounded-2xl border bg-white p-4 transition-[transform,box-shadow,border-color] duration-300 ease-out focus-ring hover:-translate-y-0.5 hover:shadow-lift',
+        stage.status === 'error' ? 'border-jj-red/30 bg-[#fff6f4]' : active ? 'border-transparent shadow-lift' : 'border-jj-gray-02 shadow-card')}
+      style={active ? { boxShadow: `0 0 0 2px ${node.color}, 0 24px 44px -26px ${node.color}` } : undefined}>
+      <div className="relative flex items-center justify-between gap-2">
+        <p className="min-w-0 font-johnson-display font-medium text-[15px] text-jj-gray-08 truncate">{node.label}</p>
+        <span className={cx('shrink-0 inline-flex items-center gap-1.5 font-johnson-text text-[12px] font-medium', st.text)}>
+          {stage.status !== 'idle' && <Dot color={stage.status === 'error' ? '#eb1700' : stage.status === 'done' ? '#328714' : stage.status === 'halted' ? '#857a73' : node.color} pulse={active} className="w-1.5 h-1.5" />}
           {st.label}
         </span>
       </div>
-      <p className="mt-1.5 font-johnson-display text-sm text-jj-gray-08 truncate">{node.label}</p>
-      <p className="mt-0.5 font-johnson-text text-xs text-jj-gray-06 leading-snug line-clamp-2 min-h-[2rem]">{node.desc}</p>
-      <ProgressBar value={stage.status === 'idle' ? 0 : stage.pct || (stage.status === 'done' ? 100 : 8)} color={stage.status === 'error' ? '#eb1700' : node.color} className="h-1 mt-2.5" label={`${node.label} progress`} />
+      <p className="relative mt-0.5 font-johnson-text font-light text-xs text-jj-gray-06 leading-snug line-clamp-2 min-h-[2rem]">{node.desc}</p>
+      <ProgressBar value={stage.status === 'idle' ? 0 : stage.pct || (stage.status === 'done' ? 100 : 8)} color={stage.status === 'error' ? '#eb1700' : stage.status === 'halted' ? '#857a73' : node.color} className="relative h-1 mt-3" label={`${node.label} progress`} />
     </button>
   );
 }
 
-function Arrow() {
+function ProgressRing({ pct, done, total }) {
+  const R = 44;
+  const C = 2 * Math.PI * R;
   return (
-    <div className="hidden 2xl:flex items-center justify-center text-jj-gray-04 px-0.5" aria-hidden="true">
-      <Icon name="chevronRight" className="w-4 h-4" />
+    <div className="relative w-28 h-28 flex-shrink-0">
+      <svg viewBox="0 0 100 100" className="w-full h-full -rotate-90" aria-hidden="true">
+        <circle cx="50" cy="50" r={R} fill="none" stroke="#f1efed" strokeWidth="7" />
+        <circle cx="50" cy="50" r={R} fill="none" stroke="#312c2a" strokeWidth="7" strokeLinecap="round" strokeDasharray={C}
+          strokeDashoffset={C * (1 - Math.min(100, pct) / 100)} className="transition-[stroke-dashoffset] duration-1000 ease-out" />
+      </svg>
+      <div className="absolute inset-0 flex flex-col items-center justify-center">
+        <span className="font-johnson-display font-light text-2xl leading-none tabular-nums text-jj-gray-08">{total ? `${Math.round(pct)}%` : '—'}</span>
+        <span className="mt-1 font-johnson-text font-medium text-[11px] text-jj-gray-06">{fmtNum(done)} done</span>
+      </div>
     </div>
   );
 }
 
-export default function EPodPipelineViz({ title, agentId, handlerRef, streamState }) {
+export default function EPodPipelineViz({ title, agentId, handlerRef, streamState, running, onStages }) {
   const { user } = useAuth();
   const [state, dispatch] = useReducer(reducer, undefined, initialState);
   const [selected, setSelected] = useState(null);
@@ -213,7 +223,13 @@ export default function EPodPipelineViz({ title, agentId, handlerRef, streamStat
     ERROR: state.history.filter((h) => h.status === 'ERROR').length,
   }), [state.history]);
 
-  const { queue, doc, stages } = state;
+  const { queue, doc } = state;
+  // A stopped pipeline cannot have running stages: whatever was mid-flight is shown as halted.
+  const stages = useMemo(() => (running === false
+    ? Object.fromEntries(Object.entries(state.stages).map(([k, v]) => [k, v.status === 'active' ? { ...v, status: 'halted' } : v]))
+    : state.stages), [state.stages, running]);
+  useEffect(() => { onStages?.({ nodes: NODES, stages }); }, [stages, onStages]);
+  const halted = running === false && !queue.finished;
   const queuePct = queue.total ? (queue.done / queue.total) * 100 : 0;
   const sel = selected ? { node: NODE[selected], stage: stages[selected] } : null;
 
@@ -221,8 +237,8 @@ export default function EPodPipelineViz({ title, agentId, handlerRef, streamStat
     <div className="p-4 sm:p-6 flex flex-col gap-4 sm:gap-5">
       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
         <div className="flex items-center gap-2 font-johnson-text text-sm text-jj-gray-06">
-          <Dot color={streamState === 'live' ? '#328714' : '#c4a000'} pulse={streamState === 'live'} className="w-2 h-2" />
-          {streamState === 'live' ? 'Following the live terminal stream' : 'Connecting to the live stream…'}
+          <Dot color={running === false ? '#857a73' : streamState === 'live' ? '#328714' : '#c4a000'} pulse={running !== false && streamState === 'live'} className="w-2 h-2" />
+          {running === false ? 'Pipeline stopped · showing the last run' : streamState === 'live' ? 'Following the live terminal stream' : 'Connecting to the live stream…'}
         </div>
         <div className="flex items-center gap-2">
           <Button size="sm" variant={showConsole ? 'dark' : 'secondary'} onClick={() => { setShowConsole(!showConsole); audit(`${showConsole ? 'Hid' : 'Opened'} stream console`); }}>
@@ -232,10 +248,10 @@ export default function EPodPipelineViz({ title, agentId, handlerRef, streamStat
         </div>
       </div>
 
-      {state.rateLimit && <div role="status" className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-2.5 font-johnson-text text-sm text-amber-900">{state.rateLimit}</div>}
+      {state.rateLimit && <div role="status" className="rounded-2xl border border-amber-300/50 bg-[#fffaf0] px-4 py-3 font-johnson-text text-sm text-amber-900">{state.rateLimit}</div>}
 
       {showConsole && (
-        <div className="rounded-xl overflow-hidden border border-jj-gray-08 bg-terminal">
+        <div className="rounded-2xl overflow-hidden border border-jj-gray-08 bg-terminal shadow-lift">
           <div className="flex items-center justify-between px-4 py-2 border-b border-white/10">
             <span className="font-mono text-xs text-[#8b949e]">terminal stream · last {state.raw.length} lines</span>
             <Toggle checked={tail} onChange={setTail} label={<span className="text-[#c9d1d9] text-xs">Follow</span>} />
@@ -264,35 +280,22 @@ export default function EPodPipelineViz({ title, agentId, handlerRef, streamStat
           ) : <p className="font-johnson-text text-sm text-jj-gray-06">No document in progress yet.</p>}
         </Panel>
         <Panel title="Run progress" bodyClassName="pt-3">
-          <div className="flex items-baseline justify-between gap-3 font-johnson-text">
-            <p className="text-sm text-jj-gray-08"><span className="font-johnson-display text-2xl tabular-nums">{fmtNum(queue.done)}</span> <span className="text-jj-gray-06">of {fmtNum(queue.total)} documents</span></p>
-            <p className="text-xs text-jj-gray-06 text-right">
-              {queue.finished ? 'Run complete' : queue.rate ? <>{queue.rate} docs/s · ETA {queue.eta}</> : 'Waiting for progress'}
-            </p>
+          <div className="flex items-center gap-5">
+            <ProgressRing pct={queue.finished ? 100 : queuePct} done={queue.done} total={queue.total} />
+            <div className="min-w-0 font-johnson-text">
+              <p className="text-sm text-jj-gray-06"><span className="font-johnson-display font-light text-3xl text-jj-gray-08 tabular-nums">{fmtNum(queue.done)}</span> of {fmtNum(queue.total)} documents</p>
+              <p className="mt-1.5 text-xs text-jj-gray-06">
+                {queue.finished ? 'Run complete' : halted ? 'Stopped before the run finished' : queue.rate ? <>{queue.rate} docs/s · ETA {queue.eta}</> : 'Waiting for progress'}
+              </p>
+              {queue.skipped > 0 && <p className="mt-1 text-xs text-jj-gray-05">{fmtNum(queue.skipped)} already ingested and skipped</p>}
+            </div>
           </div>
-          <ProgressBar value={queue.finished ? 100 : queuePct} color="#eb1700" className="h-2 mt-3" label="Run progress" />
-          {queue.skipped > 0 && <p className="mt-2 font-johnson-text text-xs text-jj-gray-06">{fmtNum(queue.skipped)} already ingested and skipped</p>}
         </Panel>
       </div>
 
-      <Panel title="Stages" bodyClassName="pt-3">
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-3 2xl:gap-0 2xl:grid-cols-[1fr_auto_1fr_auto_1fr_auto_1fr_auto_1fr_auto_1fr_auto_1fr] 2xl:items-center">
-          <StageCard node={NODE.start} stage={stages.start} onOpen={setSelected} />
-          <Arrow />
-          <StageCard node={NODE.pdf} stage={stages.pdf} onOpen={setSelected} />
-          <Arrow />
-          <div className="contents 2xl:grid 2xl:grid-cols-1 2xl:gap-2">
-            <StageCard node={NODE.ocr} stage={stages.ocr} onOpen={setSelected} />
-            <StageCard node={NODE.tables} stage={stages.tables} onOpen={setSelected} />
-          </div>
-          <Arrow />
-          <StageCard node={NODE.chunk} stage={stages.chunk} onOpen={setSelected} />
-          <Arrow />
-          <StageCard node={NODE.embed} stage={stages.embed} onOpen={setSelected} />
-          <Arrow />
-          <StageCard node={NODE.db} stage={stages.db} onOpen={setSelected} />
-          <Arrow />
-          <StageCard node={NODE.end} stage={stages.end} onOpen={setSelected} />
+      <Panel title="Stages" bodyClassName="pt-4">
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+          {NODES.map((node) => <StageCard key={node.id} node={node} stage={stages[node.id]} onOpen={setSelected} />)}
         </div>
       </Panel>
 

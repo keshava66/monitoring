@@ -5,14 +5,15 @@ import {
 } from 'recharts';
 import { useAuth } from '../context/AuthContext';
 import { apiJson, isAbort } from '../utils/apiClient';
+import { RingGauge } from '../components/HeroArt';
 import { logAuditEvent } from '../utils/auditLog';
 import {
-  Alert, Button, EmptyState, KpiGrid, KpiTile, Page, PageHeader, Panel, SearchInput, Skeleton, SortTh, TableShell, Tabs, Td, Toggle,
+  Alert, Button, EmptyState, KpiGrid, KpiTile, Page, PageHeader, Panel, SearchInput, Skeleton, SortTh, StatusChip, TableShell, Tabs, Td, Toggle,
   fmtBytes, fmtCompact, fmtNum, useDebouncedValue, usePolling, useSortedRows,
 } from '../components/ui';
 
 const REFRESH_MS = 30_000;
-const C = { pdf: '#eb1700', xml: '#0f68b2', other: '#857a73' };
+const C = { pdf: '#8c3bbb', xml: '#0f68b2', other: '#a39992' };
 const TABS = [
   { id: 'folders', label: 'Segments' },
   { id: 'overview', label: 'Overview' },
@@ -24,7 +25,7 @@ const AXIS = { fontSize: 11, fill: '#6e6259' };
 const truncate = (s, n = 18) => (s && s.length > n ? `${s.slice(0, n - 1)}…` : s);
 
 function ChartSkeleton({ h = 'h-64' }) {
-  return <div className="bg-white rounded-xl border border-jj-gray-02 p-5"><Skeleton className={`${h} w-full`} /></div>;
+  return <div className="surface p-5"><Skeleton className={`${h} w-full`} /></div>;
 }
 
 function Overview({ data, loading }) {
@@ -326,9 +327,25 @@ export default function NasScannerPage() {
 
   return (
     <Page>
-      <PageHeader icon="archive" title="EPOD NAS scanner"
-        description={<span className="font-mono text-xs break-all">{overview?.base_prefix || '\\\\jnj.com\\grausdfsroot\\ERIS\\EPOD\\Archive\\eCTD'}</span>}
-        meta={updated ? `refreshed ${updated.toLocaleTimeString('en-US')}` : null}
+      <PageHeader title="The EPOD archive," accent="at a glance."
+        description={<>Every eCTD segment on the NAS, its file mix and its weight. <span className="font-mono text-xs text-jj-gray-05">{(overview?.base_prefix || '\\\\jnj.com\\grausdfsroot\\ERIS\\EPOD\\Archive\\eCTD').split('\\').map((part, i, all) => (
+          <React.Fragment key={i}>{part}{i < all.length - 1 && <>{'\\'}<wbr /></>}</React.Fragment>
+        ))}</span></>}
+        chips={(
+          <>
+            <StatusChip color="#0f68b2" live={busy}>{busy ? 'Scanning…' : updated ? `Refreshed ${updated.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' })}` : 'Waiting'}</StatusChip>
+            {k && <StatusChip color="#8c3bbb">{fmtNum(k.segments)} segments</StatusChip>}
+          </>
+        )}
+        art={(
+          <RingGauge loading={loading.overview && !k} value={k?.total_files ? (k.pdf_files / k.total_files) * 100 : 0}
+            center={k?.total_size || '—'} sub="archived" caption={k ? `${k.total_size} across ${fmtNum(k.total_files)} files` : undefined}
+            segments={k ? [
+              { label: 'PDF', color: C.pdf, value: k.pdf_files },
+              { label: 'XML', color: C.xml, value: k.xml_files },
+              { label: 'Other', color: C.other, value: k.other_files },
+            ] : []} />
+        )}
         actions={(
           <>
             <SearchInput value={search} onChange={setSearch} placeholder="Filter segments" className="w-full sm:w-56" />
@@ -339,7 +356,7 @@ export default function NasScannerPage() {
       />
       {error && <Alert tone="error" title="Some data failed to load" action={<Button size="sm" onClick={refresh}>Retry</Button>}>{error}</Alert>}
 
-      <KpiGrid className="sm:grid-cols-3 xl:grid-cols-6">
+      <KpiGrid className="sm:grid-cols-3 2xl:grid-cols-6">
         <KpiTile label="Segments" value={fmtNum(k?.segments)} accent="#0f68b2" loading={loading.overview && !k} />
         <KpiTile label="Total files" value={fmtCompact(k?.total_files)} hint={fmtNum(k?.total_files)} loading={loading.overview && !k} />
         <KpiTile label="PDF files" value={fmtCompact(k?.pdf_files)} hint={k?.pdf_size} accent={C.pdf} loading={loading.overview && !k} />
