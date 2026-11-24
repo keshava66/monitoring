@@ -3,7 +3,8 @@ import { useLocation } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 import { useRBAC } from '../context/RBACContext';
 import { useProfilePhoto } from '../context/ProfilePhotoContext';
-import { Icon, Menu, MenuItem, Badge } from './ui';
+import { Icon, Menu, MenuItem, MenuToggle, Badge } from './ui';
+import { saveReducedMotion, useReducedMotion } from '../utils/motion';
 import { PAGE_TITLES } from '../navigation';
 
 export function Avatar({ src, name, className = 'w-8 h-8' }) {
@@ -38,6 +39,7 @@ function LiveClock() {
 
 /** Sticky app bar: navigation toggle (mobile), page title, user menu. */
 export default function Header({ onMenuClick }) {
+  const reduceMotion = useReducedMotion();
   const { user, logout } = useAuth();
   const { roleName, roleColor } = useRBAC();
   const { profilePhoto } = useProfilePhoto();
@@ -80,6 +82,10 @@ export default function Header({ onMenuClick }) {
             <p className="font-johnson-text text-xs text-jj-gray-05 truncate">{user?.email}</p>
             <Badge color={roleColor} className="mt-1.5">{roleName}</Badge>
           </div>
+        </div>
+        <div role="group" aria-label="Preferences" className="pb-1 mb-1 border-b border-jj-gray-02">
+          <p className="px-3 pt-1 pb-1 font-johnson-text text-xs text-jj-gray-06">Preferences</p>
+          <MenuToggle label="Reduce motion" hint="Calmer pages, fewer animations" checked={reduceMotion} onChange={saveReducedMotion} />
         </div>
         <MenuItem tone="danger" onClick={() => { setOpen(false); logout(); }}>
           <span className="flex items-center gap-2"><Icon name="logout" className="w-4 h-4" />Sign out</span>

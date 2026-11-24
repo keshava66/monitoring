@@ -401,6 +401,20 @@ def test_heartbeat_and_active_users():
     assert any(u["email"] == "ops@corp.com" for u in users["users"])
 
 
+def test_preferences_are_per_user_and_merge():
+    assert client.get("/api/audit/preferences").status_code == 401
+    assert client.get("/api/audit/preferences", headers=VIEWER).json() == {"preferences": {}}
+    resp = client.put("/api/audit/preferences", headers=VIEWER, json={"reduce_motion": True})
+    assert resp.status_code == 200 and resp.json()["preferences"]["reduce_motion"] is True
+    # Omitted fields leave saved values alone; other people are unaffected.
+    client.put("/api/audit/preferences", headers=VIEWER, json={})
+    assert client.get("/api/audit/preferences", headers=VIEWER).json()["preferences"] == {"reduce_motion": True}
+    assert client.get("/api/audit/preferences", headers=OPS).json()["preferences"] == {}
+    assert client.put("/api/audit/preferences", headers=VIEWER, json={"reduce_motion": "sometimes"}).status_code == 422
+    client.put("/api/audit/preferences", headers=VIEWER, json={"reduce_motion": False})
+    assert client.get("/api/audit/preferences", headers=VIEWER).json()["preferences"]["reduce_motion"] is False
+
+
 # ============================================================================
 # Agent proxy
 # ============================================================================

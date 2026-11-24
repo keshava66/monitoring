@@ -229,7 +229,7 @@ export default function Dashboard() {
         )}
       </header>
 
-      <Section title="Your" accent="toolkit." description={`${tools.length} ${tools.length === 1 ? 'tool' : 'tools'} for the ${roleName} role, with a live reading from each.`}>
+      <Section title="Your" accent="toolkit." description={tools.length ? `${tools.length} ${tools.length === 1 ? 'tool' : 'tools'} for the ${roleName} role, with a live reading from each.` : `Nothing is assigned to the ${roleName} role yet.`}>
         {tools.length === 0 ? (
           <div className="surface">
             <EmptyState icon="lock" title="No tools assigned yet"

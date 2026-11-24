@@ -10,6 +10,7 @@ import Sidebar from './components/Sidebar';
 import Header from './components/Header';
 import LoginPage from './LoginPage';
 import { logAuditEvent } from './utils/auditLog';
+import { useSyncedMotionPreference } from './utils/motion';
 import { PAGE_TITLES, PIPELINE_VIEW_PERMISSIONS, SERVER_MANAGER_PERMISSIONS, STATS_PERMISSIONS } from './navigation';
 
 const Dashboard = lazy(() => import('./pages/Dashboard'));
@@ -105,7 +106,9 @@ function AppShell() {
   const { error: rbacError, refresh: refreshRbac, loading: rbacLoading } = useRBAC();
   const [navOpen, setNavOpen] = useState(false);
   const closeNav = useCallback(() => setNavOpen(false), []);
+  const { user } = useAuth();
   useNavigationAudit();
+  useSyncedMotionPreference(user?.email || null);
 
   useEffect(() => {
     const title = PAGE_TITLES[location.pathname];

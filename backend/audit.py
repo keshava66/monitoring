@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import csv
 import io
+import json
 import logging
 import os
 import re
@@ -82,6 +83,11 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_audit_timestamp    ON audit_log (timestamp DESC);
             CREATE INDEX IF NOT EXISTS idx_audit_performed_by ON audit_log (performed_by);
             CREATE INDEX IF NOT EXISTS idx_audit_action       ON audit_log (action);
+            CREATE TABLE IF NOT EXISTS user_preferences (
+                email       TEXT PRIMARY KEY,
+                preferences TEXT NOT NULL DEFAULT '{}',
+                updated_at  TEXT NOT NULL
+            );
         """)
 
 
@@ -350,6 +356,44 @@ def post_audit_event(event: AuditEventRequest, request: Request, user: dict = De
 def heartbeat(user: dict = Depends(get_current_user)):
     _record_heartbeat(user["email"])
     return {"success": True}
+
+
+# ============================================================================
+# PER-USER PREFERENCES (follow the person across machines)
+# ============================================================================
+
+class PreferencesUpdate(BaseModel):
+    reduce_motion: Optional[bool] = None
+
+
+def _load_preferences(conn: sqlite3.Connection, email: str) -> Dict:
+    row = conn.execute("SELECT preferences FROM user_preferences WHERE email = ?", (email,)).fetchone()
+    if not row:
+        return {}
+    try:
+        data = json.loads(row[0])
+        return data if isinstance(data, dict) else {}
+    except ValueError:
+        return {}
+
+
+@audit_router.get("/preferences")
+def get_preferences(user: dict = Depends(get_current_user)):
+    with _db() as conn:
+        return {"preferences": _load_preferences(conn, user["email"])}
+
+
+@audit_router.put("/preferences")
+def put_preferences(update: PreferencesUpdate, user: dict = Depends(get_current_user)):
+    changes = update.model_dump(exclude_none=True)
+    with _db() as conn:
+        prefs = {**_load_preferences(conn, user["email"]), **changes}
+        conn.execute(
+            "INSERT INTO user_preferences (email, preferences, updated_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(email) DO UPDATE SET preferences = excluded.preferences, updated_at = excluded.updated_at",
+            (user["email"], json.dumps(prefs), datetime.now(timezone.utc).isoformat()),
+        )
+    return {"preferences": prefs}
 
 
 # ============================================================================

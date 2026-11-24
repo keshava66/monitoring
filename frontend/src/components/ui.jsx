@@ -678,6 +678,22 @@ export function MenuItem({ children, onClick, active, tone, title }) {
   );
 }
 
+/** A setting inside a menu: label, hint and a switch. Toggling keeps the menu open. */
+export function MenuToggle({ label, hint, checked, onChange }) {
+  return (
+    <button type="button" role="menuitemcheckbox" aria-checked={checked} onClick={() => onChange(!checked)}
+      className="w-full flex items-center justify-between gap-4 px-3 py-2.5 rounded-xl text-left transition-colors hover:bg-jj-gray-01 focus-ring-inset">
+      <span className="min-w-0">
+        <span className="block font-johnson-text text-sm text-jj-gray-08">{label}</span>
+        {hint && <span className="block font-johnson-text text-xs text-jj-gray-05">{hint}</span>}
+      </span>
+      <span aria-hidden="true" className={cx('relative inline-flex h-5 w-9 flex-shrink-0 rounded-full transition-colors duration-300', checked ? 'bg-jj-red' : 'bg-jj-gray-03')}>
+        <span className={cx('absolute top-0.5 left-0.5 h-4 w-4 rounded-full bg-white shadow transition-transform duration-300 ease-out', checked && 'translate-x-4')} />
+      </span>
+    </button>
+  );
+}
+
 // ── Toasts & confirmation ─────────────────────────────────────────────────────
 
 const FeedbackContext = createContext(null);

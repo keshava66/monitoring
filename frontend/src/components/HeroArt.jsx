@@ -2,8 +2,8 @@
    moves slowly; under prefers-reduced-motion everything holds still. */
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Icon, cx } from './ui';
+import { useReducedMotion } from '../utils/motion';
 
-const reducedMotion = () => typeof window !== 'undefined' && window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
 
 /** True while the element is narrower than `px`, so art can shed detail on phones. */
 function useNarrow(ref, px = 480) {
@@ -69,6 +69,7 @@ export function ToolOrbit({ tools, onLaunch, status = {} }) {
   const paused = useRef(false);
   const [active, setActive] = useState(null);
   const small = useNarrow(wrap);
+  const still = useReducedMotion();
 
   useEffect(() => {
     const place = (t) => {
@@ -89,7 +90,7 @@ export function ToolOrbit({ tools, onLaunch, status = {} }) {
     };
     let t = -Math.PI / 2;
     place(t);
-    if (reducedMotion()) return undefined;
+    if (still) return undefined;
     let raf = 0;
     let last = performance.now();
     const loop = (now) => {
@@ -101,7 +102,7 @@ export function ToolOrbit({ tools, onLaunch, status = {} }) {
     };
     raf = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(raf);
-  }, [tools.length]);
+  }, [tools.length, still]);
 
   const hold = (id) => { paused.current = !!id; setActive(id); };
 
@@ -234,11 +235,12 @@ export function RingGauge({ value, segments = [], center, sub, caption, loading,
 /** Clock dial with a sweeping second hand; centre shows a live count. */
 export function ClockDial({ count, label, loading }) {
   const [now, setNow] = useState(() => new Date());
+  const still = useReducedMotion();
   useEffect(() => {
-    if (reducedMotion()) return undefined;
-    const id = setInterval(() => setNow(new Date()), 1000);
+    // Reduced motion: the hands still tell the time, once a minute instead of sweeping.
+    const id = setInterval(() => setNow(new Date()), still ? 60_000 : 1000);
     return () => clearInterval(id);
-  }, []);
+  }, [still]);
   const h = (now.getHours() % 12) * 30 + now.getMinutes() * 0.5;
   const m = now.getMinutes() * 6 + now.getSeconds() * 0.1;
   const sec = now.getSeconds() * 6;

@@ -6,6 +6,8 @@ import './index.css';
 import App from './App.jsx';
 import { msalConfig } from './msalConfig';
 import { bindMsal } from './context/AuthContext';
+// Applies the saved motion setting before the first paint.
+import './utils/motion';
 
 const msalInstance = new PublicClientApplication(msalConfig);
 const root = ReactDOM.createRoot(document.getElementById('root'));
