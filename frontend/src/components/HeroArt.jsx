@@ -360,48 +360,6 @@ export function PipelineFlow({ nodes, stages, running }) {
 }
 
 /** Heartbeat trace whose amplitude follows the CPU load. */
-function Trace({ load, color, live }) {
-  const amp = 4 + Math.min(100, Number(load) || 0) * 0.22;
-  const beat = (x) => `L ${x} 20 L ${x + 3} ${20 - amp} L ${x + 6} ${20 + amp * 0.6} L ${x + 9} 20`;
-  let d = 'M 0 20';
-  for (let x = 0; x < 200; x += 25) d += ` L ${x + 8} 20 ${beat(x + 8)}`;
-  return (
-    <svg viewBox="0 0 100 40" preserveAspectRatio="none" className="w-full h-7 my-1 overflow-hidden" aria-hidden="true">
-      <g className={live ? 'animate-[trace_4s_linear_infinite]' : ''}>
-        <path d={d} fill="none" stroke={color} strokeWidth="1.6" strokeLinejoin="round" vectorEffect="non-scaling-stroke" opacity={live ? 1 : 0.35} />
-      </g>
-    </svg>
-  );
-}
-
-/** One lane per service: live trace driven by CPU, plus memory and uptime. */
-export function ServicePulse({ services }) {
-  return (
-    <div className="w-full h-full flex flex-col justify-center gap-2">
-      {services.map((s, i) => (
-        <div key={s.id} className="rounded-2xl bg-white/85 border border-jj-gray-02 px-4 py-2.5 animate-rise" style={{ animationDelay: `${0.15 + i * 0.1}s` }}>
-          <div className="flex items-center justify-between gap-3">
-            <p className="flex items-center gap-2 min-w-0 font-johnson-display font-medium text-[14px] text-jj-gray-08">
-              <span className="w-2 h-2 rounded-full shrink-0" style={{ background: s.color }} />
-              <span className="truncate">{s.label}</span>
-            </p>
-            <span className="font-johnson-text font-medium text-[13px] shrink-0" style={{ color: s.color }}>{s.state}</span>
-          </div>
-          <Trace load={s.cpu} color={s.color} live={s.live} />
-          <dl className="flex gap-4 font-johnson-text text-[12px]">
-            {[['CPU', s.cpu != null ? `${s.cpu}%` : '—'], ['Mem', s.mem != null ? `${s.mem}%` : '—'], ['Up', s.uptime || '—']].map(([k, v]) => (
-              <div key={k} className="flex gap-1.5 min-w-0">
-                <dt className="text-jj-gray-06">{k}</dt>
-                <dd className="tabular-nums text-jj-gray-08 font-medium truncate">{v}</dd>
-              </div>
-            ))}
-          </dl>
-        </div>
-      ))}
-    </div>
-  );
-}
-
 /** AD groups on the left, roles on the right, each mapping drawn as a curve. */
 export function AccessGraph({ groups, roles, links }) {
   const rowY = (i, n) => (n <= 1 ? 50 : 12 + (i * 76) / (n - 1));

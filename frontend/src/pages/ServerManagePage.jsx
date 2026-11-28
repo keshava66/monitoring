@@ -7,7 +7,6 @@ import { logAuditEvent } from '../utils/auditLog';
 import {
   Alert, Badge, Button, Dot, EmptyState, Icon, Menu, MenuItem, Page, PageHeader, ProgressBar, StatusChip, Tabs, Toggle, cx, useFeedback, usePolling,
 } from '../components/ui';
-import { ServicePulse } from '../components/HeroArt';
 
 const Terminal = lazy(() => import('./Terminal'));
 
@@ -168,16 +167,16 @@ function ServiceCard({ svc, info, state, busy, canAdmin, onAction, dirOptions, o
 
 function HostStrip({ host }) {
   const tiles = [
-    { k: 'CPU', v: `${host.cpu}%`, bar: host.cpu, color: '#0f68b2', hint: `${host.cores} core${host.cores === 1 ? '' : 's'}` },
-    { k: 'Memory', v: `${host.mem}%`, bar: host.mem, color: '#8c3bbb' },
+    { k: 'Server CPU', v: `${host.cpu}%`, bar: host.cpu, color: '#0f68b2', hint: `${host.cores} core${host.cores === 1 ? '' : 's'}` },
+    { k: 'Server memory', v: `${host.mem}%`, bar: host.mem, color: '#8c3bbb' },
     { k: 'Disk', v: `${host.disk}%`, bar: host.disk, color: host.disk >= 90 ? '#eb1700' : '#328714', hint: host.disk_path },
     { k: 'Load', v: host.load ? host.load[0].toFixed(2) : '—', hint: host.load ? `5m ${host.load[1].toFixed(2)} · 15m ${host.load[2].toFixed(2)}` : null },
-    { k: 'Host uptime', v: host.uptime, hint: host.hostname },
+    { k: 'Server uptime', v: host.uptime, hint: host.hostname },
   ];
   // 2 columns on phones (uptime spans the last row), 3 + 2 on tablets, 5 across on desktops.
   const span = ['sm:col-span-2', 'sm:col-span-2', 'sm:col-span-2', 'sm:col-span-3', 'col-span-2 sm:col-span-3'];
   return (
-    <section aria-label="Host vitals" className="surface grid grid-cols-2 sm:grid-cols-6 lg:grid-cols-5 gap-px overflow-hidden bg-jj-gray-02">
+    <section aria-label="Server vitals" className="surface grid grid-cols-2 sm:grid-cols-6 lg:grid-cols-5 gap-px overflow-hidden bg-jj-gray-02">
       {tiles.map((t, i) => (
         <div key={t.k} className={cx('min-w-0 bg-white px-4 sm:px-5 py-3.5 lg:col-span-1', span[i])}>
           <p className="font-johnson-text text-[12px] font-medium text-jj-gray-06">{t.k}</p>
@@ -392,14 +391,6 @@ function ServerPanel({ server, tabs, onHealth }) {
             </StatusChip>
           </>
         )}
-        art={(
-          <ServicePulse services={SERVICES.map((svc) => {
-            const busy = busyOf(svc.id);
-            const st = busy ? STATE.busy : STATE[svcState(svc.id)];
-            const x = overview?.services[svc.id] || {};
-            return { id: svc.id, label: x.name || svc.label, color: st.color, state: busy ? BUSY_LABEL[busy.action] || st.label : st.label, cpu: x.cpu, mem: x.mem, uptime: x.uptime, live: svcState(svc.id) === 'running' };
-          })} />
-        )}
         actions={(
           <>
             {canAdmin && <Button icon="server" onClick={() => setTerminal(true)}>Terminal</Button>}
@@ -439,14 +430,14 @@ function ServerPanel({ server, tabs, onHealth }) {
         </Alert>
       )}
 
-      {overview?.host && <HostStrip host={overview.host} />}
-
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-5 stagger">
         {SERVICES.map((svc) => (
           <ServiceCard key={svc.id} svc={svc} info={overview?.services[svc.id] || {}} state={svcState(svc.id)} busy={busyOf(svc.id)}
             canAdmin={canAdmin} onAction={runAction} dirOptions={dirs[svc.id] || []} onChangeDir={changeDir} />
         ))}
       </div>
+
+      {overview?.host && <HostStrip host={overview.host} />}
 
       <section className="surface overflow-hidden">
         <div className="flex flex-wrap items-center justify-between gap-x-2 pl-1 pr-3 sm:px-4 border-b border-jj-gray-02">
