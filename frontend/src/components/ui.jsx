@@ -238,9 +238,9 @@ export function LoadingBlock({ label = 'Loading…', className }) {
 
 // ── Layout ────────────────────────────────────────────────────────────────────
 
-export function Page({ children, className, wide = false }) {
+export function Page({ children, className, wide = false, dense = false }) {
   return (
-    <div className={cx('w-full mx-auto px-4 sm:px-6 lg:px-10 pt-5 sm:pt-8 pb-10 flex flex-col gap-6 sm:gap-8', wide ? 'max-w-none' : 'max-w-[1600px]', className)}>
+    <div className={cx('w-full mx-auto px-4 sm:px-6 lg:px-10 flex flex-col', dense ? 'pt-4 pb-6 gap-4' : 'pt-5 sm:pt-8 pb-10 gap-6 sm:gap-8', wide ? 'max-w-none' : 'max-w-[1600px]', className)}>
       {children}
     </div>
   );

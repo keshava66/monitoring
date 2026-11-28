@@ -5,7 +5,7 @@ import { useAuth } from '../context/AuthContext';
 import { ApiError, downloadBlob, isAbort, requestJson, streamNdjsonUrl } from '../utils/apiClient';
 import { logAuditEvent } from '../utils/auditLog';
 import {
-  Alert, Badge, Button, Dot, EmptyState, Icon, Menu, MenuItem, Page, PageHeader, ProgressBar, StatusChip, Tabs, Toggle, cx, useFeedback, usePolling,
+  Alert, Badge, Button, Dot, EmptyState, Icon, Menu, MenuItem, Page, ProgressBar, StatusChip, Tabs, Toggle, cx, useFeedback, usePolling,
 } from '../components/ui';
 
 const Terminal = lazy(() => import('./Terminal'));
@@ -120,7 +120,7 @@ function ServiceCard({ svc, info, history, state, busy, canAdmin, onAction, dirO
   const reachable = state !== 'error' && state !== 'forbidden' && state !== 'loading';
   return (
     <div className="group relative overflow-hidden surface flex flex-col transition-[box-shadow,transform] duration-500 ease-out hover:-translate-y-0.5 hover:shadow-lift">
-      <div className="relative flex items-start gap-4 p-5 sm:p-6">
+      <div className="relative flex items-start gap-4 p-4 sm:p-5">
         <span className="relative w-12 h-12 rounded-2xl grid place-items-center flex-shrink-0 text-white"
           style={{ background: `linear-gradient(140deg, ${st.color}, color-mix(in srgb, ${st.color} 70%, #000))`, boxShadow: `0 14px 28px -14px ${st.color}` }}>
           {(running || busy) && <span className="absolute inset-0 rounded-2xl border animate-ring-tight" style={{ borderColor: st.color }} />}
@@ -157,12 +157,12 @@ function ServiceCard({ svc, info, history, state, busy, canAdmin, onAction, dirO
           {busy?.by && <p className="mt-1 font-johnson-text text-xs text-jj-blue-03 truncate">{busy.action} by {busy.by}</p>}
         </div>
       </div>
-      <dl className="relative grid grid-cols-3 gap-px mx-5 sm:mx-6 rounded-2xl overflow-hidden bg-jj-gray-02 border border-jj-gray-02 font-johnson-text">
+      <dl className="relative grid grid-cols-3 gap-px mx-4 sm:mx-5 rounded-2xl overflow-hidden bg-jj-gray-02 border border-jj-gray-02 font-johnson-text">
         {[['Port', info.port], ['PID', info.pid], ['Uptime', info.uptime]].map(([k, v]) => (
           <div key={k} className="min-w-0 bg-[#fbfaf8] px-3.5 py-3"><dt className="text-[12px] font-medium text-jj-gray-06">{k}</dt><dd className="mt-1 font-johnson-display font-light text-xl leading-none text-jj-gray-08 tabular-nums truncate">{v || '—'}</dd></div>
         ))}
       </dl>
-      <dl className="relative grid grid-cols-2 gap-5 px-5 sm:px-6 mt-4 font-johnson-text text-[13px]">
+      <dl className="relative grid grid-cols-2 gap-5 px-4 sm:px-5 mt-3 font-johnson-text text-[13px]">
         {[['CPU', info.cpu, history?.cpu, '#0f68b2'], ['Memory', info.mem, history?.mem, '#8c3bbb']].map(([k, v, values, c]) => (
           <div key={k} className="min-w-0">
             <div className="flex justify-between gap-2">
@@ -173,8 +173,8 @@ function ServiceCard({ svc, info, history, state, busy, canAdmin, onAction, dirO
           </div>
         ))}
       </dl>
-      {history?.cpu?.length > 1 && <p className="relative px-5 sm:px-6 mt-1 font-johnson-text text-[11px] text-jj-gray-05">Last {span}</p>}
-      <div className="relative mt-auto flex flex-wrap gap-2 p-5 sm:p-6">
+      {history?.cpu?.length > 1 && <p className="relative px-4 sm:px-5 mt-1 font-johnson-text text-[11px] text-jj-gray-05">Last {span}</p>}
+      <div className="relative mt-auto flex flex-wrap gap-2 p-4 sm:p-5">
         {canAdmin && (running ? (
           <>
             <Button size="sm" icon="sync" onClick={() => onAction(svc, 'restart')} loading={busy?.action === 'restart'} disabled={!!busy}>Restart</Button>
@@ -412,58 +412,56 @@ function ServerPanel({ server, tabs, onHealth }) {
   const hasOutput = activity === 'console' ? consoleLines.length > 0 : !!log?.text;
 
   return (
-    <Page>
-      <PageHeader title="Server" accent="control."
-        description={`Start, stop and deploy the monitoring services on ${server.alias}, then follow every command live.`}
-        chips={(
-          <>
-            {tabs}
-            <StatusChip color={STATE[anyBusy ? 'busy' : overall].color} live={!!lastSync && !failure}>
-              {failure ? STATE[failure.state].label
-                : lastSync ? `${anyBusy ? 'Working · ' : ''}Synced ${lastSync.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', second: '2-digit' })}` : 'Syncing…'}
-            </StatusChip>
-          </>
-        )}
-        actions={(
-          <>
-            {canAdmin && <Button icon="server" onClick={() => setTerminal(true)}>Terminal</Button>}
-            {canAdmin && (
-              <div className="flex">
-                <Button variant="primary" icon="sync" onClick={gitPull} loading={!!pending.git} disabled={gitBusy}
-                  title={overview?.git && !pending.git ? `git pull running (${overview.git.by})` : undefined} className={repos.length ? 'rounded-r-none' : ''}>
-                  Git pull{repo ? ` · ${repo.split('/').pop()}` : ''}
+    <Page dense>
+      {/* One compact bar: title and sync state, the server picker centred, actions on the right. */}
+      <header className="grid grid-cols-[minmax(0,1fr)_auto] xl:grid-cols-[1fr_auto_1fr] items-center gap-x-4 gap-y-3">
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 min-w-0">
+          <h1 className="font-johnson-display text-[1.6rem] leading-none tracking-[-0.02em] text-jj-gray-08 whitespace-nowrap">
+            Server <span className="font-light italic text-jj-red">control.</span>
+          </h1>
+          <StatusChip color={STATE[anyBusy ? 'busy' : overall].color} live={!!lastSync && !failure} className="h-6 px-2.5 gap-1.5 text-[9.5px] tracking-[0.14em]">
+            {failure ? STATE[failure.state].label
+              : lastSync ? `${anyBusy ? 'Working · ' : ''}Synced ${lastSync.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', second: '2-digit' })}` : 'Syncing…'}
+          </StatusChip>
+        </div>
+        {tabs && <div className="col-span-2 row-start-2 xl:col-span-1 xl:row-start-1 xl:col-start-2 justify-self-center max-w-full">{tabs}</div>}
+        <div className="flex items-center gap-2 justify-self-end row-start-1 col-start-2 xl:col-start-3">
+        {canAdmin && <Button size="sm" icon="server" onClick={() => setTerminal(true)} aria-label="Open terminal"><span className="hidden sm:inline">Terminal</span></Button>}
+        {canAdmin && (
+          <div className="flex">
+            <Button size="sm" variant="primary" icon="sync" onClick={gitPull} aria-label={repo ? `Git pull ${repo.split('/').pop()}` : 'Git pull'} loading={!!pending.git} disabled={gitBusy}
+              title={overview?.git && !pending.git ? `git pull running (${overview.git.by})` : undefined} className={repos.length ? 'rounded-r-none' : ''}>
+              <span className="hidden sm:inline">Git pull{repo ? ` · ${repo.split('/').pop()}` : ''}</span>
+            </Button>
+            {repos.length > 0 && (
+              <Menu open={repoMenu} onOpenChange={setRepoMenu} className="w-[min(26rem,calc(100vw-1rem))] max-h-80" trigger={(
+                <Button size="sm" variant="primary" aria-label="Choose repository" disabled={gitBusy} onClick={() => setRepoMenu((v) => !v)} className="rounded-l-none border-l border-white/30 px-2.5">
+                  <Icon name="chevronDown" className="w-3 h-3" />
                 </Button>
-                {repos.length > 0 && (
-                  <Menu open={repoMenu} onOpenChange={setRepoMenu} className="w-[min(26rem,calc(100vw-1rem))] max-h-80" trigger={(
-                    <Button variant="primary" aria-label="Choose repository" disabled={gitBusy} onClick={() => setRepoMenu((v) => !v)} className="rounded-l-none border-l border-white/30 px-2.5">
-                      <Icon name="chevronDown" className="w-3 h-3" />
-                    </Button>
-                  )}>
-                    <MenuItem active={!repo} onClick={() => { setRepo(''); setRepoMenu(false); }}>Default repository</MenuItem>
-                    {repos.map((r) => (
-                      <MenuItem key={r} active={repo === r} title={r} onClick={() => { setRepo(r); setRepoMenu(false); }}>
-                        <span className="block">{r.split('/').pop()}</span>
-                        <span className="block font-mono text-[11px] text-jj-gray-05 truncate">{r}</span>
-                      </MenuItem>
-                    ))}
-                  </Menu>
-                )}
-              </div>
+              )}>
+                <MenuItem active={!repo} onClick={() => { setRepo(''); setRepoMenu(false); }}>Default repository</MenuItem>
+                {repos.map((r) => (
+                  <MenuItem key={r} active={repo === r} title={r} onClick={() => { setRepo(r); setRepoMenu(false); }}>
+                    <span className="block">{r.split('/').pop()}</span>
+                    <span className="block font-mono text-[11px] text-jj-gray-05 truncate">{r}</span>
+                  </MenuItem>
+                ))}
+              </Menu>
             )}
-            <Button icon="refresh" onClick={refresh} aria-label="Refresh status"><span className="hidden sm:inline">Refresh</span></Button>
-          </>
+          </div>
         )}
-      />
+        <Button size="sm" icon="refresh" onClick={refresh} aria-label="Refresh status"><span className="hidden sm:inline">Refresh</span></Button>
+        </div>
+      </header>
 
       {failure && <Alert tone="error" title={`Can’t reach ${server.alias}`}>{failure.message}</Alert>}
       {!failure && overview?.legacy && (
         <Alert tone="warning" title={`${server.alias} runs an older Server Manager`}>
-          Everything works, but action output shows only once a job finishes, and host vitals and busy locks are off.
-          Deploy the current linux_manage folder on this host and restart the manager to turn them on.
+          Action output appears only when a job ends; server vitals and busy locks are off. Redeploy linux_manage on this host to enable them.
         </Alert>
       )}
 
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-5 stagger">
+      <div className="grid grid-cols-1 xl:grid-cols-2 gap-4 stagger">
         {SERVICES.map((svc) => (
           <ServiceCard key={svc.id} svc={svc} info={overview?.services[svc.id] || {}} history={overview?.services[svc.id]?.history || localHistory[svc.id]} state={svcState(svc.id)} busy={busyOf(svc.id)}
             canAdmin={canAdmin} onAction={runAction} dirOptions={dirs[svc.id] || []} onChangeDir={changeDir} />
@@ -490,7 +488,7 @@ function ServerPanel({ server, tabs, onHealth }) {
           </div>
         </div>
         <div ref={outRef} onScroll={onScroll} tabIndex={0} aria-label="Activity output" aria-live="off"
-          className={cx('overflow-auto terminal-scroll bg-terminal px-5 py-4 font-mono text-xs leading-5 focus-ring-inset', activity === 'console' && !consoleLines.length ? 'h-44' : 'h-80 sm:h-96')}>
+          className={cx('overflow-auto terminal-scroll bg-terminal px-5 py-4 font-mono text-xs leading-5 focus-ring-inset', activity === 'console' && !consoleLines.length ? 'h-32' : 'h-80 sm:h-[28rem]')}>
           {activity === 'console' ? (
             consoleLines.length === 0 ? (
               <div className="h-full flex flex-col items-center justify-center gap-3 text-center font-johnson-text">
