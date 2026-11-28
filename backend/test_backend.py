@@ -638,6 +638,11 @@ def test_manager_overview_and_pid_checks(manager):
     assert body["services"]["backend"]["running"] and body["services"]["backend"]["pid"] == os.getpid()
     assert body["services"]["backend"]["cpu"] is not None and body["services"]["frontend"]["running"] is False
     assert body["host"]["cores"] >= 1 and body["git"] is None
+    assert body["services"]["backend"]["history_every"] == manager.HISTORY_EVERY
+    deadline = time.time() + 5
+    while not manager._history["backend"] and time.time() < deadline:
+        time.sleep(0.05)
+    assert list(manager._history["backend"])[0] >= 0  # the sampler is recording
     # A process started long after the pid file was written is a recycled PID.
     os.utime(pidfile, (1, 1))
     assert manager.read_pid(str(manager.svc_dir), "backend") is None
