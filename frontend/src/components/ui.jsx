@@ -1,6 +1,6 @@
 /* Shared design-system primitives, formatters and hooks used by every page. */
 import React, {
-  createContext, useCallback, useContext, useEffect, useId, useMemo, useRef, useState,
+  createContext, useCallback, useContext, useEffect, useId, useLayoutEffect, useMemo, useRef, useState,
 } from 'react';
 import { createPortal } from 'react-dom';
 
@@ -645,12 +645,71 @@ export function Drawer({ open, onClose, title, description, children, footer, wi
 }
 
 /** Popover menu anchored under its trigger; closes on outside click / Escape. */
+const MENU_GAP = 8;
+const MENU_EDGE = 8;
+
+/**
+ * Dropdown anchored to its trigger. The panel is portaled and fixed, so cards
+ * with overflow:hidden and later page sections never clip or cover it. It
+ * opens below when it fits, otherwise on the roomier side, and stays inside
+ * the viewport. Arrow keys move between items; Escape returns to the trigger.
+ */
 export function Menu({ trigger, children, align = 'right', className, open, onOpenChange }) {
-  const ref = useRef(null);
+  const anchorRef = useRef(null);
+  const panelRef = useRef(null);
+  const [pos, setPos] = useState(null);
+
+  const place = useCallback(() => {
+    const anchor = anchorRef.current?.getBoundingClientRect();
+    const panel = panelRef.current;
+    if (!anchor || !panel) return;
+    panel.style.maxHeight = '';
+    const { width, height } = panel.getBoundingClientRect();
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    const below = vh - anchor.bottom - MENU_GAP - MENU_EDGE;
+    const above = anchor.top - MENU_GAP - MENU_EDGE;
+    const up = height > below && above > below;
+    const room = up ? above : below;
+    const shown = Math.min(height, room);
+    const preferred = align === 'right' ? anchor.right - width : anchor.left;
+    setPos({
+      left: Math.max(MENU_EDGE, Math.min(preferred, vw - width - MENU_EDGE)),
+      top: up ? anchor.top - MENU_GAP - shown : anchor.bottom + MENU_GAP,
+      maxHeight: height > room ? room : undefined,
+      up,
+    });
+  }, [align]);
+
+  useLayoutEffect(() => {
+    if (!open) { setPos(null); return undefined; }
+    place();
+    window.addEventListener('resize', place);
+    window.addEventListener('scroll', place, true);
+    return () => {
+      window.removeEventListener('resize', place);
+      window.removeEventListener('scroll', place, true);
+    };
+  }, [open, place]);
+
   useEffect(() => {
     if (!open) return undefined;
-    const onDoc = (e) => { if (!ref.current?.contains(e.target)) onOpenChange(false); };
-    const onKey = (e) => { if (e.key === 'Escape') onOpenChange(false); };
+    const inside = (t) => anchorRef.current?.contains(t) || panelRef.current?.contains(t);
+    const onDoc = (e) => { if (!inside(e.target)) onOpenChange(false); };
+    const onKey = (e) => {
+      if (e.key === 'Escape') {
+        if (panelRef.current?.contains(document.activeElement)) anchorRef.current?.querySelector('button')?.focus();
+        onOpenChange(false);
+        return;
+      }
+      if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
+      const items = [...(panelRef.current?.querySelectorAll('[role="menuitem"]:not(:disabled)') || [])];
+      if (!items.length) return;
+      e.preventDefault();
+      const at = items.indexOf(document.activeElement);
+      const next = at < 0 ? (e.key === 'ArrowDown' ? 0 : items.length - 1) : (at + (e.key === 'ArrowDown' ? 1 : -1) + items.length) % items.length;
+      items[next].focus();
+    };
     document.addEventListener('mousedown', onDoc);
     document.addEventListener('touchstart', onDoc, { passive: true });
     document.addEventListener('keydown', onKey);
@@ -660,13 +719,18 @@ export function Menu({ trigger, children, align = 'right', className, open, onOp
       document.removeEventListener('keydown', onKey);
     };
   }, [open, onOpenChange]);
+
   return (
-    <div ref={ref} className="relative">
+    <div ref={anchorRef} className="relative">
       {trigger}
-      {open && (
-        <div role="menu" className={cx('absolute z-50 mt-2 min-w-[14rem] max-w-[calc(100vw-2rem)] bg-white rounded-2xl border border-jj-gray-02 shadow-overlay p-1.5 animate-pop-in', align === 'right' ? 'right-0' : 'left-0', className)}>
+      {open && createPortal(
+        <div ref={panelRef} role="menu"
+          className={cx('fixed z-[70] min-w-[14rem] max-w-[calc(100vw-1rem)] overflow-y-auto overscroll-contain scroll-thin bg-white rounded-2xl border border-jj-gray-02 shadow-overlay p-1.5',
+            pos && (pos.up ? 'animate-pop-up' : 'animate-pop-in'), className)}
+          style={pos ? { top: pos.top, left: pos.left, maxHeight: pos.maxHeight } : { top: 0, left: 0, visibility: 'hidden' }}>
           {children}
-        </div>
+        </div>,
+        document.body,
       )}
     </div>
   );

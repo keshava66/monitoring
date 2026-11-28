@@ -104,7 +104,7 @@ function ServiceCard({ svc, info, state, busy, canAdmin, onAction, dirOptions, o
       <div className="relative flex items-start gap-4 p-5 sm:p-6">
         <span className="relative w-12 h-12 rounded-2xl grid place-items-center flex-shrink-0 text-white"
           style={{ background: `linear-gradient(140deg, ${st.color}, color-mix(in srgb, ${st.color} 70%, #000))`, boxShadow: `0 14px 28px -14px ${st.color}` }}>
-          {(running || busy) && <span className="absolute -inset-1 rounded-[1.1rem] border animate-ring" style={{ borderColor: st.color }} />}
+          {(running || busy) && <span className="absolute inset-0 rounded-2xl border animate-ring-tight" style={{ borderColor: st.color }} />}
           <Icon name={svc.icon} className="w-5 h-5" />
         </span>
         <div className="flex-1 min-w-0">
@@ -113,7 +113,7 @@ function ServiceCard({ svc, info, state, busy, canAdmin, onAction, dirOptions, o
             <Badge tone={st.tone}><Dot color={st.color} pulse={running || !!busy} className="w-1.5 h-1.5" />{st.label}</Badge>
           </div>
           {canAdmin && dirOptions.length > 0 ? (
-            <Menu open={menuOpen} onOpenChange={setMenuOpen} align="left" className="w-[min(22rem,calc(100vw-3rem))] max-h-72 overflow-y-auto scroll-thin" trigger={(
+            <Menu open={menuOpen} onOpenChange={setMenuOpen} align="left" className="w-[min(24rem,calc(100vw-1rem))] max-h-80" trigger={(
               <button type="button" onClick={() => setMenuOpen((v) => !v)} aria-haspopup="menu" aria-expanded={menuOpen}
                 className="mt-1 max-w-full flex items-center gap-1 font-mono text-xs text-jj-gray-06 hover:text-jj-gray-08 rounded focus-ring" title={info.dir}>
                 <span className="truncate">{info.dir || 'No directory set'}</span>
@@ -122,9 +122,12 @@ function ServiceCard({ svc, info, state, busy, canAdmin, onAction, dirOptions, o
             )}>
               {(running || busy) && <p className="px-3 pt-1.5 pb-2 font-johnson-text text-xs text-jj-gray-06">Stop the service to switch its directory.</p>}
               {dirOptions.map((o) => (
-                <MenuItem key={o.path} active={o.path === info.dir} title={o.notes || o.path} disabled={!o.exists || running || !!busy || o.path === info.dir}
-                  onClick={() => { setMenuOpen(false); onChangeDir(svc.id, o); }}>
-                  <span className="block">{o.label}{!o.exists && ' (missing)'}</span>
+                <MenuItem key={o.path} active={o.path === info.dir} title={o.notes || o.path} disabled={!o.exists || running || !!busy}
+                  onClick={() => { setMenuOpen(false); if (o.path !== info.dir) onChangeDir(svc.id, o); }}>
+                  <span className="flex items-center justify-between gap-2">
+                    <span className="truncate">{o.label}{!o.exists && ' (missing)'}</span>
+                    {o.path === info.dir && <span className="shrink-0 text-[11px] font-medium text-jj-gray-05">Current</span>}
+                  </span>
                   <span className="block font-mono text-[11px] text-jj-gray-05 truncate">{o.path}</span>
                 </MenuItem>
               ))}
@@ -171,10 +174,12 @@ function HostStrip({ host }) {
     { k: 'Load', v: host.load ? host.load[0].toFixed(2) : '—', hint: host.load ? `5m ${host.load[1].toFixed(2)} · 15m ${host.load[2].toFixed(2)}` : null },
     { k: 'Host uptime', v: host.uptime, hint: host.hostname },
   ];
+  // 2 columns on phones (uptime spans the last row), 3 + 2 on tablets, 5 across on desktops.
+  const span = ['sm:col-span-2', 'sm:col-span-2', 'sm:col-span-2', 'sm:col-span-3', 'col-span-2 sm:col-span-3'];
   return (
-    <section aria-label="Host vitals" className="surface grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-px overflow-hidden bg-jj-gray-02">
-      {tiles.map((t) => (
-        <div key={t.k} className="min-w-0 bg-white px-4 sm:px-5 py-3.5 last:col-span-2 sm:last:col-span-1">
+    <section aria-label="Host vitals" className="surface grid grid-cols-2 sm:grid-cols-6 lg:grid-cols-5 gap-px overflow-hidden bg-jj-gray-02">
+      {tiles.map((t, i) => (
+        <div key={t.k} className={cx('min-w-0 bg-white px-4 sm:px-5 py-3.5 lg:col-span-1', span[i])}>
           <p className="font-johnson-text text-[12px] font-medium text-jj-gray-06">{t.k}</p>
           <p className="mt-1 font-johnson-display font-light text-xl leading-none text-jj-gray-08 tabular-nums truncate">{t.v}</p>
           {t.bar != null && <ProgressBar value={t.bar} color={t.color} className="h-1 mt-2" label={`Host ${t.k}`} />}
@@ -405,7 +410,7 @@ function ServerPanel({ server, tabs, onHealth }) {
                   Git pull{repo ? ` · ${repo.split('/').pop()}` : ''}
                 </Button>
                 {repos.length > 0 && (
-                  <Menu open={repoMenu} onOpenChange={setRepoMenu} className="max-h-72 overflow-y-auto scroll-thin" trigger={(
+                  <Menu open={repoMenu} onOpenChange={setRepoMenu} className="w-[min(26rem,calc(100vw-1rem))] max-h-80" trigger={(
                     <Button variant="primary" aria-label="Choose repository" disabled={gitBusy} onClick={() => setRepoMenu((v) => !v)} className="rounded-l-none border-l border-white/30 px-2.5">
                       <Icon name="chevronDown" className="w-3 h-3" />
                     </Button>
@@ -421,7 +426,7 @@ function ServerPanel({ server, tabs, onHealth }) {
                 )}
               </div>
             )}
-            <Button icon="refresh" onClick={refresh} aria-label="Refresh status">Refresh</Button>
+            <Button icon="refresh" onClick={refresh} aria-label="Refresh status"><span className="hidden sm:inline">Refresh</span></Button>
           </>
         )}
       />
