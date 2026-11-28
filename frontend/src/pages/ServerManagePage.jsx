@@ -17,7 +17,13 @@ const SERVERS = [
   { id: 'qa', label: 'QA', alias: 'SmartHub QA', permission: 'viewServerManagerQA', admin: 'adminAccessQA', url: import.meta.env.VITE_MANAGE_API_QA_URL || LEGACY_URL },
   { id: 'prod', label: 'PROD', alias: 'SmartHub PROD', permission: 'viewServerManagerProd', admin: 'adminAccessProd', url: import.meta.env.VITE_MANAGE_API_PROD_URL || LEGACY_URL },
   { id: 'poc', label: 'POC', alias: 'SmartHub POC', permission: 'viewServerManagerPOC', admin: 'adminAccessPOC', url: import.meta.env.VITE_MANAGE_API_POC_URL || LEGACY_URL },
-].filter((s) => s.url).map((s) => ({ ...s, url: s.url.replace(/\/$/, '') }));
+].filter((s) => s.url).map((s) => {
+  const target = s.url.replace(/\/$/, '');
+  // In `npm run dev` requests go through Vite's proxy (vite.config.js), so a
+  // local session needs neither the manager's CORS allow-list nor a trusted
+  // certificate. Built bundles talk to the manager directly.
+  return { ...s, target, url: import.meta.env.DEV ? `${window.location.origin}/__manage/${s.id}` : target };
+});
 
 const SERVICES = [
   { id: 'backend', label: 'Backend API', icon: 'server' },
@@ -40,9 +46,15 @@ const STATE = {
 const BUSY_LABEL = { start: 'Starting…', stop: 'Stopping…', restart: 'Restarting…', 'switch directory': 'Switching…' };
 const ERROR_LINE = /^(ERROR|FAILED)\b|Traceback|npm ERR!/;
 
-const describeError = (e) => (e instanceof ApiError && e.status === 403
-  ? 'This server only accepts members of its admin AD group.'
-  : e?.message || 'Request failed');
+const describeError = (e, target) => {
+  if (e instanceof ApiError && e.status === 403) return 'This server only accepts members of its admin AD group.';
+  if (e?.name === 'TimeoutError') return `${target || 'The server'} did not answer within 15 seconds.`;
+  if (e instanceof TypeError) {
+    return `Could not connect to ${target || 'the server'}. The manager may be stopped, may not list this site in ALLOWED_ORIGINS, `
+      + 'or may use a certificate this browser does not trust (open its /health page once to check).';
+  }
+  return e?.message || 'Request failed';
+};
 const failureState = (e) => (e instanceof ApiError && e.status === 403 ? 'forbidden' : 'error');
 const summarize = (overview) => {
   const up = SERVICES.filter((s) => overview.services?.[s.id]?.running).length;
@@ -50,7 +62,37 @@ const summarize = (overview) => {
 };
 const stamp = () => new Date().toLocaleString('en-US');
 const fileStamp = () => new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
-const fetchOverview = (url) => requestJson(`${url}/api/overview`, { timeoutMs: 15_000 });
+
+// Managers are upgraded host by host. /health reports the API version; one
+// from before /api/overview (no "api" field) is read per service instead.
+const apiVersions = new Map();
+const apiVersion = (url) => {
+  if (!apiVersions.has(url)) {
+    apiVersions.set(url, requestJson(`${url}/health`, { timeoutMs: 15_000 }).then((h) => h.api || 1).catch((e) => {
+      apiVersions.delete(url);
+      throw e;
+    }));
+  }
+  return apiVersions.get(url);
+};
+async function fetchOverview(url) {
+  const opts = { timeoutMs: 15_000 };
+  if (await apiVersion(url) >= 2) return requestJson(`${url}/api/overview`, opts);
+  const [config, ...status] = await Promise.all([
+    requestJson(`${url}/api/services`, opts),
+    ...SERVICES.map((svc) => requestJson(`${url}/api/status/${svc.id}`, opts)),
+  ]).catch((e) => {
+    // Upgraded while this page was open: look the version up again next time.
+    if (e instanceof ApiError && e.status === 404) apiVersions.delete(url);
+    throw e;
+  });
+  return {
+    legacy: true,
+    git: null,
+    host: null,
+    services: Object.fromEntries(SERVICES.map((svc, i) => [svc.id, { ...config[svc.id], ...status[i], busy: null }])),
+  };
+}
 
 function ServiceCard({ svc, info, state, busy, canAdmin, onAction, dirOptions, onChangeDir }) {
   const st = busy ? { ...STATE.busy, label: BUSY_LABEL[busy.action] || STATE.busy.label } : STATE[state] || STATE.loading;
@@ -190,22 +232,22 @@ function ServerPanel({ server, tabs, onHealth }) {
       onHealth(server.id, summarize(d));
       return d;
     } catch (e) {
-      setFailure({ state: failureState(e), message: describeError(e) });
+      setFailure({ state: failureState(e), message: describeError(e, server.target) });
       onHealth(server.id, failureState(e));
       return null;
     } finally {
       setLastSync(new Date());
     }
-  }, [server.url, server.id, onHealth]);
+  }, [server.url, server.id, server.target, onHealth]);
 
   const loadLog = useCallback(async (svc) => {
     try {
       const d = await api(`/api/logs/${svc}?lines=${LOG_LINES}`);
       setLogs((t) => ({ ...t, [svc]: d.missing ? { note: `No log file yet at ${d.missing}` } : { text: d.logs || '' } }));
     } catch (e) {
-      setLogs((t) => ({ ...t, [svc]: { note: `Unable to load log: ${describeError(e)}`, error: true } }));
+      setLogs((t) => ({ ...t, [svc]: { note: `Unable to load log: ${describeError(e, server.target)}`, error: true } }));
     }
-  }, [api]);
+  }, [api, server.target]);
 
   const svcState = (id) => (failure ? failure.state : overview ? (overview.services[id]?.running ? 'running' : 'stopped') : 'loading');
   const busyOf = (id) => (pending[id] ? { action: pending[id] } : overview?.services[id]?.busy || null);
@@ -241,7 +283,14 @@ function ServerPanel({ server, tabs, onHealth }) {
       body,
       signal: abortRef.current?.signal,
       onMessage: (m) => {
-        if (m.type === 'line') { if (m.text.trim()) append(m.text, ERROR_LINE.test(m.text) ? 'err' : 'out'); } else if (m.type === 'exit') rc = m.returncode;
+        const show = (text) => { if (text.trim()) append(text, ERROR_LINE.test(text) ? 'err' : 'out'); };
+        if (m.type === 'line') show(m.text);
+        else if (m.type === 'exit') rc = m.returncode;
+        else if ('returncode' in m) {
+          // Older managers answer with one JSON document once the job ends.
+          (m.output || '').split('\n').forEach(show);
+          rc = m.returncode;
+        }
       },
     });
     return rc;
@@ -273,8 +322,8 @@ function ServerPanel({ server, tabs, onHealth }) {
       logAuditEvent('server_manager_action', user?.email, `${server.id}:${svc.id}`, `${action} ${svc.id} on ${server.alias} ${ok ? 'succeeded' : 'failed'}`);
     } catch (e) {
       if (isAbort(e)) return;
-      append(describeError(e), 'err');
-      toast.error(`${svc.label} ${action} failed: ${describeError(e)}`);
+      append(describeError(e, server.target), 'err');
+      toast.error(`${svc.label} ${action} failed: ${describeError(e, server.target)}`);
     } finally {
       setPending((p) => ({ ...p, [svc.id]: null }));
       refresh();
@@ -296,8 +345,8 @@ function ServerPanel({ server, tabs, onHealth }) {
       logAuditEvent('server_manager_action', user?.email, server.id, `git pull in ${target} on ${server.alias} ${good ? 'succeeded' : 'failed'}`);
     } catch (e) {
       if (isAbort(e)) return;
-      append(describeError(e), 'err');
-      toast.error(`Git pull failed: ${describeError(e)}`);
+      append(describeError(e, server.target), 'err');
+      toast.error(`Git pull failed: ${describeError(e, server.target)}`);
     } finally {
       setPending((p) => ({ ...p, git: null }));
       refresh();
@@ -312,7 +361,7 @@ function ServerPanel({ server, tabs, onHealth }) {
       refresh();
       if (activity === svc) loadLog(svc);
     } catch (e) {
-      toast.error(describeError(e));
+      toast.error(describeError(e, server.target));
     }
   };
 
@@ -378,6 +427,12 @@ function ServerPanel({ server, tabs, onHealth }) {
       />
 
       {failure && <Alert tone="error" title={`Can’t reach ${server.alias}`}>{failure.message}</Alert>}
+      {!failure && overview?.legacy && (
+        <Alert tone="warning" title={`${server.alias} runs an older Server Manager`}>
+          Everything works, but action output shows only once a job finishes, and host vitals and busy locks are off.
+          Deploy the current linux_manage folder on this host and restart the manager to turn them on.
+        </Alert>
+      )}
 
       {overview?.host && <HostStrip host={overview.host} />}
 

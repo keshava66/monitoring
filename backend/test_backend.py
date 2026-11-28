@@ -622,7 +622,7 @@ ADM = {"Authorization": "Bearer adm"}
 
 def test_manager_requires_admin(manager):
     mc = TestClient(manager.app)
-    assert mc.get("/health").status_code == 200
+    assert mc.get("/health").json() == {"status": "healthy", "api": manager.API_VERSION}
     assert mc.get("/api/overview").status_code == 401
     assert mc.get("/api/overview", headers={"Authorization": "Bearer other"}).status_code == 403
     assert mc.post("/api/terminal/ticket", headers=ADM).json()["expires_in"] == manager.TICKET_TTL
@@ -652,7 +652,7 @@ def test_manager_action_streams_and_claims(manager, monkeypatch):
     plain = mc.post("/api/stop/frontend", headers=ADM).json()
     assert plain["returncode"] == 0 and plain["output"] == "step one for stop\ndone"
 
-    monkeypatch.setenv("SLEEP", "2")
+    monkeypatch.setitem(manager.CHILD_ENV, "SLEEP", "2")
     import threading
     first = threading.Thread(target=lambda: mc.post("/api/start/backend", headers=ADM))
     first.start()
@@ -721,3 +721,16 @@ def test_manager_terminal_keeps_shell_state(manager, tmp_path):
     with mc.websocket_connect(f"/ws/terminal?ticket={ticket}") as ws:
         with pytest.raises(Exception):
             ws.receive_json()
+
+
+def test_manager_env_stays_out_of_services(manager, monkeypatch, tmp_path):
+    # load_dotenv put the manager's own settings into os.environ after start-up.
+    monkeypatch.delitem(manager.CHILD_ENV, "ALLOWED_ORIGINS", raising=False)
+    monkeypatch.setenv("ALLOWED_ORIGINS", "https://manager-only")
+    monkeypatch.setenv("REPO_PASSWORD", "s3cret")
+    script = tmp_path / "env.sh"
+    script.write_text('echo "origins=${ALLOWED_ORIGINS:-unset} pw=${REPO_PASSWORD:-unset}"\n')
+    cfg = Path(os.environ["MANAGE_CONFIG"])
+    cfg.write_text(cfg.read_text().replace(f"frontend = {tmp_path / 'svc.sh'}", f"frontend = {script}"))
+    out = TestClient(manager.app).post("/api/start/frontend", headers=ADM).json()["output"]
+    assert out == "origins=unset pw=unset"

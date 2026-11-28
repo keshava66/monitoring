@@ -42,6 +42,11 @@ from pydantic import BaseModel, Field
 from starlette.responses import Response as StarletteResponse, StreamingResponse
 
 BASE_DIR = Path(__file__).resolve().parent
+# Services, git and the terminal get the environment the manager was started
+# with. The manager's own .env (its ALLOWED_ORIGINS, admin group, repo
+# credentials) must not leak into them: the backend would inherit the
+# manager's ALLOWED_ORIGINS in place of the one in its own .env.
+CHILD_ENV = dict(os.environ)
 load_dotenv(BASE_DIR / ".env")
 CONFIG_FILE = Path(os.environ.get("MANAGE_CONFIG", BASE_DIR / "config.ini"))
 SERVICE_DIRS_FILE = BASE_DIR / "service_directories.json"
@@ -490,9 +495,14 @@ ACTION_TIMEOUTS = {"start": 600, "stop": 60, "restart": 900}
 
 # ── routes ───────────────────────────────────────────────────────────────────
 
+# Bumped when the HTTP API changes, so the UI can still drive managers that
+# have not been redeployed yet (no "api" field means version 1).
+API_VERSION = 2
+
+
 @app.get("/health")
 def health():
-    return {"status": "healthy"}
+    return {"status": "healthy", "api": API_VERSION}
 
 
 @_protected.get("/api/overview")
@@ -518,7 +528,7 @@ def _action_route(action: str):
         cfg = read_config()
         script, args = _service_args(cfg, service, action)
         logger.info("%s requested %s %s", email, action, service)
-        job = _start_job(service, action, email, ["bash", script, *args], {**os.environ, **_ssl_env(cfg)},
+        job = _start_job(service, action, email, ["bash", script, *args], {**CHILD_ENV, **_ssl_env(cfg)},
                          ACTION_TIMEOUTS[action])
         return _respond(request, job, {"service": service, "action": action})
     run.__name__ = f"{action}_service"
@@ -686,7 +696,7 @@ def gitpull(request: Request, body: GitPullRequest = GitPullRequest(), email: st
         raise HTTPException(status_code=400, detail="Repository is outside the configured search_paths / home directory.")
     if not (target / ".git").exists():
         raise HTTPException(status_code=400, detail=f"Not a git repository: {repo_dir}")
-    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+    env = {**CHILD_ENV, "GIT_TERMINAL_PROMPT": "0"}
     username, password = _repo_credentials(cfg)
     askpass = _make_askpass(username, password) if username and password else None
     if askpass:
@@ -738,7 +748,7 @@ class _Session:
         self.state = tempfile.mkdtemp(prefix="term_")
         self.rc = Path(self.state, "rc")
         self.rc.write_text(_RC)
-        self.env = {**{k: v for k, v in os.environ.items() if not k.startswith("REPO_")},
+        self.env = {**{k: v for k, v in CHILD_ENV.items() if not k.startswith("REPO_")},
                     "TERM": "xterm-256color", "COLORTERM": "truecolor", "CLICOLOR": "1", "CLICOLOR_FORCE": "1",
                     "FORCE_COLOR": "3", "GIT_COLOR_UI": "always", "LS_COLORS": _LS_COLORS, "GIT_TERMINAL_PROMPT": "0"}
         self.askpass = None
