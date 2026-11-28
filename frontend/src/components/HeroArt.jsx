@@ -360,6 +360,21 @@ export function PipelineFlow({ nodes, stages, running }) {
 }
 
 /** Heartbeat trace whose amplitude follows the CPU load. */
+/** Heartbeat line for a running service: beats taller as its CPU rises, flat and faded when stopped. */
+export function PulseLine({ load, color, live, className = '' }) {
+  const amp = 4 + Math.min(100, Number(load) || 0) * 0.22;
+  const beat = (x) => `L ${x} 20 L ${x + 3} ${20 - amp} L ${x + 6} ${20 + amp * 0.6} L ${x + 9} 20`;
+  let d = 'M 0 20';
+  for (let x = 0; x < 200; x += 25) d += ` L ${x + 8} 20 ${beat(x + 8)}`;
+  return (
+    <svg viewBox="0 0 100 40" preserveAspectRatio="none" className={`w-full h-7 overflow-hidden ${className}`} aria-hidden="true">
+      <g className={live ? 'animate-[trace_4s_linear_infinite]' : ''}>
+        <path d={live ? d : 'M 0 20 L 200 20'} fill="none" stroke={color} strokeWidth="1.6" strokeLinejoin="round" vectorEffect="non-scaling-stroke" opacity={live ? 1 : 0.35} />
+      </g>
+    </svg>
+  );
+}
+
 /** AD groups on the left, roles on the right, each mapping drawn as a curve. */
 export function AccessGraph({ groups, roles, links }) {
   const rowY = (i, n) => (n <= 1 ? 50 : 12 + (i * 76) / (n - 1));

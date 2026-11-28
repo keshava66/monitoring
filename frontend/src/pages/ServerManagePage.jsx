@@ -4,6 +4,7 @@ import { useRBAC } from '../context/RBACContext';
 import { useAuth } from '../context/AuthContext';
 import { ApiError, downloadBlob, isAbort, requestJson, streamNdjsonUrl } from '../utils/apiClient';
 import { logAuditEvent } from '../utils/auditLog';
+import { PulseLine } from '../components/HeroArt';
 import {
   Alert, Badge, Button, Dot, EmptyState, Icon, Menu, MenuItem, Page, PageHeader, ProgressBar, StatusChip, Tabs, Toggle, cx, useFeedback, usePolling,
 } from '../components/ui';
@@ -142,13 +143,16 @@ function ServiceCard({ svc, info, state, busy, canAdmin, onAction, dirOptions, o
           <div key={k} className="min-w-0 bg-[#fbfaf8] px-3.5 py-3"><dt className="text-[12px] font-medium text-jj-gray-06">{k}</dt><dd className="mt-1 font-johnson-display font-light text-xl leading-none text-jj-gray-08 tabular-nums truncate">{v || '—'}</dd></div>
         ))}
       </dl>
-      <div className="relative grid grid-cols-2 gap-5 px-5 sm:px-6 mt-5">
-        {[['CPU', info.cpu, '#0f68b2'], ['Memory', info.mem, '#8c3bbb']].map(([k, v, c]) => (
-          <div key={k}>
-            <div className="flex justify-between font-johnson-text text-xs"><span className="text-jj-gray-06">{k}</span><span className="text-jj-gray-08 tabular-nums">{v != null ? `${v}%` : '—'}</span></div>
-            <ProgressBar value={v || 0} color={c} className="h-1 mt-1.5" label={`${svc.label} ${k}`} />
-          </div>
-        ))}
+      <div className="relative px-5 sm:px-6 mt-4">
+        <PulseLine load={info.cpu} color={st.color} live={running} />
+        <dl className="mt-1 flex gap-5 font-johnson-text text-[13px]">
+          {[['CPU', info.cpu], ['Mem', info.mem]].map(([k, v]) => (
+            <div key={k} className="flex gap-1.5">
+              <dt className="text-jj-gray-06">{k}</dt>
+              <dd className="tabular-nums text-jj-gray-08 font-medium">{v != null ? `${v}%` : '—'}</dd>
+            </div>
+          ))}
+        </dl>
       </div>
       <div className="relative mt-auto flex flex-wrap gap-2 p-5 sm:p-6">
         {canAdmin && (running ? (
