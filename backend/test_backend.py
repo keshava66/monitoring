@@ -1,8 +1,9 @@
 """Backend test suite.
 
-Graph is faked at the HTTP transport layer; Postgres tests run against a real
-server (TEST_PG_HOST / TEST_PG_PORT / TEST_PG_USER / TEST_PG_PASSWORD,
-defaults: localhost:5432 postgres) and are skipped if it isn't reachable.
+Graph is faked at the HTTP transport layer. A real PostgreSQL server is
+required (TEST_PG_HOST / TEST_PG_PORT / TEST_PG_USER / TEST_PG_PASSWORD,
+defaults: localhost:5432 postgres): each run creates a throwaway database for
+the app's own tables (core_db) and the ingestion fixtures, then drops it.
 """
 import csv
 import io
@@ -29,6 +30,9 @@ PG = {
     "password": os.getenv("TEST_PG_PASSWORD", ""),
 }
 TEST_DB = f"monitoring_test_{uuid.uuid4().hex[:8]}"
+_admin = psycopg2.connect(dbname="postgres", connect_timeout=5, **PG)
+_admin.autocommit = True
+_admin.cursor().execute(f'CREATE DATABASE "{TEST_DB}"')
 
 (_TMP / "config.ini").write_text(
     "[POSTGRES]\n"
@@ -44,8 +48,7 @@ TEST_DB = f"monitoring_test_{uuid.uuid4().hex[:8]}"
 )
 os.environ.update({
     "EPOD_CONFIG_PATH": str(_TMP / "config.ini"),
-    "RBAC_CONFIG_PATH": str(_TMP / "rbac_config.json"),
-    "AUDIT_DB_PATH": str(_TMP / "audit.db"),
+    "MONITORING_DB_DSN": " ".join(f"{k}={v}" for k, v in {**PG, "dbname": TEST_DB}.items() if v != ""),
     "ALLOWED_ORIGINS": "http://localhost:5173",
     "AD_GROUP_ADMIN": "GRP-ADMIN",
     "AD_GROUP_OPERATIONAL_SUPPORT": "GRP-OPS",
@@ -54,8 +57,10 @@ os.environ.update({
     "STALL_THRESHOLD_MINS": "30",
 })
 
+import audit  # noqa: E402
 import auth  # noqa: E402
 import Backend  # noqa: E402
+import core_db  # noqa: E402
 import rbac  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
@@ -131,26 +136,8 @@ ADMIN, OPS, VIEWER = H("admin-token"), H("ops-token"), H("viewer-token")
 # Postgres fixture
 # ============================================================================
 
-def _pg_available():
-    try:
-        psycopg2.connect(dbname="postgres", connect_timeout=3, **PG).close()
-        return True
-    except psycopg2.Error:
-        return False
-
-
-PG_OK = _pg_available()
-needs_pg = pytest.mark.skipif(not PG_OK, reason="Postgres not reachable")
-
-
 @pytest.fixture(scope="session", autouse=True)
 def database():
-    if not PG_OK:
-        yield
-        return
-    admin = psycopg2.connect(dbname="postgres", **PG)
-    admin.autocommit = True
-    admin.cursor().execute(f'CREATE DATABASE "{TEST_DB}"')
     conn = psycopg2.connect(dbname=TEST_DB, **PG)
     conn.autocommit = True
     cur = conn.cursor()
@@ -184,9 +171,9 @@ def database():
     yield
     import db_common
     db_common.close_pool()
-    cur = admin.cursor()
-    cur.execute(f'DROP DATABASE IF EXISTS "{TEST_DB}" WITH (FORCE)')
-    admin.close()
+    core_db.close_pool()
+    _admin.cursor().execute(f'DROP DATABASE IF EXISTS "{TEST_DB}" WITH (FORCE)')
+    _admin.close()
 
 
 # ============================================================================
@@ -352,14 +339,59 @@ def test_assignment_validation():
     assert client.delete("/api/rbac/user-assignments/none@corp.com", headers=ADMIN).status_code == 404
 
 
-def test_legacy_config_normalised(tmp_path):
-    path = tmp_path / "rbac.json"
-    path.write_text(json.dumps({"custom_roles": {"legacy": {"name": "Legacy", "permissions": {"viewServerManagerDev": True}}},
-                                "user_role_overrides": {"MiXeD@corp.com": "legacy"}}))
-    store = rbac.RBACStore(path)
-    cfg = store.load()
+def test_migration_from_old_files(tmp_path):
+    import sqlite3
+    import migrate_to_postgres
+    old = sqlite3.connect(tmp_path / "audit_log.db")
+    old.executescript("""
+        CREATE TABLE audit_log (id TEXT PRIMARY KEY, timestamp TEXT, action TEXT, performed_by TEXT,
+                                target TEXT, details TEXT, ip_address TEXT);
+        CREATE TABLE user_preferences (email TEXT PRIMARY KEY, preferences TEXT, updated_at TEXT);
+        INSERT INTO audit_log VALUES ('old-1', '2025-03-04T10:11:12.000-05:00', 'legacy_event', 'old@corp.com', 't', 'd', '1.2.3.4');
+        INSERT INTO audit_log VALUES ('old-2', 'not a time', 'legacy_event', 'old@corp.com', '', '', '');
+        INSERT INTO user_preferences VALUES ('Old@Corp.com', '{"reduce_motion": true}', '2025-03-04');
+    """)
+    old.executemany("INSERT INTO audit_log VALUES (?, '2025-03-05T09:00:00+00:00', 'legacy_bulk', 'old@corp.com', '', '', '')",
+                    [(f"bulk-{i}",) for i in range(250)])
+    old.commit()
+    old.close()
+    (tmp_path / "rbac.json").write_text(json.dumps({
+        "custom_roles": {"legacy": {"name": "Legacy", "permissions": {"viewServerManagerDev": True}}},
+        "user_role_overrides": {"MiXeD@corp.com": "legacy"},
+    }))
+    args = ["--audit-db", str(tmp_path / "audit_log.db"), "--rbac-json", str(tmp_path / "rbac.json")]
+
+    assert migrate_to_postgres.main(args + ["--dry-run"]) == 0
+    with core_db.transaction() as cur:
+        cur.execute("SELECT count(*) FROM audit_log WHERE id LIKE 'old-%'")
+        assert cur.fetchone()[0] == 0
+    assert migrate_to_postgres.main(args) == 0
+    assert migrate_to_postgres.main(args) == 0  # a second run copies nothing twice
+    with core_db.transaction() as cur:
+        cur.execute("SELECT id, \"timestamp\" FROM audit_log WHERE id LIKE 'old-%'")
+        rows = cur.fetchall()
+        cur.execute("SELECT preferences FROM user_preferences WHERE email = 'old@corp.com'")
+        prefs = cur.fetchone()[0]
+    assert [r[0] for r in rows] == ["old-1"] and rows[0][1] == datetime(2025, 3, 4, 15, 11, 12, tzinfo=timezone.utc)
+    assert prefs == {"reduce_motion": True}
+    with core_db.transaction() as cur:
+        cur.execute("SELECT count(*) FROM audit_log WHERE id LIKE 'bulk-%'")
+        assert cur.fetchone()[0] == 250
+    rbac.store._cache = None
+    cfg = rbac.store.load()
+    # Roles saved before a parent permission existed are opened up on the way in.
     assert cfg["custom_roles"]["legacy"]["permissions"]["viewServerManager"] is True
-    assert "mixed@corp.com" in cfg["user_role_overrides"]
+    assert cfg["user_role_overrides"]["mixed@corp.com"] == "legacy"
+    rbac.store.mutate(lambda c: (c["custom_roles"].pop("legacy"), c["user_role_overrides"].pop("mixed@corp.com")))
+
+
+def test_rbac_changes_survive_a_fresh_cache():
+    """Roles live in the database, not in one process: a new reader sees them."""
+    body = {"role_id": "shared_role", "role_definition": _role(viewDashboard=True)}
+    assert client.post("/api/rbac/roles", headers=ADMIN, json=body).status_code == 200
+    assert "shared_role" in rbac.RBACStore().load()["custom_roles"]
+    client.delete("/api/rbac/roles/shared_role", headers=ADMIN)
+    assert "shared_role" not in rbac.RBACStore().load()["custom_roles"]
 
 
 # ============================================================================
@@ -371,7 +403,7 @@ def test_audit_write_filter_export():
     assert client.post("/api/audit/log", headers=VIEWER, json={"action": "role_assigned"}).status_code == 403
     assert client.post("/api/audit/log", headers=VIEWER, json={"action": "Bad Action!"}).status_code == 422
 
-    today = datetime.now(Backend.audit.DISPLAY_TZ).date().isoformat()
+    today = datetime.now(audit.DISPLAY_TZ).date().isoformat()
     page = client.get("/api/audit/logs", headers=ADMIN, params={"performed_by": "viewer@", "date_from": today, "date_to": today}).json()
     assert page["total"] >= 1 and page["logs"][0]["performed_by"] == "viewer@corp.com"
     assert client.get("/api/audit/logs", headers=ADMIN, params={"search": "%"}).json()["total"] == 0
@@ -525,7 +557,6 @@ def test_agent_list():
 # Ingestion stats / NAS (real Postgres)
 # ============================================================================
 
-@needs_pg
 def test_epod_dashboard():
     data = client.get("/api/epod/dashboard", headers=OPS).json()
     alpha, missing = data["tables"]
@@ -537,7 +568,6 @@ def test_epod_dashboard():
     assert data["kpis"]["total_docs"] == 4 and data["chart_donut"] == {"success": 2, "error": 1, "running": 1}
 
 
-@needs_pg
 def test_rimdocs_stream_and_available():
     with client.stream("GET", "/api/rimdocs/dashboard/stream", headers=OPS) as resp:
         lines = [json.loads(l) for l in resp.iter_lines() if l]
@@ -552,7 +582,6 @@ def test_rimdocs_stream_and_available():
     assert avail == {"rimdocs1.ingestion_log_x": 2, "rimdocs1.ingestion_log_y": None}
 
 
-@needs_pg
 def test_diagnose():
     assert client.get("/api/epod/diagnose", headers=OPS).status_code == 403
     data = client.get("/api/epod/diagnose", headers=ADMIN).json()
@@ -560,7 +589,6 @@ def test_diagnose():
     assert flags == {"epod1.ingestion_log_alpha": True, "epod1.ingestion_log_missing": False}
 
 
-@needs_pg
 def test_nas_endpoints():
     ov = client.get("/api/nas/overview", headers=OPS).json()
     assert ov["kpis"]["segments"] == 3
@@ -576,9 +604,8 @@ def test_nas_endpoints():
     assert client.get("/api/nas/debug", headers=ADMIN).json()["top_level_segments"] == 3
 
 
-@needs_pg
 def test_readiness():
-    assert client.get("/health/ready").json() == {"status": "ready", "checks": {"audit_db": True, "postgres": True}}
+    assert client.get("/health/ready").json() == {"status": "ready", "checks": {"core_db": True, "postgres": True}}
 
 
 def test_config_injection_rejected(tmp_path, monkeypatch):
@@ -741,3 +768,19 @@ def test_manager_env_stays_out_of_services(manager, monkeypatch, tmp_path):
     cfg.write_text(cfg.read_text().replace(f"frontend = {tmp_path / 'svc.sh'}", f"frontend = {script}"))
     out = TestClient(manager.app).post("/api/start/frontend", headers=ADM).json()["output"]
     assert out == "origins=unset pw=unset"
+
+
+def test_core_db_down_answers_503(monkeypatch):
+    def down():
+        raise core_db.DatabaseUnavailable("connection refused")
+    monkeypatch.setattr(audit, "_db", down)
+    resp = client.get("/api/audit/stats", headers=ADMIN)
+    assert resp.status_code == 503 and resp.json()["detail"] == "Database unavailable, please retry"
+
+
+def test_changed_migration_is_refused(monkeypatch, tmp_path):
+    (tmp_path / "001_init.sql").write_text("SELECT 1;")
+    monkeypatch.setattr(core_db, "MIGRATIONS_DIR", tmp_path)
+    monkeypatch.setattr(core_db, "_migrated", False)
+    with pytest.raises(RuntimeError, match="changed after it was applied"):
+        core_db.migrate()

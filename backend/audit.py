@@ -1,4 +1,5 @@
-"""Audit log (SQLite, WAL) plus in-memory active-user tracking."""
+"""Audit log and per-user preferences (PostgreSQL, see core_db) plus in-memory
+active-user tracking."""
 from __future__ import annotations
 
 import csv
@@ -7,12 +8,9 @@ import json
 import logging
 import os
 import re
-import sqlite3
 import threading
 import uuid
-from contextlib import contextmanager
-from datetime import date, datetime, timedelta, timezone
-from pathlib import Path
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Dict, List, Optional
 from zoneinfo import ZoneInfo
 
@@ -20,12 +18,12 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+import core_db
 from auth import get_current_user, require_admin, require_permission
 
 logger = logging.getLogger(__name__)
 
 DISPLAY_TZ = ZoneInfo(os.getenv("DISPLAY_TIMEZONE", "America/New_York"))
-DB_PATH = Path(os.getenv("AUDIT_DB_PATH", str(Path(__file__).parent / "audit_log.db")))
 ACTIVE_TIMEOUT_MINUTES = 5
 EXPORT_MAX_ROWS = 200_000
 
@@ -45,60 +43,24 @@ _view_audit = require_permission("viewAudit")
 # DATABASE
 # ============================================================================
 
-def _connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(str(DB_PATH), timeout=10, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA synchronous=NORMAL;")
-    conn.execute("PRAGMA busy_timeout=10000;")
-    return conn
+_db = core_db.transaction
 
 
-@contextmanager
-def _db():
-    conn = _connect()
-    try:
-        yield conn
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+def _iso(ts: Optional[datetime]) -> Optional[str]:
+    """Timestamps leave the API as ISO strings in DISPLAY_TZ, as they always have."""
+    return ts.astimezone(DISPLAY_TZ).isoformat(timespec="milliseconds") if ts else None
 
 
-def init_db() -> None:
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with _db() as conn:
-        conn.executescript("""
-            CREATE TABLE IF NOT EXISTS audit_log (
-                id           TEXT PRIMARY KEY,
-                timestamp    TEXT NOT NULL,
-                action       TEXT NOT NULL,
-                performed_by TEXT NOT NULL,
-                target       TEXT DEFAULT '',
-                details      TEXT DEFAULT '',
-                ip_address   TEXT DEFAULT ''
-            );
-            CREATE INDEX IF NOT EXISTS idx_audit_timestamp    ON audit_log (timestamp DESC);
-            CREATE INDEX IF NOT EXISTS idx_audit_performed_by ON audit_log (performed_by);
-            CREATE INDEX IF NOT EXISTS idx_audit_action       ON audit_log (action);
-            CREATE TABLE IF NOT EXISTS user_preferences (
-                email       TEXT PRIMARY KEY,
-                preferences TEXT NOT NULL DEFAULT '{}',
-                updated_at  TEXT NOT NULL
-            );
-        """)
+def _row(r) -> Dict:
+    out = dict(r)
+    for key in ("timestamp", "last_activity"):
+        if isinstance(out.get(key), datetime):
+            out[key] = _iso(out[key])
+    return out
 
 
-def db_healthy() -> bool:
-    try:
-        with _db() as conn:
-            conn.execute("SELECT 1").fetchone()
-        return True
-    except sqlite3.Error:
-        logger.exception("[AUDIT] database health check failed")
-        return False
+def _day_start(d: date) -> datetime:
+    return datetime.combine(d, time.min, DISPLAY_TZ)
 
 
 # ============================================================================
@@ -132,13 +94,13 @@ def _get_active_users() -> List[Dict]:
 # ============================================================================
 
 def write_audit_event(action: str, performed_by: str, target: str = "", details: str = "", ip_address: str = "") -> None:
-    with _db() as conn:
-        conn.execute(
-            "INSERT INTO audit_log (id, timestamp, action, performed_by, target, details, ip_address) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+    with _db() as cur:
+        cur.execute(
+            'INSERT INTO audit_log (id, "timestamp", action, performed_by, target, details, ip_address) '
+            "VALUES (%s, %s, %s, %s, %s, %s, %s)",
             (
                 str(uuid.uuid4()),
-                datetime.now(DISPLAY_TZ).isoformat(timespec="milliseconds"),
+                datetime.now(timezone.utc),
                 action[:64],
                 (performed_by or "unknown")[:254],
                 (target or "")[:512],
@@ -179,26 +141,26 @@ def _build_where(search, action, performed_by, date_from, date_to) -> tuple:
     if search:
         s = f"%{_like_escape(search.lower())}%"
         clauses.append(
-            "(LOWER(performed_by) LIKE ? ESCAPE '\\' OR LOWER(action) LIKE ? ESCAPE '\\' "
-            "OR LOWER(details) LIKE ? ESCAPE '\\' OR LOWER(target) LIKE ? ESCAPE '\\')"
+            "(LOWER(performed_by) LIKE %s ESCAPE '\\' OR LOWER(action) LIKE %s ESCAPE '\\' "
+            "OR LOWER(details) LIKE %s ESCAPE '\\' OR LOWER(target) LIKE %s ESCAPE '\\')"
         )
         params.extend([s, s, s, s])
     if action:
-        clauses.append("action = ?")
+        clauses.append("action = %s")
         params.append(action)
     if performed_by:
-        clauses.append("LOWER(performed_by) LIKE ? ESCAPE '\\'")
+        clauses.append("LOWER(performed_by) LIKE %s ESCAPE '\\'")
         params.append(f"%{_like_escape(performed_by.lower())}%")
     d_from = _parse_day(date_from, "date_from")
     d_to = _parse_day(date_to, "date_to")
+    # Days are calendar days in DISPLAY_TZ; "< next day" includes every
+    # fraction of a second of the end date.
     if d_from:
-        clauses.append("timestamp >= ?")
-        params.append(d_from.isoformat())
+        clauses.append('"timestamp" >= %s')
+        params.append(_day_start(d_from))
     if d_to:
-        # Timestamps are ISO strings in DISPLAY_TZ, so "< next day" includes
-        # every fractional second of the end date.
-        clauses.append("timestamp < ?")
-        params.append((d_to + timedelta(days=1)).isoformat())
+        clauses.append('"timestamp" < %s')
+        params.append(_day_start(d_to + timedelta(days=1)))
     return ("WHERE " + " AND ".join(clauses)) if clauses else "", params
 
 
@@ -224,19 +186,22 @@ def get_audit_logs(
     page_size: int = Query(20, ge=1, le=100),
     f: _Filters = Depends(),
 ):
-    with _db() as conn:
-        total = conn.execute(f"SELECT COUNT(*) FROM audit_log {f.where}", f.params).fetchone()[0]
-        rows = conn.execute(
-            f"SELECT * FROM audit_log {f.where} ORDER BY timestamp DESC, id LIMIT ? OFFSET ?",
+    with _db() as cur:
+        cur.execute(f"SELECT COUNT(*) FROM audit_log {f.where}", f.params)
+        total = cur.fetchone()[0]
+        cur.execute(
+            f'SELECT * FROM audit_log {f.where} ORDER BY "timestamp" DESC, id LIMIT %s OFFSET %s',
             f.params + [page_size, (page - 1) * page_size],
-        ).fetchall()
-    return {"logs": [dict(r) for r in rows], "total": total, "page": page, "page_size": page_size}
+        )
+        rows = cur.fetchall()
+    return {"logs": [_row(r) for r in rows], "total": total, "page": page, "page_size": page_size}
 
 
 @audit_router.get("/logs/ids", dependencies=[Depends(_view_audit)])
 def get_audit_log_ids(f: _Filters = Depends()):
-    with _db() as conn:
-        ids = [r[0] for r in conn.execute(f"SELECT id FROM audit_log {f.where}", f.params)]
+    with _db() as cur:
+        cur.execute(f"SELECT id FROM audit_log {f.where}", f.params)
+        ids = [r[0] for r in cur.fetchall()]
     return {"ids": ids, "total": len(ids)}
 
 
@@ -244,18 +209,19 @@ def get_audit_log_ids(f: _Filters = Depends()):
 def get_audit_stats():
     today = datetime.now(DISPLAY_TZ).date()
     role_actions = ("role_assigned", "role_removed", "role_created", "role_updated", "role_deleted", "role_reset")
-    with _db() as conn:
-        row = conn.execute(
-            f"""
+    with _db() as cur:
+        cur.execute(
+            """
             SELECT
                 COUNT(*),
-                SUM(CASE WHEN timestamp >= ? AND timestamp < ? THEN 1 ELSE 0 END),
-                SUM(CASE WHEN action IN ({",".join("?" * len(role_actions))}) THEN 1 ELSE 0 END),
+                COUNT(*) FILTER (WHERE "timestamp" >= %s AND "timestamp" < %s),
+                COUNT(*) FILTER (WHERE action = ANY(%s)),
                 COUNT(DISTINCT performed_by)
             FROM audit_log
             """,
-            [today.isoformat(), (today + timedelta(days=1)).isoformat(), *role_actions],
-        ).fetchone()
+            [_day_start(today), _day_start(today + timedelta(days=1)), list(role_actions)],
+        )
+        row = cur.fetchone()
     return {
         "total": row[0] or 0,
         "today": row[1] or 0,
@@ -266,8 +232,9 @@ def get_audit_stats():
 
 @audit_router.get("/actions", dependencies=[Depends(_view_audit)])
 def get_audit_actions():
-    with _db() as conn:
-        rows = conn.execute("SELECT action, COUNT(*) AS n FROM audit_log GROUP BY action ORDER BY action").fetchall()
+    with _db() as cur:
+        cur.execute("SELECT action, COUNT(*) AS n FROM audit_log GROUP BY action ORDER BY action")
+        rows = cur.fetchall()
     return {"actions": [{"action": r["action"], "count": r["n"]} for r in rows]}
 
 
@@ -285,9 +252,9 @@ def export_audit_logs(request: Request, f: _Filters = Depends(), user: dict = De
         buf = io.StringIO()
         writer = csv.writer(buf)
         writer.writerow(fields)
-        with _db() as conn:
-            cur = conn.execute(
-                f"SELECT {', '.join(fields)} FROM audit_log {f.where} ORDER BY timestamp DESC LIMIT ?",
+        with _db() as cur:
+            cur.execute(
+                "SELECT " + ", ".join(f'"{c}"' for c in fields) + f' FROM audit_log {f.where} ORDER BY "timestamp" DESC LIMIT %s',
                 f.params + [EXPORT_MAX_ROWS],
             )
             while True:
@@ -295,7 +262,7 @@ def export_audit_logs(request: Request, f: _Filters = Depends(), user: dict = De
                 if not batch:
                     break
                 for row in batch:
-                    writer.writerow([_csv_safe(v) for v in row])
+                    writer.writerow([_csv_safe(_iso(v) if isinstance(v, datetime) else v) for v in row])
                 yield buf.getvalue()
                 buf.seek(0)
                 buf.truncate(0)
@@ -313,16 +280,17 @@ def export_audit_logs(request: Request, f: _Filters = Depends(), user: dict = De
 
 @audit_router.get("/unique-users", dependencies=[Depends(_view_audit)])
 def get_unique_users():
-    with _db() as conn:
-        rows = conn.execute("""
-            SELECT performed_by AS email, COUNT(*) AS event_count, MAX(timestamp) AS last_activity
+    with _db() as cur:
+        cur.execute("""
+            SELECT performed_by AS email, COUNT(*) AS event_count, MAX("timestamp") AS last_activity
             FROM audit_log
             WHERE performed_by NOT IN ('', 'unknown')
             GROUP BY performed_by
             ORDER BY last_activity DESC
             LIMIT 1000
-        """).fetchall()
-    return {"users": [dict(r) for r in rows]}
+        """)
+        rows = cur.fetchall()
+    return {"users": [_row(r) for r in rows]}
 
 
 @audit_router.get("/active-users", dependencies=[Depends(_view_audit)])
@@ -366,32 +334,27 @@ class PreferencesUpdate(BaseModel):
     reduce_motion: Optional[bool] = None
 
 
-def _load_preferences(conn: sqlite3.Connection, email: str) -> Dict:
-    row = conn.execute("SELECT preferences FROM user_preferences WHERE email = ?", (email,)).fetchone()
-    if not row:
-        return {}
-    try:
-        data = json.loads(row[0])
-        return data if isinstance(data, dict) else {}
-    except ValueError:
-        return {}
+def _load_preferences(cur, email: str, lock: bool = False) -> Dict:
+    cur.execute("SELECT preferences FROM user_preferences WHERE email = %s" + (" FOR UPDATE" if lock else ""), (email,))
+    row = cur.fetchone()
+    return row[0] if row and isinstance(row[0], dict) else {}
 
 
 @audit_router.get("/preferences")
 def get_preferences(user: dict = Depends(get_current_user)):
-    with _db() as conn:
-        return {"preferences": _load_preferences(conn, user["email"])}
+    with _db() as cur:
+        return {"preferences": _load_preferences(cur, user["email"])}
 
 
 @audit_router.put("/preferences")
 def put_preferences(update: PreferencesUpdate, user: dict = Depends(get_current_user)):
     changes = update.model_dump(exclude_none=True)
-    with _db() as conn:
-        prefs = {**_load_preferences(conn, user["email"]), **changes}
-        conn.execute(
-            "INSERT INTO user_preferences (email, preferences, updated_at) VALUES (?, ?, ?) "
-            "ON CONFLICT(email) DO UPDATE SET preferences = excluded.preferences, updated_at = excluded.updated_at",
-            (user["email"], json.dumps(prefs), datetime.now(timezone.utc).isoformat()),
+    with _db() as cur:
+        prefs = {**_load_preferences(cur, user["email"], lock=True), **changes}
+        cur.execute(
+            "INSERT INTO user_preferences (email, preferences, updated_at) VALUES (%s, %s, now()) "
+            "ON CONFLICT (email) DO UPDATE SET preferences = excluded.preferences, updated_at = excluded.updated_at",
+            (user["email"], json.dumps(prefs)),
         )
     return {"preferences": prefs}
 
@@ -402,11 +365,11 @@ def put_preferences(update: PreferencesUpdate, user: dict = Depends(get_current_
 
 @audit_router.delete("/logs/{log_id}")
 def delete_audit_log(log_id: str, request: Request, silent: bool = Query(False), user: dict = Depends(require_admin)):
-    with _db() as conn:
-        row = conn.execute("SELECT action, performed_by FROM audit_log WHERE id = ?", (log_id,)).fetchone()
+    with _db() as cur:
+        cur.execute("DELETE FROM audit_log WHERE id = %s RETURNING action, performed_by", (log_id,))
+        row = cur.fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Audit log not found")
-        conn.execute("DELETE FROM audit_log WHERE id = ?", (log_id,))
     if not silent:
         write_audit_event(
             "audit_log_deleted", user["email"], target=log_id,
@@ -430,12 +393,10 @@ def delete_audit_logs_bulk(
     ids = list(dict.fromkeys(i for i in body.ids if i))
     deleted = 0
     if ids:
-        with _db() as conn:
-            for i in range(0, len(ids), 500):
-                chunk = ids[i:i + 500]
-                deleted += conn.execute(
-                    f"DELETE FROM audit_log WHERE id IN ({','.join('?' * len(chunk))})", chunk
-                ).rowcount
+        with _db() as cur:
+            for i in range(0, len(ids), 5000):
+                cur.execute("DELETE FROM audit_log WHERE id = ANY(%s)", (ids[i:i + 5000],))
+                deleted += cur.rowcount
     if deleted and not silent:
         write_audit_event(
             "audit_log_deleted", user["email"], target=f"{deleted} entries",

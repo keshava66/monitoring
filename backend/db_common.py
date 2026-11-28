@@ -125,7 +125,7 @@ def load_table_section(section: str, schema: str) -> List[Dict]:
 # CONNECTION POOL
 # ============================================================================
 
-class _BlockingPool:
+class BlockingPool:
     """ThreadedConnectionPool raises immediately when exhausted; this waits
     (bounded) for a free connection instead, so bursts queue rather than 500."""
 
@@ -156,11 +156,11 @@ class _BlockingPool:
         self._pool.closeall()
 
 
-_POOL: Optional[_BlockingPool] = None
+_POOL: Optional[BlockingPool] = None
 _pool_lock = threading.Lock()
 
 
-def _get_pool() -> _BlockingPool:
+def _get_pool() -> BlockingPool:
     global _POOL
     if _POOL is not None:
         return _POOL
@@ -168,7 +168,7 @@ def _get_pool() -> _BlockingPool:
         if _POOL is None:
             pg = load_config()["POSTGRES"]
             schemas = ",".join(dict.fromkeys([epod_schema(), rimdocs_schema(), "public"]))
-            _POOL = _BlockingPool(
+            _POOL = BlockingPool(
                 int(os.environ.get("PG_POOL_MIN", "1")),
                 int(os.environ.get("PG_POOL_MAX", "20")),
                 host=pg.get("host", "localhost"),

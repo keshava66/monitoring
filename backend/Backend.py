@@ -22,8 +22,10 @@ from pydantic import BaseModel, Field  # noqa: E402
 from starlette.concurrency import run_in_threadpool  # noqa: E402
 from starlette.datastructures import MutableHeaders  # noqa: E402
 
-import audit  # noqa: E402
+import psycopg2  # noqa: E402
+
 import auth  # noqa: E402
+import core_db  # noqa: E402
 import db_common  # noqa: E402
 import rbac  # noqa: E402
 from audit import audit_router, client_ip, write_audit_event  # noqa: E402
@@ -103,7 +105,8 @@ _agent_stream_client = httpx.AsyncClient(
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    audit.init_db()
+    # Fail fast: without its own database the app can't resolve roles or audit.
+    core_db.migrate()
     configured = [p for p, a in AGENTS.items() if a["url"]]
     logger.info("Monitoring API %s starting; agents configured: %s", APP_VERSION, ", ".join(configured) or "none")
     for p in configured:
@@ -115,6 +118,7 @@ async def lifespan(_: FastAPI):
     await _agent_stream_client.aclose()
     auth.graph_client.close()
     db_common.close_pool()
+    core_db.close_pool()
 
 
 TAGS_METADATA = [
@@ -201,6 +205,15 @@ app.add_middleware(
 app.add_middleware(RequestContextMiddleware)
 
 
+@app.exception_handler(core_db.DatabaseUnavailable)
+@app.exception_handler(psycopg2.OperationalError)
+async def _database_down(request: Request, exc: Exception):
+    rid = request.scope.get("state", {}).get("request_id", "")
+    logger.error("Database unavailable rid=%s on %s %s: %s", rid, request.method, request.url.path,
+                 str(exc).strip().splitlines()[0] if str(exc).strip() else type(exc).__name__)
+    return JSONResponse(status_code=503, content={"detail": "Database unavailable, please retry", "request_id": rid})
+
+
 @app.exception_handler(Exception)
 async def _unhandled(request: Request, exc: Exception):
     rid = request.scope.get("state", {}).get("request_id", "")
@@ -225,7 +238,7 @@ def health_check():
 
 @app.get("/health/ready", tags=["System"])
 def readiness_check():
-    checks = {"audit_db": audit.db_healthy()}
+    checks = {"core_db": core_db.healthy()}
     try:
         db_common.load_config()
         checks["postgres"] = db_common.db_healthy()

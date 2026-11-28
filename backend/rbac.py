@@ -8,18 +8,18 @@ permissions from /api/rbac/me, so nothing here is duplicated client-side.
 from __future__ import annotations
 
 import copy
-import json
 import logging
 import os
 import re
-import tempfile
 import threading
-from pathlib import Path
+import time
 from typing import Dict, Iterable, List, Optional, Tuple
 
-logger = logging.getLogger(__name__)
+import psycopg2.extras
 
-RBAC_CONFIG_PATH = Path(os.getenv("RBAC_CONFIG_PATH", str(Path(__file__).parent / "rbac_config.json")))
+import core_db
+
+logger = logging.getLogger(__name__)
 
 ROLE_ID_RE = re.compile(r"^[a-z][a-z0-9_]{1,47}$")
 COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
@@ -175,80 +175,72 @@ ROLE_PRIORITY = ("admin", "operational_support")
 # ── Persistence ──────────────────────────────────────────────────────────────
 
 class RBACStore:
-    """JSON-file store with an mtime-validated cache and atomic writes.
+    """Custom roles and per-user assignments in PostgreSQL (core_db).
 
-    Reads are served from memory and only hit the disk when the file has
-    changed, so per-request permission checks are cheap. Every mutation runs
-    under one lock as a read-modify-write, so two concurrent edits can never
-    silently drop one another.
+    Permission checks run on every request, so reads come from a copy kept
+    in memory for CACHE_SECONDS; another backend instance's change is seen
+    within that window, this instance's own changes at once. Every mutation
+    is one transaction under an advisory lock, as a read-modify-write, so two
+    concurrent edits (from any instance) can never drop one another.
     """
 
-    def __init__(self, path: Path):
-        self.path = path
-        self._lock = threading.RLock()
+    CACHE_SECONDS = 5.0
+    _LOCK_KEY = 0x72626163  # "rbac"
+
+    def __init__(self):
+        self._lock = threading.Lock()
         self._cache: Optional[Dict] = None
-        self._mtime: Optional[float] = None
+        self._loaded_at = 0.0
 
     @staticmethod
-    def _empty() -> Dict:
-        return {"custom_roles": {}, "user_role_overrides": {}}
-
-    def _read_disk(self) -> Dict:
-        try:
-            with open(self.path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except FileNotFoundError:
-            return self._empty()
-        except (OSError, json.JSONDecodeError):
-            logger.exception("[RBAC] %s is unreadable; refusing to treat it as empty", self.path)
-            raise
-        if not isinstance(data, dict):
-            raise ValueError(f"{self.path} must contain a JSON object")
-        data.setdefault("custom_roles", {})
-        data.setdefault("user_role_overrides", {})
-        data["custom_roles"] = {rid: _normalize_role(r) for rid, r in data["custom_roles"].items()}
-        data["user_role_overrides"] = {e.lower(): r for e, r in data["user_role_overrides"].items()}
-        return data
+    def _read(cur) -> Dict:
+        cur.execute("SELECT role_id, definition FROM rbac_roles")
+        roles = {r[0]: _normalize_role(r[1]) for r in cur.fetchall()}
+        cur.execute("SELECT email, role_id FROM rbac_user_roles")
+        return {"custom_roles": roles, "user_role_overrides": {r[0].lower(): r[1] for r in cur.fetchall()}}
 
     def load(self) -> Dict:
         with self._lock:
-            try:
-                mtime = self.path.stat().st_mtime
-            except FileNotFoundError:
-                mtime = None
-            if self._cache is None or mtime != self._mtime:
-                self._cache = self._read_disk()
-                self._mtime = mtime
+            if self._cache is None or time.monotonic() - self._loaded_at > self.CACHE_SECONDS:
+                with core_db.transaction() as cur:
+                    self._cache = self._read(cur)
+                self._loaded_at = time.monotonic()
             return copy.deepcopy(self._cache)
 
-    def _write(self, config: Dict) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(prefix=".rbac_", suffix=".json", dir=str(self.path.parent))
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(config, f, indent=2, sort_keys=True)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp, self.path)
-        except BaseException:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
-        self._cache = copy.deepcopy(config)
-        self._mtime = self.path.stat().st_mtime
-
     def mutate(self, fn):
-        """Run fn(config) under the store lock and persist the result."""
-        with self._lock:
-            config = self.load()
+        """Run fn(config) on the current state and persist whatever it changed."""
+        with core_db.transaction() as cur:
+            cur.execute("SELECT pg_advisory_xact_lock(%s)", (self._LOCK_KEY,))
+            before = self._read(cur)
+            config = copy.deepcopy(before)
             result = fn(config)
-            self._write(config)
-            return result
+            roles, users = config["custom_roles"], config["user_role_overrides"]
+            gone = [r for r in before["custom_roles"] if r not in roles]
+            if gone:
+                cur.execute("DELETE FROM rbac_roles WHERE role_id = ANY(%s)", (gone,))
+            for role_id, role in roles.items():
+                if before["custom_roles"].get(role_id) != role:
+                    cur.execute(
+                        "INSERT INTO rbac_roles (role_id, definition, updated_at) VALUES (%s, %s, now()) "
+                        "ON CONFLICT (role_id) DO UPDATE SET definition = excluded.definition, updated_at = now()",
+                        (role_id, psycopg2.extras.Json(role)),
+                    )
+            gone = [e for e in before["user_role_overrides"] if e not in users]
+            if gone:
+                cur.execute("DELETE FROM rbac_user_roles WHERE email = ANY(%s)", (gone,))
+            for email, role_id in users.items():
+                if before["user_role_overrides"].get(email) != role_id:
+                    cur.execute(
+                        "INSERT INTO rbac_user_roles (email, role_id, updated_at) VALUES (%s, %s, now()) "
+                        "ON CONFLICT (email) DO UPDATE SET role_id = excluded.role_id, updated_at = now()",
+                        (email.lower(), role_id),
+                    )
+        with self._lock:
+            self._cache, self._loaded_at = copy.deepcopy(config), time.monotonic()
+        return result
 
 
-store = RBACStore(RBAC_CONFIG_PATH)
+store = RBACStore()
 
 
 # ── Validation / normalisation ───────────────────────────────────────────────
