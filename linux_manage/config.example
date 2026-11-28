@@ -1,0 +1,34 @@
+[manager]
+host = 0.0.0.0
+port = 8001
+
+# Each service's own settings (port, certificate, python/node) live in
+# <dir>/.env.server, the same file backend.sh / frontend.sh read from cron.
+# port, entry and [ssl] below only fill in what .env.server leaves out.
+[backend]
+name = Backend API
+dir = /home/sa-prd-rdi-react-<>/monitoring/backend
+port = 8501
+entry = Backend:app
+
+[frontend]
+name = Frontend App
+dir = /home/sa-prd-rdi-react-<>/monitoring/frontend
+port = 8502
+
+# HTTPS for this manager, and the default certificate for the services.
+[ssl]
+certfile = /home/sa-prd-rdi-react-<>/SSL2026/server_cert.pem
+keyfile = /home/sa-prd-rdi-react-<>/SSL2026/server_key.pem
+
+[scripts]
+backend = /home/sa-prd-rdi-react-<>/monitoring/linux_manage/backend.sh
+frontend = /home/sa-prd-rdi-react-<>/monitoring/linux_manage/frontend.sh
+
+[repo]
+dir = /home/sa-prd-rdi-react-<>/monitoring
+username = SA-PRD-RDI-REACT-<>
+password =
+
+[search_paths]
+home = /home/sa-prd-rdi-react-<>

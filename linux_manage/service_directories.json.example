@@ -1,0 +1,22 @@
+{
+  "_readme": [
+    "port and entry are used only when that folder's .env.server doesn't set PORT / APP.",
+    "entry (backend only): tells uvicorn which file + variable to run, format is 'filename_without_.py:variable_name'.",
+    "  Examples: Backend.py with 'app = FastAPI()' inside -> entry = 'Backend:app'",
+    "            app.py with 'app = FastAPI()' inside     -> entry = 'app:app'",
+    "            main.py with 'server = FastAPI()' inside -> entry = 'main:server'",
+    "  Open the backend's main .py file, find the FastAPI() line, use that filename + variable name.",
+    "port (backend and frontend): the port that service will run on. Must be unique per running service, don't reuse a port that's already active elsewhere.",
+    "label: short name shown in the directory-switcher dropdown in the UI.",
+    "notes: free text, shown as a tooltip next to the label, not used by the code."
+  ],
+  "backend": [
+    { "label": "Monitoring",    "path": "/home/sa-prd-rdi-react-dev/monitoring/backend", "port": 8501, "entry": "Backend:app", "notes": "Monitoring backend service" },
+    { "label": "SmartHub",      "path": "/home/sa-prd-rdi-react-dev/dqe/backend",         "port": 8000, "entry": "app:app", "notes": "DQE backend service" },
+    { "label": "Linux Manage",  "path": "/home/sa-prd-rdi-react-dev/monitoring/linux_manage", "port": 8001, "entry": "manage:app", "notes": "Pre-prod validation" }
+  ],
+  "frontend": [
+    { "label": "Monitoring",    "path": "/home/sa-prd-rdi-react-dev/monitoring/frontend", "port": 8502, "notes": "Monitoring frontend service" },
+    { "label": "SmartHub",      "path": "/home/sa-prd-rdi-react-dev/dqe/frontend",         "port": 8080, "notes": "DQE frontend service" }
+  ]
+}
