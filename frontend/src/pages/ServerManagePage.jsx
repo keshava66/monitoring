@@ -143,17 +143,17 @@ function ServiceCard({ svc, info, state, busy, canAdmin, onAction, dirOptions, o
           <div key={k} className="min-w-0 bg-[#fbfaf8] px-3.5 py-3"><dt className="text-[12px] font-medium text-jj-gray-06">{k}</dt><dd className="mt-1 font-johnson-display font-light text-xl leading-none text-jj-gray-08 tabular-nums truncate">{v || '—'}</dd></div>
         ))}
       </dl>
-      <div className="relative px-5 sm:px-6 mt-4">
-        <PulseLine load={info.cpu} color={st.color} live={running} />
-        <dl className="mt-1 flex gap-5 font-johnson-text text-[13px]">
-          {[['CPU', info.cpu], ['Mem', info.mem]].map(([k, v]) => (
-            <div key={k} className="flex gap-1.5">
+      <dl className="relative grid grid-cols-2 gap-5 px-5 sm:px-6 mt-4 font-johnson-text text-[13px]">
+        {[['CPU', info.cpu, '#0f68b2'], ['Memory', info.mem, '#8c3bbb']].map(([k, v, c]) => (
+          <div key={k} className="min-w-0">
+            <div className="flex justify-between gap-2">
               <dt className="text-jj-gray-06">{k}</dt>
               <dd className="tabular-nums text-jj-gray-08 font-medium">{v != null ? `${v}%` : '—'}</dd>
             </div>
-          ))}
-        </dl>
-      </div>
+            <PulseLine load={v} color={c} live={running} className="mt-1" />
+          </div>
+        ))}
+      </dl>
       <div className="relative mt-auto flex flex-wrap gap-2 p-5 sm:p-6">
         {canAdmin && (running ? (
           <>
