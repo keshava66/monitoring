@@ -3,7 +3,27 @@ start.sh
 start.bat
 config.ini
 .env
+
+# Runtime output
 *.pid
 *.log
+*.log.[0-9]*
+
+# Python
 __pycache__/
+*.pyc
 venv/
+.venv/
+.pytest_cache/
+
+# Node
+node_modules/
+dist/
+
+# Editors and OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
