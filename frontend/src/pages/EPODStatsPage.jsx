@@ -24,7 +24,7 @@ const PRODUCTS = [
   { id: 'epod', label: 'EPOD', permission: 'viewEPODStatsEPOD', title: 'EPOD ingestion', subtitle: 'EPOD NAS drive ingestion log', chunks: false },
 ];
 
-const TOOLTIP_STYLE = { borderRadius: 10, border: '1px solid #e8e6e3', boxShadow: '0 8px 24px rgba(49,44,42,0.12)', fontFamily: 'JohnsonText, Arial', fontSize: 12 };
+const TOOLTIP_STYLE = { borderRadius: 10, border: '1px solid #e8e6e3', boxShadow: '0 8px 24px rgba(49,44,42,0.12)', fontFamily: 'JohnsonText, sans-serif', fontSize: 12 };
 
 // ── Sections ──────────────────────────────────────────────────────────────────
 

@@ -29,7 +29,7 @@ import subprocess
 import tempfile
 import threading
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -505,17 +505,49 @@ def health():
     return {"status": "healthy", "api": API_VERSION}
 
 
+# CPU and memory history for the service cards' trend lines: one sample per service every
+# HISTORY_EVERY seconds, the last HISTORY_LEN kept (10 minutes). Started at
+# boot; the first overview call starts it too when the module is imported.
+HISTORY_EVERY = 10
+HISTORY_LEN = 60
+_history: Dict[str, deque] = {svc: deque(maxlen=HISTORY_LEN) for svc in SERVICES}  # (cpu %, mem %)
+_sampler_started = threading.Event()
+
+
+def _sample_forever() -> None:
+    while True:
+        try:
+            cfg = read_config()
+            pids = {svc: read_pid(_section(cfg, svc).get("dir", ""), svc) for svc in SERVICES}
+            for svc, st in proc_stats(pids).items():
+                _history[svc].append((st["cpu"] or 0.0, st["mem"] or 0.0))
+        except Exception:
+            logger.exception("Resource sampler tick failed")
+        time.sleep(HISTORY_EVERY)
+
+
+def _ensure_sampler() -> None:
+    if not _sampler_started.is_set():
+        _sampler_started.set()
+        threading.Thread(target=_sample_forever, name="resource-sampler", daemon=True).start()
+
+
 @_protected.get("/api/overview")
 def overview():
     """Everything the panel shows in one call: per-service config, process
     state and any action in progress, plus host vitals."""
+    _ensure_sampler()
     cfg = read_config()
     sections = {svc: _section(cfg, svc) for svc in SERVICES}
     pids = {svc: read_pid(sec.get("dir", ""), svc) for svc, sec in sections.items()}
     stats = proc_stats(pids)
     services = {
         svc: {"name": sec.get("name", ""), "port": sec.get("port", ""), "dir": sec.get("dir", ""),
-              "running": pids[svc] is not None, "pid": pids[svc], **stats[svc], "busy": _busy(svc)}
+              "running": pids[svc] is not None, "pid": pids[svc], **stats[svc], "busy": _busy(svc),
+              # Ends with the reading shown next to it, so line and number agree.
+              "history": {"cpu": [*(c for c, _ in _history[svc]), stats[svc]["cpu"] or 0.0],
+                          "mem": [*(m for _, m in _history[svc]), stats[svc]["mem"] or 0.0],
+                          "every": HISTORY_EVERY}}
         for svc, sec in sections.items()
     }
     return {"services": services, "git": _busy("git"),
@@ -908,6 +940,7 @@ async def terminal_ws(websocket: WebSocket):
 # ── entry point ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    _ensure_sampler()
     cfg = read_config()
     mgr = _section(cfg, "manager")
     ssl = _section(cfg, "ssl")

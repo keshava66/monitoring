@@ -20,7 +20,7 @@ const TABS = [
   { id: 'trends', label: 'Trends' },
   { id: 'pdfs', label: 'Largest PDFs' },
 ];
-const TT = { borderRadius: 10, border: '1px solid #e8e6e3', boxShadow: '0 8px 24px rgba(49,44,42,0.12)', fontFamily: 'JohnsonText, Arial', fontSize: 12 };
+const TT = { borderRadius: 10, border: '1px solid #e8e6e3', boxShadow: '0 8px 24px rgba(49,44,42,0.12)', fontFamily: 'JohnsonText, sans-serif', fontSize: 12 };
 const AXIS = { fontSize: 11, fill: '#6e6259' };
 const truncate = (s, n = 18) => (s && s.length > n ? `${s.slice(0, n - 1)}…` : s);
 
@@ -119,8 +119,8 @@ function TreemapCell({ x, y, width, height, name, label, index }) {
       <rect x={x} y={y} width={width} height={height} fill={shades[index % shades.length]} stroke="#fff" strokeWidth={2} />
       {width > 70 && height > 34 && (
         <>
-          <text x={x + 8} y={y + 18} fill="#fff" fontSize={12} fontFamily="JohnsonText, Arial">{truncate(name, Math.floor(width / 7))}</text>
-          <text x={x + 8} y={y + 33} fill="rgba(255,255,255,0.8)" fontSize={11} fontFamily="JohnsonText, Arial">{label}</text>
+          <text x={x + 8} y={y + 18} fill="#fff" fontSize={12} fontFamily="JohnsonText, sans-serif">{truncate(name, Math.floor(width / 7))}</text>
+          <text x={x + 8} y={y + 33} fill="rgba(255,255,255,0.8)" fontSize={11} fontFamily="JohnsonText, sans-serif">{label}</text>
         </>
       )}
     </g>

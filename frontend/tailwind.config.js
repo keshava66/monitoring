@@ -32,9 +32,12 @@ export default {
       borderRadius: { '4xl': '2rem' },
       transitionTimingFunction: { out: 'cubic-bezier(0.16,1,0.3,1)' },
       fontFamily: {
-        'johnson-text': ['JohnsonText', 'system-ui', 'Arial', 'sans-serif'],
-        'johnson-display': ['JohnsonDisplay', 'system-ui', 'Arial', 'sans-serif'],
-        mono: ['ui-monospace', 'SFMono-Regular', 'Menlo', 'Consolas', 'Liberation Mono', 'monospace'],
+        // J&J fonts only. There is no J&J monospace, so code, paths and the
+        // terminal use JohnsonText with tabular figures (see index.css).
+        sans: ['JohnsonText', 'sans-serif'],
+        'johnson-text': ['JohnsonText', 'sans-serif'],
+        'johnson-display': ['JohnsonDisplay', 'sans-serif'],
+        mono: ['JohnsonText', 'sans-serif'],
       },
       boxShadow: {
         card: '0 1px 2px rgba(49,44,42,0.04), 0 18px 40px -30px rgba(49,44,42,0.45)',

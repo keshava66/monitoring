@@ -4,7 +4,6 @@ import { useRBAC } from '../context/RBACContext';
 import { useAuth } from '../context/AuthContext';
 import { ApiError, downloadBlob, isAbort, requestJson, streamNdjsonUrl } from '../utils/apiClient';
 import { logAuditEvent } from '../utils/auditLog';
-import { PulseLine } from '../components/HeroArt';
 import {
   Alert, Badge, Button, Dot, EmptyState, Icon, Menu, MenuItem, Page, PageHeader, ProgressBar, StatusChip, Tabs, Toggle, cx, useFeedback, usePolling,
 } from '../components/ui';
@@ -30,6 +29,7 @@ const SERVICES = [
   { id: 'frontend', label: 'Frontend app', icon: 'globe' },
 ];
 const REFRESH_MS = 30_000;
+const LOCAL_HISTORY = 21; // 10 minutes of 30-second polls, for managers that keep no history
 const BUSY_REFRESH_MS = 3_000;
 const LOG_FOLLOW_MS = 5_000;
 const LOG_LINES = 500;
@@ -94,7 +94,26 @@ async function fetchOverview(url) {
   };
 }
 
-function ServiceCard({ svc, info, state, busy, canAdmin, onAction, dirOptions, onChangeDir }) {
+const spanLabel = (seconds) => (seconds >= 90 ? `${Math.round(seconds / 60)} min` : `${seconds}s`);
+
+/** Measured values, oldest first, scaled to the busiest moment (at least 5%). */
+function Trend({ values, color, label }) {
+  if (!values || values.length < 2) {
+    return <div className="h-7 mt-1 flex items-center font-johnson-text text-[11.5px] text-jj-gray-05">Collecting…</div>;
+  }
+  const top = Math.max(5, Math.max(...values) * 1.2);
+  const step = 100 / (values.length - 1);
+  const pts = values.map((v, i) => `${(i * step).toFixed(2)},${(38 - (v / top) * 34).toFixed(2)}`).join(' ');
+  return (
+    <svg viewBox="0 0 100 40" preserveAspectRatio="none" className="w-full h-7 mt-1" role="img" aria-label={label}>
+      <polygon points={`0,40 ${pts} 100,40`} fill={color} opacity="0.12" />
+      <polyline points={pts} fill="none" stroke={color} strokeWidth="1.6" strokeLinejoin="round" vectorEffect="non-scaling-stroke" />
+    </svg>
+  );
+}
+
+function ServiceCard({ svc, info, history, state, busy, canAdmin, onAction, dirOptions, onChangeDir }) {
+  const span = spanLabel(Math.max(0, (history?.cpu?.length || 1) - 1) * (history?.every || 0));
   const st = busy ? { ...STATE.busy, label: BUSY_LABEL[busy.action] || STATE.busy.label } : STATE[state] || STATE.loading;
   const [menuOpen, setMenuOpen] = useState(false);
   const running = state === 'running';
@@ -144,16 +163,17 @@ function ServiceCard({ svc, info, state, busy, canAdmin, onAction, dirOptions, o
         ))}
       </dl>
       <dl className="relative grid grid-cols-2 gap-5 px-5 sm:px-6 mt-4 font-johnson-text text-[13px]">
-        {[['CPU', info.cpu, '#0f68b2'], ['Memory', info.mem, '#8c3bbb']].map(([k, v, c]) => (
+        {[['CPU', info.cpu, history?.cpu, '#0f68b2'], ['Memory', info.mem, history?.mem, '#8c3bbb']].map(([k, v, values, c]) => (
           <div key={k} className="min-w-0">
             <div className="flex justify-between gap-2">
               <dt className="text-jj-gray-06">{k}</dt>
               <dd className="tabular-nums text-jj-gray-08 font-medium">{v != null ? `${v}%` : '—'}</dd>
             </div>
-            <PulseLine load={v} color={c} live={running} className="mt-1" />
+            <Trend values={values} color={c} label={`${svc.label} ${k} over the last ${span}, now ${v ?? 0}%`} />
           </div>
         ))}
       </dl>
+      {history?.cpu?.length > 1 && <p className="relative px-5 sm:px-6 mt-1 font-johnson-text text-[11px] text-jj-gray-05">Last {span}</p>}
       <div className="relative mt-auto flex flex-wrap gap-2 p-5 sm:p-6">
         {canAdmin && (running ? (
           <>
@@ -202,6 +222,7 @@ function ServerPanel({ server, tabs, onHealth }) {
   const api = useCallback((path, opts) => requestJson(`${server.url}${path}`, opts), [server.url]);
 
   const [overview, setOverview] = useState(null);
+  const [localHistory, setLocalHistory] = useState({});
   const [failure, setFailure] = useState(null);
   const [lastSync, setLastSync] = useState(null);
   const [pending, setPending] = useState({});
@@ -235,6 +256,14 @@ function ServerPanel({ server, tabs, onHealth }) {
   const refresh = useCallback(async () => {
     try {
       const d = await fetchOverview(server.url);
+      if (d.legacy) {
+        // Older managers keep no history: build it from this page's own polls.
+        setLocalHistory((h) => Object.fromEntries(SERVICES.map((svc) => {
+          const prev = h[svc.id] || { cpu: [], mem: [] };
+          const x = d.services[svc.id] || {};
+          return [svc.id, { cpu: [...prev.cpu, x.cpu || 0].slice(-LOCAL_HISTORY), mem: [...prev.mem, x.mem || 0].slice(-LOCAL_HISTORY), every: REFRESH_MS / 1000 }];
+        })));
+      }
       setOverview(d);
       setFailure(null);
       onHealth(server.id, summarize(d));
@@ -436,7 +465,7 @@ function ServerPanel({ server, tabs, onHealth }) {
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-5 stagger">
         {SERVICES.map((svc) => (
-          <ServiceCard key={svc.id} svc={svc} info={overview?.services[svc.id] || {}} state={svcState(svc.id)} busy={busyOf(svc.id)}
+          <ServiceCard key={svc.id} svc={svc} info={overview?.services[svc.id] || {}} history={overview?.services[svc.id]?.history || localHistory[svc.id]} state={svcState(svc.id)} busy={busyOf(svc.id)}
             canAdmin={canAdmin} onAction={runAction} dirOptions={dirs[svc.id] || []} onChangeDir={changeDir} />
         ))}
       </div>
