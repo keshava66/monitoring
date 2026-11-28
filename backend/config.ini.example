@@ -1,0 +1,22 @@
+[POSTGRES]
+host = <postgres-host>
+port = 5432
+dbname = <database>
+user = <user>
+password =
+schema = epod1
+rimdocs_schema = rimdocs1
+sslmode = require
+
+# One line per ingestion table: key = table | label | optional #colour
+[TABLES]
+m1 = ingestion_log_m1 | Module 1 Regional
+
+[RIMDOCS_TABLES]
+us = ingestion_log_us | United States
+
+# Optional NAS scanner settings
+[NAS]
+schema = epod1
+folder_table = folder_progress
+file_table = file_data

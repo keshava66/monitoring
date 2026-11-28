@@ -1,0 +1,786 @@
+"""Backend test suite.
+
+Graph is faked at the HTTP transport layer. A real PostgreSQL server is
+required (TEST_PG_HOST / TEST_PG_PORT / TEST_PG_USER / TEST_PG_PASSWORD,
+defaults: localhost:5432 postgres): each run creates a throwaway database for
+the app's own tables (core_db) and the ingestion fixtures, then drops it.
+"""
+import csv
+import io
+import json
+import os
+import sys
+import tempfile
+import time
+import uuid
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import httpx
+import psycopg2
+import pytest
+
+sys.path.insert(0, str(Path(__file__).parent))
+
+_TMP = Path(tempfile.mkdtemp(prefix="monitoring-test-"))
+PG = {
+    "host": os.getenv("TEST_PG_HOST", "localhost"),
+    "port": int(os.getenv("TEST_PG_PORT", "5432")),
+    "user": os.getenv("TEST_PG_USER", "postgres"),
+    "password": os.getenv("TEST_PG_PASSWORD", ""),
+}
+TEST_DB = f"monitoring_test_{uuid.uuid4().hex[:8]}"
+_admin = psycopg2.connect(dbname="postgres", connect_timeout=5, **PG)
+_admin.autocommit = True
+_admin.cursor().execute(f'CREATE DATABASE "{TEST_DB}"')
+
+(_TMP / "config.ini").write_text(
+    "[POSTGRES]\n"
+    f"host={PG['host']}\nport={PG['port']}\ndbname={TEST_DB}\nuser={PG['user']}\npassword={PG['password']}\n"
+    "schema=epod1\nrimdocs_schema=rimdocs1\nsslmode=disable\n\n"
+    "[TABLES]\n"
+    "t1 = ingestion_log_alpha | Alpha | #112233\n"
+    "t2 = ingestion_log_missing | Missing\n\n"
+    "[RIMDOCS_TABLES]\n"
+    "r1 = ingestion_log_x | X\n"
+    "r2 = ingestion_log_y | Y\n\n"
+    "[NAS]\nschema=epod1\n"
+)
+os.environ.update({
+    "EPOD_CONFIG_PATH": str(_TMP / "config.ini"),
+    "MONITORING_DB_DSN": " ".join(f"{k}={v}" for k, v in {**PG, "dbname": TEST_DB}.items() if v != ""),
+    "ALLOWED_ORIGINS": "http://localhost:5173",
+    "AD_GROUP_ADMIN": "GRP-ADMIN",
+    "AD_GROUP_OPERATIONAL_SUPPORT": "GRP-OPS",
+    "EPOD_AGENT_DEV_URL": "http://agent.test",
+    "EPOD_AGENT_DEV_TOKEN": "agent-secret",
+    "STALL_THRESHOLD_MINS": "30",
+})
+
+import audit  # noqa: E402
+import auth  # noqa: E402
+import Backend  # noqa: E402
+import core_db  # noqa: E402
+import rbac  # noqa: E402
+from fastapi.testclient import TestClient  # noqa: E402
+
+USERS = {
+    "admin-token": {"mail": "admin@corp.com", "groups": [{"id": "g1", "displayName": "GRP-ADMIN"}]},
+    "ops-token": {"mail": "ops@corp.com", "groups": [{"id": "g2", "displayName": "GRP-OPS"}]},
+    "viewer-token": {"mail": "viewer@corp.com", "groups": []},
+    "paged-token": {"mail": "paged@corp.com", "groups": "paged"},
+    "nophoto-token": {"mail": "nophoto@corp.com", "groups": []},
+}
+
+
+def _graph_handler(request: httpx.Request) -> httpx.Response:
+    token = request.headers.get("authorization", "")[7:]
+    user = USERS.get(token)
+    if not user:
+        return httpx.Response(401, json={"error": {"code": "InvalidAuthenticationToken"}})
+    path = request.url.path
+    if path.endswith("/me"):
+        return httpx.Response(200, json={"id": token, "displayName": user["mail"].split("@")[0].title(),
+                                         "mail": user["mail"], "userPrincipalName": user["mail"]})
+    if path.endswith("/me/memberOf"):
+        if user["groups"] == "paged":
+            if "page2" in str(request.url):
+                return httpx.Response(200, json={"value": [{"id": "g1", "displayName": "GRP-ADMIN"}]})
+            return httpx.Response(200, json={"value": [{"id": f"x{i}", "displayName": f"Other {i}"} for i in range(5)],
+                                             "@odata.nextLink": "https://graph.test/v1.0/me/memberOf?page2=1"})
+        return httpx.Response(200, json={"value": user["groups"]})
+    if "photo" in path:
+        if token == "nophoto-token":
+            return httpx.Response(404)
+        return httpx.Response(200, content=b"\x89PNG fake", headers={"content-type": "image/png"})
+    return httpx.Response(404)
+
+
+auth.graph_client = httpx.Client(transport=httpx.MockTransport(_graph_handler))
+auth.GRAPH_BASE = "https://graph.test/v1.0"
+
+AGENT_CALLS = []
+
+
+def _agent_handler(request: httpx.Request) -> httpx.Response:
+    AGENT_CALLS.append(request)
+    if request.headers.get("authorization") != "Bearer agent-secret":
+        return httpx.Response(401, json={"detail": "Invalid token"})
+    if request.url.path in ("/status", "/running"):
+        return httpx.Response(200, json={"running": True, "pid": 42})
+    if request.url.path == "/info":
+        return httpx.Response(200, json={"server_name": "EPOD Box"})
+    if request.url.path == "/stop":
+        return httpx.Response(200, json={"success": True})
+    if request.url.path == "/terminal/stream":
+        return httpx.Response(200, stream=httpx.ByteStream(b"data: hello\n\ndata: world\n\n"), headers={"content-type": "text/event-stream"})
+    return httpx.Response(200, json={"path": request.url.path, "query": dict(request.url.params)})
+
+
+Backend._agent_client = httpx.AsyncClient(transport=httpx.MockTransport(_agent_handler))
+Backend._agent_read_client = httpx.AsyncClient(transport=httpx.MockTransport(_agent_handler))
+Backend._agent_stream_client = httpx.AsyncClient(transport=httpx.MockTransport(_agent_handler))
+
+client = TestClient(Backend.app)
+client.__enter__()
+
+
+def H(token):
+    return {"Authorization": f"Bearer {token}"}
+
+
+ADMIN, OPS, VIEWER = H("admin-token"), H("ops-token"), H("viewer-token")
+
+
+# ============================================================================
+# Postgres fixture
+# ============================================================================
+
+@pytest.fixture(scope="session", autouse=True)
+def database():
+    conn = psycopg2.connect(dbname=TEST_DB, **PG)
+    conn.autocommit = True
+    cur = conn.cursor()
+    now = datetime.now(timezone.utc)
+    cur.execute("CREATE SCHEMA epod1; CREATE SCHEMA rimdocs1;")
+    for table in ("epod1.ingestion_log_alpha", "rimdocs1.ingestion_log_x", "rimdocs1.ingestion_log_y"):
+        cur.execute(f"""CREATE TABLE {table} (id serial, status text, file_size bigint,
+                        ingested_at timestamptz, updated_at timestamptz)""")
+    rows = [("SUCCESS", 1000), ("SUCCESS", 3000), ("ERROR", 500), ("RUNNING", 250)]
+    for status, size in rows:
+        cur.execute("INSERT INTO epod1.ingestion_log_alpha (status,file_size,ingested_at,updated_at) VALUES (%s,%s,%s,%s)",
+                    (status, size, now - timedelta(hours=5), now - timedelta(hours=2)))
+    cur.execute("INSERT INTO rimdocs1.ingestion_log_x (status,file_size,ingested_at,updated_at) VALUES ('SUCCESS',2048,%s,%s)",
+                (now - timedelta(minutes=10), now - timedelta(minutes=1)))
+    cur.execute("INSERT INTO rimdocs1.ingestion_log_y (status,file_size,ingested_at,updated_at) VALUES ('RUNNING',10,%s,%s)",
+                (now - timedelta(minutes=5), now - timedelta(minutes=2)))
+    cur.execute("CREATE TABLE rimdocs1.doc_chunks_x (doc_id int)")
+    cur.execute("INSERT INTO rimdocs1.doc_chunks_x VALUES (1),(1),(2)")
+    base = r"\\jnj.com\grausdfsroot\ERIS\EPOD\Archive\eCTD"
+    cur.execute("""CREATE TABLE epod1.folder_progress (folder_path text, total_files int, pdf_files int, xml_files int,
+                   other_files int, total_size_mb bigint, pdf_size_mb bigint, xml_size_mb bigint, other_size_mb bigint,
+                   last_modified timestamp)""")
+    for name, size in (("SEG_A", 5000), ("SEG_B", 9000), ("SEG_100%", 10)):
+        cur.execute("INSERT INTO epod1.folder_progress VALUES (%s,10,6,3,1,%s,%s,10,5,%s)",
+                    (base + "\\" + name, size, size - 20, datetime(2026, 1, 2, 3, 4, 5)))
+    cur.execute("INSERT INTO epod1.folder_progress VALUES (%s,1,1,0,0,1,1,0,0,NULL)", (base + "\\SEG_A\\deep",))
+    cur.execute("CREATE TABLE epod1.file_data (folder_path text, file_name text, file_size_mb bigint, last_modified timestamp)")
+    cur.execute("INSERT INTO epod1.file_data VALUES (%s,'big.pdf',99999,NULL),(%s,'small.PDF',5,NULL),(%s,'x.xml',1e9,NULL)",
+                (base + "\\SEG_B\\sub", base + "\\SEG_A", base))
+    conn.close()
+    yield
+    import db_common
+    db_common.close_pool()
+    core_db.close_pool()
+    _admin.cursor().execute(f'DROP DATABASE IF EXISTS "{TEST_DB}" WITH (FORCE)')
+    _admin.close()
+
+
+# ============================================================================
+# Authentication & authorisation
+# ============================================================================
+
+PROTECTED = [
+    ("GET", "/api/epod/dashboard"), ("GET", "/api/epod/tables"), ("GET", "/api/epod/diagnose"),
+    ("GET", "/api/rimdocs/dashboard"), ("GET", "/api/rimdocs/dashboard/stream"), ("GET", "/api/rimdocs/diagnose"),
+    ("GET", "/api/nas/overview"), ("GET", "/api/nas/debug"),
+    ("GET", "/api/audit/logs"), ("GET", "/api/audit/stats"), ("GET", "/api/audit/export"),
+    ("GET", "/api/audit/active-users"), ("POST", "/api/audit/log"), ("POST", "/api/audit/heartbeat"),
+    ("DELETE", "/api/audit/logs/some-id"),
+    ("GET", "/api/rbac/config"), ("GET", "/api/rbac/me"), ("POST", "/api/rbac/roles"),
+    ("POST", "/api/rbac/user-assignments"), ("GET", "/epod-dev/status"), ("GET", "/epod-qa/status"),
+    ("GET", "/api/agents"), ("GET", "/auth/user"),
+]
+
+
+@pytest.mark.parametrize("method,path", PROTECTED)
+def test_requires_authentication(method, path):
+    assert client.request(method, path, json={} if method == "POST" else None).status_code == 401
+
+
+@pytest.mark.parametrize("method,path", PROTECTED)
+def test_rejects_invalid_token(method, path):
+    resp = client.request(method, path, headers=H("bogus"), json={} if method == "POST" else None)
+    assert resp.status_code == 401
+
+
+VIEWER_FORBIDDEN = [
+    "/api/epod/dashboard", "/api/rimdocs/dashboard", "/api/nas/overview", "/api/audit/logs",
+    "/api/audit/stats", "/api/audit/export", "/api/audit/active-users", "/api/audit/unique-users",
+    "/api/rbac/config", "/epod-dev/status",
+]
+
+
+@pytest.mark.parametrize("path", VIEWER_FORBIDDEN)
+def test_viewer_is_forbidden(path):
+    assert client.get(path, headers=VIEWER).status_code == 403
+
+
+def test_spoofed_admin_header_ignored():
+    resp = client.delete("/api/audit/logs/x", headers={**VIEWER, "X-User-Role": "admin"})
+    assert resp.status_code == 403
+
+
+def test_health_and_security_headers():
+    resp = client.get("/health")
+    assert resp.status_code == 200
+    assert resp.headers["x-content-type-options"] == "nosniff"
+    assert resp.headers["x-request-id"]
+
+
+def test_rbac_me_roles():
+    assert client.get("/api/rbac/me", headers=ADMIN).json()["role"] == "admin"
+    assert client.get("/api/rbac/me", headers=OPS).json()["role"] == "operational_support"
+    me = client.get("/api/rbac/me", headers=VIEWER).json()
+    assert me["role"] == "viewer" and me["permissions"]["viewDashboard"] and not me["permissions"]["viewAudit"]
+
+
+def test_group_membership_pagination():
+    assert client.get("/api/rbac/me", headers=H("paged-token")).json()["role"] == "admin"
+
+
+def test_graph_outage_returns_503(monkeypatch):
+    def boom(*a, **k):
+        raise httpx.ConnectError("down")
+    auth._cache.clear()
+    monkeypatch.setattr(auth.graph_client, "get", boom)
+    assert client.get("/api/rbac/me", headers=ADMIN).status_code == 503
+    monkeypatch.undo()
+    auth._cache.clear()
+
+
+def test_photo_proxy():
+    resp = client.get("/auth/user/photo", headers=VIEWER)
+    assert resp.status_code == 200 and resp.headers["content-type"] == "image/png"
+
+
+def test_photo_missing_is_no_content():
+    resp = client.get("/auth/user/photo", headers={"Authorization": "Bearer nophoto-token"})
+    assert resp.status_code == 204 and not resp.content
+
+
+# ============================================================================
+# RBAC management
+# ============================================================================
+
+def _role(name="Analyst", **perms):
+    return {"name": name, "description": "d", "color": "#123456", "permissions": perms}
+
+
+def test_rbac_config_shape():
+    cfg = client.get("/api/rbac/config", headers=ADMIN).json()["config"]
+    assert set(cfg["builtin_role_ids"]) == {"admin", "operational_support", "viewer"}
+    assert cfg["ad_group_roles"] == {"GRP-ADMIN": "admin", "GRP-OPS": "operational_support"}
+    assert cfg["permission_catalog"][0]["key"] == "viewDashboard"
+
+
+def test_role_lifecycle_and_assignment():
+    body = {"role_id": "analyst", "role_definition": _role(viewDashboard=True, viewAudit=True)}
+    assert client.post("/api/rbac/roles", headers=OPS, json=body).status_code == 403
+    assert client.post("/api/rbac/roles", headers=ADMIN, json=body).status_code == 200
+    assert client.post("/api/rbac/roles", headers=ADMIN, json=body).status_code == 409
+
+    r = client.post("/api/rbac/user-assignments", headers=ADMIN, json={"user_email": "Viewer@Corp.com", "role_name": "analyst"})
+    assert r.status_code == 200
+    auth._cache.clear()
+    me = client.get("/api/rbac/me", headers=VIEWER).json()
+    assert me["role"] == "analyst" and me["permissions"]["viewAudit"]
+    assert client.get("/api/audit/logs", headers=VIEWER).status_code == 200
+
+    upd = client.put("/api/rbac/roles/analyst", headers=ADMIN, json={"role_definition": _role("Analyst 2", viewDashboard=True)})
+    assert upd.status_code == 200
+    assert client.get("/api/audit/logs", headers=VIEWER).status_code == 403
+
+    assert client.delete("/api/rbac/roles/analyst", headers=ADMIN).json()["removed_assignments"] == ["viewer@corp.com"]
+    assert client.get("/api/rbac/me", headers=VIEWER).json()["role"] == "viewer"
+
+    logs = client.get("/api/audit/logs", headers=ADMIN, params={"search": "analyst"}).json()["logs"]
+    actions = {l["action"] for l in logs}
+    assert {"role_created", "role_assigned", "role_updated", "role_deleted"} <= actions
+    updated = next(l for l in logs if l["action"] == "role_updated")
+    assert "Audit Log disabled" in updated["details"]
+
+
+@pytest.mark.parametrize("role_id,definition,status", [
+    ("Bad ID", _role(), 422),
+    ("ok_id", _role(name=""), 422),
+    ("ok_id", {**_role(), "color": "red"}, 422),
+    ("ok_id", _role(notAPermission=True), 422),
+    ("admin", _role(), 409),
+])
+def test_role_validation(role_id, definition, status):
+    resp = client.post("/api/rbac/roles", headers=ADMIN, json={"role_id": role_id, "role_definition": definition})
+    assert resp.status_code == status
+
+
+def test_admin_role_cannot_lock_itself_out():
+    resp = client.put("/api/rbac/roles/admin", headers=ADMIN, json={"role_definition": _role("Admin", viewDashboard=True)})
+    assert resp.status_code == 422
+
+
+def test_builtin_override_and_reset():
+    perms = dict(rbac.ROLE_DEFINITIONS["viewer"]["permissions"], viewNasScanner=True)
+    assert client.put("/api/rbac/roles/viewer", headers=ADMIN, json={"role_definition": _role("Viewer", **perms)}).status_code == 200
+    assert client.get("/api/rbac/me", headers=VIEWER).json()["permissions"]["viewNasScanner"]
+    resp = client.delete("/api/rbac/roles/viewer", headers=ADMIN)
+    assert resp.status_code == 200 and resp.json()["reset"]
+    assert not client.get("/api/rbac/me", headers=VIEWER).json()["permissions"]["viewNasScanner"]
+
+
+def test_child_permission_requires_parent():
+    resp = client.post("/api/rbac/roles", headers=ADMIN, json={"role_id": "orphan", "role_definition": _role(manageUsers=True)})
+    assert resp.status_code == 200 and resp.json()["role"]["permissions"]["manageUsers"] is False
+    client.delete("/api/rbac/roles/orphan", headers=ADMIN)
+
+
+def test_assignment_validation():
+    assert client.post("/api/rbac/user-assignments", headers=ADMIN, json={"user_email": "nope", "role_name": "viewer"}).status_code == 422
+    assert client.post("/api/rbac/user-assignments", headers=ADMIN, json={"user_email": "a@b.c", "role_name": "ghost"}).status_code == 422
+    assert client.delete("/api/rbac/user-assignments/none@corp.com", headers=ADMIN).status_code == 404
+
+
+def test_migration_from_old_files(tmp_path):
+    import sqlite3
+    import migrate_to_postgres
+    old = sqlite3.connect(tmp_path / "audit_log.db")
+    old.executescript("""
+        CREATE TABLE audit_log (id TEXT PRIMARY KEY, timestamp TEXT, action TEXT, performed_by TEXT,
+                                target TEXT, details TEXT, ip_address TEXT);
+        CREATE TABLE user_preferences (email TEXT PRIMARY KEY, preferences TEXT, updated_at TEXT);
+        INSERT INTO audit_log VALUES ('old-1', '2025-03-04T10:11:12.000-05:00', 'legacy_event', 'old@corp.com', 't', 'd', '1.2.3.4');
+        INSERT INTO audit_log VALUES ('old-2', 'not a time', 'legacy_event', 'old@corp.com', '', '', '');
+        INSERT INTO user_preferences VALUES ('Old@Corp.com', '{"reduce_motion": true}', '2025-03-04');
+    """)
+    old.executemany("INSERT INTO audit_log VALUES (?, '2025-03-05T09:00:00+00:00', 'legacy_bulk', 'old@corp.com', '', '', '')",
+                    [(f"bulk-{i}",) for i in range(250)])
+    old.commit()
+    old.close()
+    (tmp_path / "rbac.json").write_text(json.dumps({
+        "custom_roles": {"legacy": {"name": "Legacy", "permissions": {"viewServerManagerDev": True}}},
+        "user_role_overrides": {"MiXeD@corp.com": "legacy"},
+    }))
+    args = ["--audit-db", str(tmp_path / "audit_log.db"), "--rbac-json", str(tmp_path / "rbac.json")]
+
+    assert migrate_to_postgres.main(args + ["--dry-run"]) == 0
+    with core_db.transaction() as cur:
+        cur.execute("SELECT count(*) FROM audit_log WHERE id LIKE 'old-%'")
+        assert cur.fetchone()[0] == 0
+    assert migrate_to_postgres.main(args) == 0
+    assert migrate_to_postgres.main(args) == 0  # a second run copies nothing twice
+    with core_db.transaction() as cur:
+        cur.execute("SELECT id, \"timestamp\" FROM audit_log WHERE id LIKE 'old-%'")
+        rows = cur.fetchall()
+        cur.execute("SELECT preferences FROM user_preferences WHERE email = 'old@corp.com'")
+        prefs = cur.fetchone()[0]
+    assert [r[0] for r in rows] == ["old-1"] and rows[0][1] == datetime(2025, 3, 4, 15, 11, 12, tzinfo=timezone.utc)
+    assert prefs == {"reduce_motion": True}
+    with core_db.transaction() as cur:
+        cur.execute("SELECT count(*) FROM audit_log WHERE id LIKE 'bulk-%'")
+        assert cur.fetchone()[0] == 250
+    rbac.store._cache = None
+    cfg = rbac.store.load()
+    # Roles saved before a parent permission existed are opened up on the way in.
+    assert cfg["custom_roles"]["legacy"]["permissions"]["viewServerManager"] is True
+    assert cfg["user_role_overrides"]["mixed@corp.com"] == "legacy"
+    rbac.store.mutate(lambda c: (c["custom_roles"].pop("legacy"), c["user_role_overrides"].pop("mixed@corp.com")))
+
+
+def test_rbac_changes_survive_a_fresh_cache():
+    """Roles live in the database, not in one process: a new reader sees them."""
+    body = {"role_id": "shared_role", "role_definition": _role(viewDashboard=True)}
+    assert client.post("/api/rbac/roles", headers=ADMIN, json=body).status_code == 200
+    assert "shared_role" in rbac.RBACStore().load()["custom_roles"]
+    client.delete("/api/rbac/roles/shared_role", headers=ADMIN)
+    assert "shared_role" not in rbac.RBACStore().load()["custom_roles"]
+
+
+# ============================================================================
+# Audit
+# ============================================================================
+
+def test_audit_write_filter_export():
+    assert client.post("/api/audit/log", headers=VIEWER, json={"action": "page_access", "target": "/x", "details": "=cmd()"}).status_code == 200
+    assert client.post("/api/audit/log", headers=VIEWER, json={"action": "role_assigned"}).status_code == 403
+    assert client.post("/api/audit/log", headers=VIEWER, json={"action": "Bad Action!"}).status_code == 422
+
+    today = datetime.now(audit.DISPLAY_TZ).date().isoformat()
+    page = client.get("/api/audit/logs", headers=ADMIN, params={"performed_by": "viewer@", "date_from": today, "date_to": today}).json()
+    assert page["total"] >= 1 and page["logs"][0]["performed_by"] == "viewer@corp.com"
+    assert client.get("/api/audit/logs", headers=ADMIN, params={"search": "%"}).json()["total"] == 0
+    assert client.get("/api/audit/logs", headers=ADMIN, params={"date_from": "bad"}).status_code == 422
+
+    export = client.get("/api/audit/export", headers=ADMIN, params={"action": "page_access"})
+    assert export.status_code == 200 and "attachment" in export.headers["content-disposition"]
+    rows = list(csv.reader(io.StringIO(export.text)))
+    assert rows[0][0] == "id" and any(r[5] == "'=cmd()" for r in rows[1:])
+
+    actions = {a["action"] for a in client.get("/api/audit/actions", headers=ADMIN).json()["actions"]}
+    assert {"page_access", "audit_exported"} <= actions
+    stats = client.get("/api/audit/stats", headers=ADMIN).json()
+    assert stats["today"] >= 1 and stats["total"] >= stats["today"]
+
+
+def test_audit_delete_admin_only():
+    client.post("/api/audit/log", headers=OPS, json={"action": "page_access", "target": "delete-me"})
+    log_id = client.get("/api/audit/logs", headers=ADMIN, params={"search": "delete-me"}).json()["logs"][0]["id"]
+    assert client.delete(f"/api/audit/logs/{log_id}", headers=OPS).status_code == 403
+    assert client.delete(f"/api/audit/logs/{log_id}", headers=ADMIN).status_code == 200
+    assert client.delete(f"/api/audit/logs/{log_id}", headers=ADMIN).status_code == 404
+    ids = client.get("/api/audit/logs/ids", headers=ADMIN, params={"action": "page_access"}).json()["ids"]
+    resp = client.request("DELETE", "/api/audit/logs", headers=ADMIN, params={"silent": "true"}, json={"ids": ids})
+    assert resp.json()["deleted"] == len(ids)
+
+
+def test_heartbeat_and_active_users():
+    client.post("/api/audit/heartbeat", headers=OPS)
+    users = client.get("/api/audit/active-users", headers=ADMIN).json()
+    assert any(u["email"] == "ops@corp.com" for u in users["users"])
+
+
+def test_preferences_are_per_user_and_merge():
+    assert client.get("/api/audit/preferences").status_code == 401
+    assert client.get("/api/audit/preferences", headers=VIEWER).json() == {"preferences": {}}
+    resp = client.put("/api/audit/preferences", headers=VIEWER, json={"reduce_motion": True})
+    assert resp.status_code == 200 and resp.json()["preferences"]["reduce_motion"] is True
+    # Omitted fields leave saved values alone; other people are unaffected.
+    client.put("/api/audit/preferences", headers=VIEWER, json={})
+    assert client.get("/api/audit/preferences", headers=VIEWER).json()["preferences"] == {"reduce_motion": True}
+    assert client.get("/api/audit/preferences", headers=OPS).json()["preferences"] == {}
+    assert client.put("/api/audit/preferences", headers=VIEWER, json={"reduce_motion": "sometimes"}).status_code == 422
+    client.put("/api/audit/preferences", headers=VIEWER, json={"reduce_motion": False})
+    assert client.get("/api/audit/preferences", headers=VIEWER).json()["preferences"]["reduce_motion"] is False
+
+
+# ============================================================================
+# Agent proxy
+# ============================================================================
+
+def test_agent_proxy_read_and_token_injection():
+    AGENT_CALLS.clear()
+    resp = client.get("/epod-dev/status", headers=OPS)
+    assert resp.status_code == 200 and resp.json()["running"] is True
+    assert AGENT_CALLS[-1].headers["authorization"] == "Bearer agent-secret"
+    assert "cookie" not in AGENT_CALLS[-1].headers
+
+
+def test_agent_proxy_query_filtered():
+    resp = client.get("/epod-dev/logs?n=25&evil=1&from=10", headers=ADMIN).json()
+    assert resp["query"] == {"n": "25", "from": "10"}
+
+
+def test_agent_proxy_control_requires_permission():
+    assert client.post("/epod-dev/stop", headers=OPS).status_code == 403
+    assert client.post("/epod-dev/stop", headers=ADMIN).status_code == 200
+    logs = client.get("/api/audit/logs", headers=ADMIN, params={"action": "pipeline_action"}).json()["logs"]
+    assert logs and logs[0]["target"] == "epod-dev"
+
+
+def test_agent_proxy_unknown_path_and_unconfigured():
+    assert client.get("/epod-dev/admin/shell", headers=ADMIN).status_code == 404
+    assert client.post("/epod-dev/status", headers=ADMIN).status_code == 404
+    assert client.get("/epod-qa/status", headers=ADMIN).status_code == 503
+
+
+def test_agent_proxy_stream():
+    with client.stream("GET", "/epod-dev/terminal/stream", headers=ADMIN) as resp:
+        assert resp.status_code == 200
+        body = b"".join(resp.iter_bytes())
+    assert b"data: hello" in body
+
+
+def test_agents_status_fans_out_and_respects_permissions():
+    agents = client.get("/api/agents/status", headers=OPS).json()["agents"]
+    assert agents == [{"id": "epod-dev", "state": "running", "name": "EPOD Box"}]
+    assert client.get("/api/agents/status").status_code == 401
+    assert client.get("/api/agents/status", headers=VIEWER).json()["agents"] == []
+
+
+def test_agents_status_marks_unreachable(monkeypatch):
+    async def down(*_a, **_k):
+        raise httpx.ConnectError("down")
+    monkeypatch.setattr(Backend._agent_read_client, "get", down)
+    assert client.get("/api/agents/status", headers=OPS).json()["agents"][0]["state"] == "unreachable"
+
+
+def test_agent_copies_are_identical():
+    root = Path(__file__).resolve().parent.parent
+    master = (root / "windows_manage" / "epod_agent.py").read_bytes()
+    for copy in ("rimdocs_agent/linux/RIMDocs_agent.py", "rimdocs_agent/windows/RIMDocs_agent.py"):
+        assert (root / copy).read_bytes() == master, f"{copy} drifted from windows_manage/epod_agent.py"
+
+
+def _load_agent(tmp_path):
+    import importlib.util
+    script = tmp_path / "main.py"
+    script.write_text("print('hi')\n")
+    cfg = tmp_path / "config.ini"
+    cfg.write_text(
+        "[app]\n"
+        f"SCRIPT_PATH = {script}\nPYTHON_EXE = {sys.executable}\n"
+        f"LOG_PATH = {tmp_path / 'run.log'}\nTERMINAL_LOG = {tmp_path / 'terminal.log'}\n"
+        "AGENT_TOKEN = agent-token-0123456789abcdefghij\n"
+    )
+    os.environ["AGENT_CONFIG"] = str(cfg)
+    path = Path(__file__).resolve().parent.parent / "windows_manage" / "epod_agent.py"
+    spec = importlib.util.spec_from_file_location(f"agent_{uuid.uuid4().hex}", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_agent_auth_probe_and_backlog(tmp_path):
+    agent = _load_agent(tmp_path)
+    ac = TestClient(agent.app)
+    tok = {"Authorization": "Bearer agent-token-0123456789abcdefghij"}
+    assert ac.get("/health").status_code == 200
+    assert ac.get("/running").status_code == 401
+    assert ac.get("/running", headers=tok).json() == {"running": False, "pid": None}
+    assert ac.get("/status", headers=tok).json()["running"] is False
+    log = tmp_path / "terminal.log"
+    log.write_bytes(b"one\ntwo\nthree\npart")
+    lines, end = agent._backlog(str(log), 2, log.stat().st_size)
+    # The trailing partial line is held back so it is never streamed in two pieces.
+    assert lines == ["two", "three"] and end == len(b"one\ntwo\nthree\n")
+    assert agent._backlog(str(log), 0, log.stat().st_size) == ([], end)
+    assert agent._sse("x", "7:5") == "id: 7:5\ndata: x\n\n"
+    assert agent._parse_resume("7:5") == (7, 5) and agent._parse_resume("junk") is None and agent._parse_resume(None) is None
+    assert agent._sse("", event="reset") == "event: reset\ndata: \n\n"
+
+
+def test_agent_list():
+    agents = client.get("/api/agents", headers=OPS).json()["agents"]
+    dev = next(a for a in agents if a["id"] == "epod-dev")
+    assert dev["configured"] and dev["can_view"] and not dev["can_control"]
+
+
+# ============================================================================
+# Ingestion stats / NAS (real Postgres)
+# ============================================================================
+
+def test_epod_dashboard():
+    data = client.get("/api/epod/dashboard", headers=OPS).json()
+    alpha, missing = data["tables"]
+    assert alpha["counts"] == {"total": 4, "success": 2, "error": 1, "running": 1}
+    assert alpha["sizes"]["total_size_bytes"] == 4750 and alpha["sizes"]["pct_ingested"] == round(4000 / 4750, 4)
+    assert alpha["timeline"]["duration_secs"] == pytest.approx(3 * 3600, abs=2)
+    assert alpha["stall"] and alpha["stall"]["running"] == 1
+    assert missing["status"] == "not_started"
+    assert data["kpis"]["total_docs"] == 4 and data["chart_donut"] == {"success": 2, "error": 1, "running": 1}
+
+
+def test_rimdocs_stream_and_available():
+    with client.stream("GET", "/api/rimdocs/dashboard/stream", headers=OPS) as resp:
+        lines = [json.loads(l) for l in resp.iter_lines() if l]
+    assert lines[0] == {"type": "meta", "data": {"table_count": 2}}
+    tables = [l["data"] for l in lines if l["type"] == "table"]
+    assert {t["label"] for t in tables} == {"X", "Y"}
+    assert all(t["stall"] is None for t in tables)
+    summary = lines[-1]
+    assert summary["type"] == "summary" and summary["data"]["kpis"]["total_docs"] == 2
+
+    avail = client.get("/api/rimdocs/available-counts", headers=OPS).json()["available"]
+    assert avail == {"rimdocs1.ingestion_log_x": 2, "rimdocs1.ingestion_log_y": None}
+
+
+def test_diagnose():
+    assert client.get("/api/epod/diagnose", headers=OPS).status_code == 403
+    data = client.get("/api/epod/diagnose", headers=ADMIN).json()
+    flags = {t["config_name"]: t["exists"] for t in data["configured_tables"]}
+    assert flags == {"epod1.ingestion_log_alpha": True, "epod1.ingestion_log_missing": False}
+
+
+def test_nas_endpoints():
+    ov = client.get("/api/nas/overview", headers=OPS).json()
+    assert ov["kpis"]["segments"] == 3
+    assert [s["segment"] for s in ov["segments"]] == ["SEG_B", "SEG_A", "SEG_100%"]
+    assert ov["segments"][0]["last_modified"].startswith("2026-01-")
+    only = client.get("/api/nas/overview", headers=OPS, params={"search": "100%"}).json()
+    assert [s["segment"] for s in only["segments"]] == ["SEG_100%"]
+    assert client.get("/api/nas/overview", headers=OPS, params={"search": "_"}).json()["kpis"]["segments"] == 3
+    pdfs = client.get("/api/nas/largest-pdfs", headers=OPS).json()["files"]
+    assert [f["file_name"] for f in pdfs] == ["big.pdf", "small.PDF"] and pdfs[0]["segment"] == "SEG_B"
+    trends = client.get("/api/nas/trends", headers=OPS).json()["daily"]
+    assert trends[-1]["cumulative"] == 3
+    assert client.get("/api/nas/debug", headers=ADMIN).json()["top_level_segments"] == 3
+
+
+def test_readiness():
+    assert client.get("/health/ready").json() == {"status": "ready", "checks": {"core_db": True, "postgres": True}}
+
+
+def test_config_injection_rejected(tmp_path, monkeypatch):
+    import db_common
+    with pytest.raises(ValueError):
+        db_common.table_identifier("public.t; DROP TABLE x", "public")
+    with pytest.raises(ValueError):
+        db_common.table_identifier('a"b', "public")
+
+
+# ── linux_manage/manage.py ───────────────────────────────────────────────────
+
+@pytest.fixture()
+def manager(tmp_path, monkeypatch):
+    import importlib.util
+    svc_dir = tmp_path / "svc"
+    svc_dir.mkdir()
+    script = tmp_path / "svc.sh"
+    script.write_text('echo "step one for $1"\nsleep "${SLEEP:-0}"\necho done\n')
+    cfg = tmp_path / "config.ini"
+    cfg.write_text(
+        f"[backend]\nname = API\ndir = {svc_dir}\nport = 9001\nentry = Backend:app\n"
+        f"[frontend]\nname = UI\ndir = {svc_dir}\nport = 9002\n"
+        f"[scripts]\nbackend = {script}\nfrontend = {script}\n"
+        f"[search_paths]\nroot = {tmp_path}\n"
+    )
+    monkeypatch.setenv("MANAGE_CONFIG", str(cfg))
+    monkeypatch.setenv("AD_GROUP_ADMIN", "admins")
+    path = Path(__file__).resolve().parent.parent / "linux_manage" / "manage.py"
+    spec = importlib.util.spec_from_file_location(f"manage_{uuid.uuid4().hex}", path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod  # pydantic resolves the postponed annotations through it
+    spec.loader.exec_module(mod)
+    monkeypatch.setattr(mod, "_admin_email", lambda token: "ops@x.com" if token == "adm" else None)
+    mod.svc_dir = svc_dir
+    return mod
+
+
+ADM = {"Authorization": "Bearer adm"}
+
+
+def test_manager_requires_admin(manager):
+    mc = TestClient(manager.app)
+    assert mc.get("/health").json() == {"status": "healthy", "api": manager.API_VERSION}
+    assert mc.get("/api/overview").status_code == 401
+    assert mc.get("/api/overview", headers={"Authorization": "Bearer other"}).status_code == 403
+    assert mc.post("/api/terminal/ticket", headers=ADM).json()["expires_in"] == manager.TICKET_TTL
+    assert mc.post("/api/reboot/backend", headers=ADM).status_code == 404
+    assert mc.post("/api/start/nope", headers=ADM).status_code == 404
+
+
+def test_manager_overview_and_pid_checks(manager):
+    mc = TestClient(manager.app)
+    pidfile = manager.svc_dir / "backend.pid"
+    pidfile.write_text(str(os.getpid()))
+    body = mc.get("/api/overview", headers=ADM).json()
+    assert body["services"]["backend"]["running"] and body["services"]["backend"]["pid"] == os.getpid()
+    assert body["services"]["backend"]["cpu"] is not None and body["services"]["frontend"]["running"] is False
+    assert body["host"]["cores"] >= 1 and body["git"] is None
+    history = body["services"]["backend"]["history"]
+    assert history["every"] == manager.HISTORY_EVERY and len(history["cpu"]) == len(history["mem"]) >= 1
+    deadline = time.time() + 5
+    while not manager._history["backend"] and time.time() < deadline:
+        time.sleep(0.05)
+    cpu, mem = manager._history["backend"][0]  # the sampler is recording
+    assert cpu >= 0 and mem > 0
+    # A process started long after the pid file was written is a recycled PID.
+    os.utime(pidfile, (1, 1))
+    assert manager.read_pid(str(manager.svc_dir), "backend") is None
+
+
+def test_manager_action_streams_and_claims(manager, monkeypatch):
+    mc = TestClient(manager.app)
+    with mc.stream("POST", "/api/restart/frontend", headers={**ADM, "Accept": "application/x-ndjson"}) as resp:
+        events = [json.loads(l) for l in resp.iter_lines() if l]
+    assert events[0] == {"type": "line", "text": "step one for restart"}
+    assert events[-1] == {"type": "exit", "returncode": 0, "service": "frontend", "action": "restart"}
+    plain = mc.post("/api/stop/frontend", headers=ADM).json()
+    assert plain["returncode"] == 0 and plain["output"] == "step one for stop\ndone"
+
+    monkeypatch.setitem(manager.CHILD_ENV, "SLEEP", "2")
+    import threading
+    first = threading.Thread(target=lambda: mc.post("/api/start/backend", headers=ADM))
+    first.start()
+    deadline = time.time() + 5
+    while not manager._busy("backend") and time.time() < deadline:
+        time.sleep(0.02)
+    busy = mc.post("/api/stop/backend", headers=ADM)
+    assert busy.status_code == 409 and "start started by ops@x.com" in busy.json()["detail"]
+    assert mc.get("/api/overview", headers=ADM).json()["services"]["backend"]["busy"]["action"] == "start"
+    first.join()
+    assert manager._busy("backend") is None
+
+
+def test_manager_dir_switch_refused_while_running(manager, tmp_path):
+    mc = TestClient(manager.app)
+    other = tmp_path / "other"
+    other.mkdir()
+    (manager.svc_dir / "backend.pid").write_text(str(os.getpid()))
+    resp = mc.post("/api/service/backend/dir", headers=ADM, json={"dir": str(other)})
+    assert resp.status_code == 409
+    (manager.svc_dir / "backend.pid").unlink()
+    assert mc.post("/api/service/backend/dir", headers=ADM, json={"dir": str(other)}).json()["dir"] == str(other.resolve())
+    assert mc.post("/api/service/backend/dir", headers=ADM, json={"dir": "/"}).status_code == 400
+
+
+def test_manager_tail_and_logs(manager):
+    log = manager.svc_dir / "backend.log"
+    log.write_text("".join(f"line {i}\n" for i in range(20000)))
+    assert manager.tail_file(log, 3) == "line 19997\nline 19998\nline 19999"
+    mc = TestClient(manager.app)
+    assert mc.get("/api/logs/backend?lines=2", headers=ADM).json()["logs"] == "line 19998\nline 19999"
+    assert mc.get("/api/logs/frontend", headers=ADM).json()["logs"] == ""
+
+
+def test_manager_terminal_keeps_shell_state(manager, tmp_path):
+    mc = TestClient(manager.app)
+    with mc.websocket_connect("/ws/terminal?ticket=bad") as ws:
+        with pytest.raises(Exception):
+            ws.receive_json()
+
+    def run(ws, cmd):
+        ws.send_json({"cmd": cmd})
+        out = ""
+        while (m := ws.receive_json())["type"] != "exit":
+            out += m.get("data", "")
+        return out, m
+
+    ticket = mc.post("/api/terminal/ticket", headers=ADM).json()["ticket"]
+    with mc.websocket_connect(f"/ws/terminal?ticket={ticket}") as ws:
+        assert ws.receive_json()["type"] == "cwd"
+        _, m = run(ws, f"cd {tmp_path} && export DEMO=42")
+        assert m == {"type": "exit", "code": 0, "cwd": str(tmp_path.resolve())}
+        out, _ = run(ws, 'echo "$DEMO $(pwd)"; cd /')
+        assert out == f"42 {tmp_path.resolve()}\n"
+        out, m = run(ws, "cd - >/dev/null; pwd; exit 4")
+        assert out == f"{tmp_path.resolve()}\n" and m["code"] == 4
+        out, _ = run(ws, "env | grep -c BASH_ENV")
+        assert out == "0\n"
+        ws.send_json({"cmd": "sleep 20"})
+        time.sleep(0.3)
+        ws.send_json({"type": "signal", "signal": "SIGINT"})
+        assert ws.receive_json()["code"] == 130
+        ws.send_json({"cmd": "clear"})
+        assert ws.receive_json() == {"type": "clear"}
+    # The second use of a ticket is rejected.
+    with mc.websocket_connect(f"/ws/terminal?ticket={ticket}") as ws:
+        with pytest.raises(Exception):
+            ws.receive_json()
+
+
+def test_manager_env_stays_out_of_services(manager, monkeypatch, tmp_path):
+    # load_dotenv put the manager's own settings into os.environ after start-up.
+    monkeypatch.delitem(manager.CHILD_ENV, "ALLOWED_ORIGINS", raising=False)
+    monkeypatch.setenv("ALLOWED_ORIGINS", "https://manager-only")
+    monkeypatch.setenv("REPO_PASSWORD", "s3cret")
+    script = tmp_path / "env.sh"
+    script.write_text('echo "origins=${ALLOWED_ORIGINS:-unset} pw=${REPO_PASSWORD:-unset}"\n')
+    cfg = Path(os.environ["MANAGE_CONFIG"])
+    cfg.write_text(cfg.read_text().replace(f"frontend = {tmp_path / 'svc.sh'}", f"frontend = {script}"))
+    out = TestClient(manager.app).post("/api/start/frontend", headers=ADM).json()["output"]
+    assert out == "origins=unset pw=unset"
+
+
+def test_core_db_down_answers_503(monkeypatch):
+    def down():
+        raise core_db.DatabaseUnavailable("connection refused")
+    monkeypatch.setattr(audit, "_db", down)
+    resp = client.get("/api/audit/stats", headers=ADMIN)
+    assert resp.status_code == 503 and resp.json()["detail"] == "Database unavailable, please retry"
+
+
+def test_changed_migration_is_refused(monkeypatch, tmp_path):
+    (tmp_path / "001_init.sql").write_text("SELECT 1;")
+    monkeypatch.setattr(core_db, "MIGRATIONS_DIR", tmp_path)
+    monkeypatch.setattr(core_db, "_migrated", False)
+    with pytest.raises(RuntimeError, match="changed after it was applied"):
+        core_db.migrate()

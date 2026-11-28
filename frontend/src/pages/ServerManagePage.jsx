@@ -1,0 +1,542 @@
+import React, { Suspense, lazy, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { useSearchParams } from 'react-router-dom';
+import { useRBAC } from '../context/RBACContext';
+import { useAuth } from '../context/AuthContext';
+import { ApiError, downloadBlob, isAbort, requestJson, streamNdjsonUrl } from '../utils/apiClient';
+import { logAuditEvent } from '../utils/auditLog';
+import { MANAGE_SERVERS as SERVERS } from '../navigation';
+import {
+  Alert, Badge, Button, Dot, EmptyState, Icon, Menu, MenuItem, Page, ProgressBar, StatusChip, Tabs, Toggle, cx, useFeedback, usePolling,
+} from '../components/ui';
+
+const Terminal = lazy(() => import('./Terminal'));
+
+
+const SERVICES = [
+  { id: 'backend', label: 'Backend API', icon: 'server' },
+  { id: 'frontend', label: 'Frontend app', icon: 'globe' },
+];
+const REFRESH_MS = 30_000;
+const LOCAL_HISTORY = 21; // 10 minutes of 30-second polls, for managers that keep no history
+const BUSY_REFRESH_MS = 3_000;
+const LOG_FOLLOW_MS = 5_000;
+const LOG_LINES = 500;
+const CONSOLE_CAP = 2000;
+const STATE = {
+  running: { label: 'Running', color: '#328714', tone: 'success' },
+  stopped: { label: 'Stopped', color: '#857a73', tone: 'neutral' },
+  partial: { label: 'Partially running', color: '#c4a000', tone: 'warning' },
+  busy: { label: 'Working…', color: '#0f68b2', tone: 'info' },
+  error: { label: 'Unreachable', color: '#eb1700', tone: 'danger' },
+  forbidden: { label: 'No access', color: '#eb1700', tone: 'danger' },
+  loading: { label: 'Checking…', color: '#cbc4bc', tone: 'neutral' },
+};
+const BUSY_LABEL = { start: 'Starting…', stop: 'Stopping…', restart: 'Restarting…', 'switch directory': 'Switching…' };
+const ERROR_LINE = /^(ERROR|FAILED)\b|Traceback|npm ERR!/;
+
+const describeError = (e, target) => {
+  if (e instanceof ApiError && e.status === 403) return 'This server only accepts members of its admin AD group.';
+  if (e?.name === 'TimeoutError') return `${target || 'The server'} did not answer within 15 seconds.`;
+  if (e instanceof TypeError) {
+    return `Could not connect to ${target || 'the server'}. The manager may be stopped, may not list this site in ALLOWED_ORIGINS, `
+      + 'or may use a certificate this browser does not trust (open its /health page once to check).';
+  }
+  return e?.message || 'Request failed';
+};
+const failureState = (e) => (e instanceof ApiError && e.status === 403 ? 'forbidden' : 'error');
+const summarize = (overview) => {
+  const up = SERVICES.filter((s) => overview.services?.[s.id]?.running).length;
+  return up === SERVICES.length ? 'running' : up === 0 ? 'stopped' : 'partial';
+};
+const stamp = () => new Date().toLocaleString('en-US');
+const fileStamp = () => new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
+
+// Managers are upgraded host by host. /health reports the API version; one
+// from before /api/overview (no "api" field) is read per service instead.
+const apiVersions = new Map();
+const apiVersion = (url) => {
+  if (!apiVersions.has(url)) {
+    apiVersions.set(url, requestJson(`${url}/health`, { timeoutMs: 15_000 }).then((h) => h.api || 1).catch((e) => {
+      apiVersions.delete(url);
+      throw e;
+    }));
+  }
+  return apiVersions.get(url);
+};
+async function fetchOverview(url) {
+  const opts = { timeoutMs: 15_000 };
+  if (await apiVersion(url) >= 2) return requestJson(`${url}/api/overview`, opts);
+  const [config, ...status] = await Promise.all([
+    requestJson(`${url}/api/services`, opts),
+    ...SERVICES.map((svc) => requestJson(`${url}/api/status/${svc.id}`, opts)),
+  ]).catch((e) => {
+    // Upgraded while this page was open: look the version up again next time.
+    if (e instanceof ApiError && e.status === 404) apiVersions.delete(url);
+    throw e;
+  });
+  return {
+    legacy: true,
+    git: null,
+    host: null,
+    services: Object.fromEntries(SERVICES.map((svc, i) => [svc.id, { ...config[svc.id], ...status[i], busy: null }])),
+  };
+}
+
+const spanLabel = (seconds) => (seconds >= 90 ? `${Math.round(seconds / 60)} min` : `${seconds}s`);
+
+/** Measured values, oldest first, scaled to the busiest moment (at least 5%). */
+function Trend({ values, color, label }) {
+  if (!values || values.length < 2) {
+    return <div className="h-7 mt-1 flex items-center font-johnson-text text-[11.5px] text-jj-gray-05">Collecting…</div>;
+  }
+  const top = Math.max(5, Math.max(...values) * 1.2);
+  const step = 100 / (values.length - 1);
+  const pts = values.map((v, i) => `${(i * step).toFixed(2)},${(38 - (v / top) * 34).toFixed(2)}`).join(' ');
+  return (
+    <svg viewBox="0 0 100 40" preserveAspectRatio="none" className="w-full h-7 mt-1" role="img" aria-label={label}>
+      <polygon points={`0,40 ${pts} 100,40`} fill={color} opacity="0.12" />
+      <polyline points={pts} fill="none" stroke={color} strokeWidth="1.6" strokeLinejoin="round" vectorEffect="non-scaling-stroke" />
+    </svg>
+  );
+}
+
+function ServiceCard({ svc, info, history, state, busy, canAdmin, onAction, dirOptions, onChangeDir }) {
+  const span = spanLabel(Math.max(0, (history?.cpu?.length || 1) - 1) * (history?.every || 0));
+  const st = busy ? { ...STATE.busy, label: BUSY_LABEL[busy.action] || STATE.busy.label } : STATE[state] || STATE.loading;
+  const [menuOpen, setMenuOpen] = useState(false);
+  const running = state === 'running';
+  const reachable = state !== 'error' && state !== 'forbidden' && state !== 'loading';
+  return (
+    <div className="group relative overflow-hidden surface flex flex-col transition-[box-shadow,transform] duration-500 ease-out hover:-translate-y-0.5 hover:shadow-lift">
+      <div className="relative flex items-start gap-4 p-4 sm:p-5">
+        <span className="relative w-12 h-12 rounded-2xl grid place-items-center flex-shrink-0 text-white"
+          style={{ background: `linear-gradient(140deg, ${st.color}, color-mix(in srgb, ${st.color} 70%, #000))`, boxShadow: `0 14px 28px -14px ${st.color}` }}>
+          {(running || busy) && <span className="absolute inset-0 rounded-2xl border animate-ring-tight" style={{ borderColor: st.color }} />}
+          <Icon name={svc.icon} className="w-5 h-5" />
+        </span>
+        <div className="flex-1 min-w-0">
+          <div className="flex flex-wrap items-center gap-2">
+            <p className="font-johnson-display font-medium text-xl tracking-[-0.01em] text-jj-gray-08 truncate">{info.name || svc.label}</p>
+            <Badge tone={st.tone}><Dot color={st.color} pulse={running || !!busy} className="w-1.5 h-1.5" />{st.label}</Badge>
+          </div>
+          {canAdmin && dirOptions.length > 0 ? (
+            <Menu open={menuOpen} onOpenChange={setMenuOpen} align="left" className="w-[min(24rem,calc(100vw-1rem))] max-h-80" trigger={(
+              <button type="button" onClick={() => setMenuOpen((v) => !v)} aria-haspopup="menu" aria-expanded={menuOpen}
+                className="mt-1 max-w-full flex items-center gap-1 font-mono text-xs text-jj-gray-06 hover:text-jj-gray-08 rounded focus-ring" title={info.dir}>
+                <span className="truncate">{info.dir || 'No directory set'}</span>
+                <Icon name="chevronDown" className="w-2.5 h-2.5" />
+              </button>
+            )}>
+              {(running || busy) && <p className="px-3 pt-1.5 pb-2 font-johnson-text text-xs text-jj-gray-06">Stop the service to switch its directory.</p>}
+              {dirOptions.map((o) => (
+                <MenuItem key={o.path} active={o.path === info.dir} title={o.notes || o.path} disabled={!o.exists || running || !!busy}
+                  onClick={() => { setMenuOpen(false); if (o.path !== info.dir) onChangeDir(svc.id, o); }}>
+                  <span className="flex items-center justify-between gap-2">
+                    <span className="truncate">{o.label}{!o.exists && ' (missing)'}</span>
+                    {o.path === info.dir && <span className="shrink-0 text-[11px] font-medium text-jj-gray-05">Current</span>}
+                  </span>
+                  <span className="block font-mono text-[11px] text-jj-gray-05 truncate">{o.path}</span>
+                </MenuItem>
+              ))}
+            </Menu>
+          ) : (
+            <p className="mt-1 font-mono text-xs text-jj-gray-06 truncate" title={info.dir}>{info.dir || '—'}</p>
+          )}
+          {busy?.by && <p className="mt-1 font-johnson-text text-xs text-jj-blue-03 truncate">{busy.action} by {busy.by}</p>}
+        </div>
+      </div>
+      <dl className="relative grid grid-cols-3 gap-px mx-4 sm:mx-5 rounded-2xl overflow-hidden bg-jj-gray-02 border border-jj-gray-02 font-johnson-text">
+        {[['Port', info.port], ['PID', info.pid], ['Uptime', info.uptime]].map(([k, v]) => (
+          <div key={k} className="min-w-0 bg-[#fbfaf8] px-3.5 py-3"><dt className="text-[12px] font-medium text-jj-gray-06">{k}</dt><dd className="mt-1 font-johnson-display font-light text-xl leading-none text-jj-gray-08 tabular-nums truncate">{v || '—'}</dd></div>
+        ))}
+      </dl>
+      <dl className="relative grid grid-cols-2 gap-5 px-4 sm:px-5 mt-3 font-johnson-text text-[13px]">
+        {[['CPU', info.cpu, history?.cpu, '#0f68b2'], ['Memory', info.mem, history?.mem, '#8c3bbb']].map(([k, v, values, c]) => (
+          <div key={k} className="min-w-0">
+            <div className="flex justify-between gap-2">
+              <dt className="text-jj-gray-06">{k}</dt>
+              <dd className="tabular-nums text-jj-gray-08 font-medium">{v != null ? `${v}%` : '—'}</dd>
+            </div>
+            <Trend values={values} color={c} label={`${svc.label} ${k} over the last ${span}, now ${v ?? 0}%`} />
+          </div>
+        ))}
+      </dl>
+      {history?.cpu?.length > 1 && <p className="relative px-4 sm:px-5 mt-1 font-johnson-text text-[11px] text-jj-gray-05">Last {span}</p>}
+      <div className="relative mt-auto flex flex-wrap gap-2 p-4 sm:p-5">
+        {canAdmin && (running ? (
+          <>
+            <Button size="sm" icon="sync" onClick={() => onAction(svc, 'restart')} loading={busy?.action === 'restart'} disabled={!!busy}>Restart</Button>
+            <Button size="sm" variant="dangerOutline" onClick={() => onAction(svc, 'stop')} loading={busy?.action === 'stop'} disabled={!!busy}>Stop</Button>
+          </>
+        ) : (
+          <Button size="sm" variant="primary" icon="play" onClick={() => onAction(svc, 'start')} loading={busy?.action === 'start'} disabled={!!busy || !reachable}>Start</Button>
+        ))}
+        <Button size="sm" variant="ghost" icon="refresh" onClick={() => onAction(svc, 'status')}>Check status</Button>
+      </div>
+    </div>
+  );
+}
+
+function HostStrip({ host }) {
+  const tiles = [
+    { k: 'Server CPU', v: `${host.cpu}%`, bar: host.cpu, color: '#0f68b2', hint: `${host.cores} core${host.cores === 1 ? '' : 's'}` },
+    { k: 'Server memory', v: `${host.mem}%`, bar: host.mem, color: '#8c3bbb' },
+    { k: 'Disk', v: `${host.disk}%`, bar: host.disk, color: host.disk >= 90 ? '#eb1700' : '#328714', hint: host.disk_path },
+    { k: 'Load', v: host.load ? host.load[0].toFixed(2) : '—', hint: host.load ? `5m ${host.load[1].toFixed(2)} · 15m ${host.load[2].toFixed(2)}` : null },
+    { k: 'Server uptime', v: host.uptime, hint: host.hostname },
+  ];
+  // 2 columns on phones (uptime spans the last row), 3 + 2 on tablets, 5 across on desktops.
+  const span = ['sm:col-span-2', 'sm:col-span-2', 'sm:col-span-2', 'sm:col-span-3', 'col-span-2 sm:col-span-3'];
+  return (
+    <section aria-label="Server vitals" className="surface grid grid-cols-2 sm:grid-cols-6 lg:grid-cols-5 gap-px overflow-hidden bg-jj-gray-02">
+      {tiles.map((t, i) => (
+        <div key={t.k} className={cx('min-w-0 bg-white px-4 sm:px-5 py-3.5 lg:col-span-1', span[i])}>
+          <p className="font-johnson-text text-[12px] font-medium text-jj-gray-06">{t.k}</p>
+          <p className="mt-1 font-johnson-display font-light text-xl leading-none text-jj-gray-08 tabular-nums truncate">{t.v}</p>
+          {t.bar != null && <ProgressBar value={t.bar} color={t.color} className="h-1 mt-2" label={`Host ${t.k}`} />}
+          {t.hint && <p className="mt-1.5 font-mono text-[11px] text-jj-gray-05 truncate" title={t.hint}>{t.hint}</p>}
+        </div>
+      ))}
+    </section>
+  );
+}
+
+function ServerPanel({ server, tabs, onHealth }) {
+  const { hasPermission } = useRBAC();
+  const { user } = useAuth();
+  const { toast, confirm } = useFeedback();
+  const canAdmin = hasPermission(server.admin);
+  const [params, setParams] = useSearchParams();
+  const api = useCallback((path, opts) => requestJson(`${server.url}${path}`, opts), [server.url]);
+
+  const [overview, setOverview] = useState(null);
+  const [localHistory, setLocalHistory] = useState({});
+  const [failure, setFailure] = useState(null);
+  const [lastSync, setLastSync] = useState(null);
+  const [pending, setPending] = useState({});
+  const [activity, setActivity] = useState('console');
+  const [consoleLines, setConsoleLines] = useState([]);
+  const [logs, setLogs] = useState({});
+  const [follow, setFollow] = useState(true);
+  const [repos, setRepos] = useState([]);
+  const [repo, setRepo] = useState('');
+  const [repoMenu, setRepoMenu] = useState(false);
+  const [dirs, setDirs] = useState({ backend: [], frontend: [] });
+  const outRef = useRef(null);
+  const stickRef = useRef(true);
+  const lineId = useRef(0);
+  const abortRef = useRef(null);
+  const termOpen = canAdmin && params.get('terminal') === 'true';
+
+  useEffect(() => {
+    const ctrl = new AbortController();
+    abortRef.current = ctrl;
+    return () => ctrl.abort();
+  }, []);
+
+  const append = useCallback((text, tone = 'out') => {
+    setConsoleLines((l) => {
+      const next = [...l, { text, tone, id: ++lineId.current }];
+      return next.length > CONSOLE_CAP ? next.slice(-CONSOLE_CAP) : next;
+    });
+  }, []);
+
+  const refresh = useCallback(async () => {
+    try {
+      const d = await fetchOverview(server.url);
+      if (d.legacy) {
+        // Older managers keep no history: build it from this page's own polls.
+        setLocalHistory((h) => Object.fromEntries(SERVICES.map((svc) => {
+          const prev = h[svc.id] || { cpu: [], mem: [] };
+          const x = d.services[svc.id] || {};
+          return [svc.id, { cpu: [...prev.cpu, x.cpu || 0].slice(-LOCAL_HISTORY), mem: [...prev.mem, x.mem || 0].slice(-LOCAL_HISTORY), every: REFRESH_MS / 1000 }];
+        })));
+      }
+      setOverview(d);
+      setFailure(null);
+      onHealth(server.id, summarize(d));
+      return d;
+    } catch (e) {
+      setFailure({ state: failureState(e), message: describeError(e, server.target) });
+      onHealth(server.id, failureState(e));
+      return null;
+    } finally {
+      setLastSync(new Date());
+    }
+  }, [server.url, server.id, server.target, onHealth]);
+
+  const loadLog = useCallback(async (svc) => {
+    try {
+      const d = await api(`/api/logs/${svc}?lines=${LOG_LINES}`);
+      setLogs((t) => ({ ...t, [svc]: d.missing ? { note: `No log file yet at ${d.missing}` } : { text: d.logs || '' } }));
+    } catch (e) {
+      setLogs((t) => ({ ...t, [svc]: { note: `Unable to load log: ${describeError(e, server.target)}`, error: true } }));
+    }
+  }, [api, server.target]);
+
+  const svcState = (id) => (failure ? failure.state : overview ? (overview.services[id]?.running ? 'running' : 'stopped') : 'loading');
+  const busyOf = (id) => (pending[id] ? { action: pending[id] } : overview?.services[id]?.busy || null);
+  const gitBusy = !!pending.git || !!overview?.git;
+  const anyBusy = gitBusy || SERVICES.some((s) => busyOf(s.id));
+  const overall = failure ? failure.state : overview ? summarize(overview) : 'loading';
+
+  usePolling(refresh, anyBusy ? BUSY_REFRESH_MS : REFRESH_MS);
+  usePolling(() => loadLog(activity), LOG_FOLLOW_MS, { enabled: activity !== 'console' && follow, immediate: false });
+  useEffect(() => { if (activity !== 'console') loadLog(activity); }, [activity, loadLog]);
+  useEffect(() => {
+    if (!canAdmin) return;
+    api('/api/repos').then((d) => setRepos(d.repos || [])).catch(() => {});
+    api('/api/service-directories').then((d) => setDirs({ backend: d.backend || [], frontend: d.frontend || [] })).catch(() => {});
+  }, [api, canAdmin]);
+
+  // Follow the newest output unless the reader has scrolled up.
+  useLayoutEffect(() => { stickRef.current = true; }, [activity]);
+  useLayoutEffect(() => {
+    const el = outRef.current;
+    if (el && stickRef.current) el.scrollTop = el.scrollHeight;
+  }, [consoleLines, logs, activity]);
+  const onScroll = (e) => {
+    const el = e.currentTarget;
+    stickRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 32;
+  };
+
+  /** Run a streamed job and echo its output into the console. Resolves to the exit code, or null if it never finished. */
+  const stream = async (path, body) => {
+    let rc = null;
+    await streamNdjsonUrl(`${server.url}${path}`, {
+      method: 'POST',
+      body,
+      signal: abortRef.current?.signal,
+      onMessage: (m) => {
+        const show = (text) => { if (text.trim()) append(text, ERROR_LINE.test(text) ? 'err' : 'out'); };
+        if (m.type === 'line') show(m.text);
+        else if (m.type === 'exit') rc = m.returncode;
+        else if ('returncode' in m) {
+          // Older managers answer with one JSON document once the job ends.
+          (m.output || '').split('\n').forEach(show);
+          rc = m.returncode;
+        }
+      },
+    });
+    return rc;
+  };
+
+  const runAction = async (svc, action) => {
+    if (action === 'status') {
+      const d = await refresh();
+      const st = d ? (d.services[svc.id]?.running ? 'running' : 'stopped') : 'error';
+      toast.info(`${svc.label}: ${STATE[st].label}`);
+      return;
+    }
+    if (action !== 'start') {
+      const ok = await confirm({ title: `${action === 'stop' ? 'Stop' : 'Restart'} ${svc.label}?`,
+        message: action === 'stop'
+          ? 'The service will be unavailable until it is started again.'
+          : `The service is prepared first${svc.id === 'frontend' ? ' (dependencies and a fresh build)' : ''}, then swapped over with only a few seconds of downtime.`,
+        confirmLabel: action === 'stop' ? 'Stop service' : 'Restart service', tone: 'danger' });
+      if (!ok) return;
+    }
+    setPending((p) => ({ ...p, [svc.id]: action }));
+    setActivity('console');
+    append(`$ ${action} ${svc.id}  ·  ${stamp()}`, 'cmd');
+    try {
+      const rc = await stream(`/api/${action}/${svc.id}`);
+      const ok = rc === 0;
+      append(ok ? `✓ ${action} ${svc.id} finished` : `✗ ${action} ${svc.id} failed${rc == null ? '' : ` (exit ${rc})`}`, ok ? 'ok' : 'err');
+      if (ok) toast.success(`${svc.label} ${action} succeeded`); else toast.error(`${svc.label} ${action} failed`);
+      logAuditEvent('server_manager_action', user?.email, `${server.id}:${svc.id}`, `${action} ${svc.id} on ${server.alias} ${ok ? 'succeeded' : 'failed'}`);
+    } catch (e) {
+      if (isAbort(e)) return;
+      append(describeError(e, server.target), 'err');
+      toast.error(`${svc.label} ${action} failed: ${describeError(e, server.target)}`);
+    } finally {
+      setPending((p) => ({ ...p, [svc.id]: null }));
+      refresh();
+    }
+  };
+
+  const gitPull = async () => {
+    const target = repo || 'the default repository';
+    const ok = await confirm({ title: 'Pull latest code?', message: `Runs git pull --ff-only in ${target} on ${server.alias}.`, confirmLabel: 'Git pull' });
+    if (!ok) return;
+    setPending((p) => ({ ...p, git: 'git pull' }));
+    setActivity('console');
+    append(`$ git pull  ·  ${repo || 'default repo'}  ·  ${stamp()}`, 'cmd');
+    try {
+      const rc = await stream('/api/gitpull', repo ? { dir: repo } : {});
+      const good = rc === 0;
+      append(good ? '✓ git pull finished' : `✗ git pull failed${rc == null ? '' : ` (exit ${rc})`}`, good ? 'ok' : 'err');
+      if (good) toast.success('Git pull succeeded'); else toast.error('Git pull failed');
+      logAuditEvent('server_manager_action', user?.email, server.id, `git pull in ${target} on ${server.alias} ${good ? 'succeeded' : 'failed'}`);
+    } catch (e) {
+      if (isAbort(e)) return;
+      append(describeError(e, server.target), 'err');
+      toast.error(`Git pull failed: ${describeError(e, server.target)}`);
+    } finally {
+      setPending((p) => ({ ...p, git: null }));
+      refresh();
+    }
+  };
+
+  const changeDir = async (svc, option) => {
+    try {
+      await api(`/api/service/${svc}/dir`, { body: { dir: option.path, port: option.port || undefined, entry: option.entry || undefined } });
+      toast.success(`${svc} now points to ${option.label}`);
+      logAuditEvent('server_manager_action', user?.email, `${server.id}:${svc}`, `Switched ${svc} directory to ${option.path} on ${server.alias}`);
+      refresh();
+      if (activity === svc) loadLog(svc);
+    } catch (e) {
+      toast.error(describeError(e, server.target));
+    }
+  };
+
+  const download = () => {
+    const text = activity === 'console' ? consoleLines.map((l) => l.text).join('\n') : logs[activity]?.text || '';
+    downloadBlob(new Blob([text], { type: 'text/plain' }), `${server.id}_${activity}_${fileStamp()}.log`);
+  };
+
+  const setTerminal = (open) => setParams((p) => { const n = new URLSearchParams(p); if (open) n.set('terminal', 'true'); else n.delete('terminal'); return n; });
+  const log = logs[activity];
+  const hasOutput = activity === 'console' ? consoleLines.length > 0 : !!log?.text;
+
+  return (
+    <Page dense>
+      {/* One compact bar: title and sync state, the server picker centred, actions on the right. */}
+      <header className="grid grid-cols-[minmax(0,1fr)_auto] xl:grid-cols-[1fr_auto_1fr] items-center gap-x-4 gap-y-3">
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 min-w-0">
+          <h1 className="font-johnson-display text-[1.6rem] leading-none tracking-[-0.02em] text-jj-gray-08 whitespace-nowrap">
+            Server <span className="font-light italic text-jj-red">control.</span>
+          </h1>
+          <StatusChip color={STATE[anyBusy ? 'busy' : overall].color} live={!!lastSync && !failure} className="h-6 px-2.5 gap-1.5 text-[9.5px] tracking-[0.14em]">
+            {failure ? STATE[failure.state].label
+              : lastSync ? `${anyBusy ? 'Working · ' : ''}Synced ${lastSync.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', second: '2-digit' })}` : 'Syncing…'}
+          </StatusChip>
+        </div>
+        {tabs && <div className="col-span-2 row-start-2 xl:col-span-1 xl:row-start-1 xl:col-start-2 justify-self-center max-w-full">{tabs}</div>}
+        <div className="flex items-center gap-2 justify-self-end row-start-1 col-start-2 xl:col-start-3">
+        {canAdmin && <Button size="sm" icon="server" onClick={() => setTerminal(true)} aria-label="Open terminal"><span className="hidden sm:inline">Terminal</span></Button>}
+        {canAdmin && (
+          <div className="flex">
+            <Button size="sm" variant="primary" icon="sync" onClick={gitPull} aria-label={repo ? `Git pull ${repo.split('/').pop()}` : 'Git pull'} loading={!!pending.git} disabled={gitBusy}
+              title={overview?.git && !pending.git ? `git pull running (${overview.git.by})` : undefined} className={repos.length ? 'rounded-r-none' : ''}>
+              <span className="hidden sm:inline">Git pull{repo ? ` · ${repo.split('/').pop()}` : ''}</span>
+            </Button>
+            {repos.length > 0 && (
+              <Menu open={repoMenu} onOpenChange={setRepoMenu} className="w-[min(26rem,calc(100vw-1rem))] max-h-80" trigger={(
+                <Button size="sm" variant="primary" aria-label="Choose repository" disabled={gitBusy} onClick={() => setRepoMenu((v) => !v)} className="rounded-l-none border-l border-white/30 px-2.5">
+                  <Icon name="chevronDown" className="w-3 h-3" />
+                </Button>
+              )}>
+                <MenuItem active={!repo} onClick={() => { setRepo(''); setRepoMenu(false); }}>Default repository</MenuItem>
+                {repos.map((r) => (
+                  <MenuItem key={r} active={repo === r} title={r} onClick={() => { setRepo(r); setRepoMenu(false); }}>
+                    <span className="block">{r.split('/').pop()}</span>
+                    <span className="block font-mono text-[11px] text-jj-gray-05 truncate">{r}</span>
+                  </MenuItem>
+                ))}
+              </Menu>
+            )}
+          </div>
+        )}
+        <Button size="sm" icon="refresh" onClick={refresh} aria-label="Refresh status"><span className="hidden sm:inline">Refresh</span></Button>
+        </div>
+      </header>
+
+      {failure && <Alert tone="error" title={`Can’t reach ${server.alias}`}>{failure.message}</Alert>}
+      {!failure && overview?.legacy && (
+        <Alert tone="warning" title={`${server.alias} runs an older Server Manager`}>
+          Action output appears only when a job ends; server vitals and busy locks are off. Redeploy linux_manage on this host to enable them.
+        </Alert>
+      )}
+
+      <div className="grid grid-cols-1 xl:grid-cols-2 gap-4 stagger">
+        {SERVICES.map((svc) => (
+          <ServiceCard key={svc.id} svc={svc} info={overview?.services[svc.id] || {}} history={overview?.services[svc.id]?.history || localHistory[svc.id]} state={svcState(svc.id)} busy={busyOf(svc.id)}
+            canAdmin={canAdmin} onAction={runAction} dirOptions={dirs[svc.id] || []} onChangeDir={changeDir} />
+        ))}
+      </div>
+
+      {overview?.host && <HostStrip host={overview.host} />}
+
+      <section className="surface overflow-hidden">
+        <div className="flex flex-wrap items-center justify-between gap-x-2 pl-1 pr-3 sm:px-4 border-b border-jj-gray-02">
+          <Tabs label="Activity" value={activity} onChange={setActivity} className="border-b-0 min-w-0"
+            tabs={[{ id: 'console', label: 'Console' }, ...SERVICES.map((s) => ({ id: s.id, label: `${s.id}.log` }))]} />
+          <div className="flex items-center gap-1 shrink-0 py-1.5 ml-auto">
+            {activity !== 'console' && (
+              <>
+                <Toggle checked={follow} onChange={setFollow} label="Follow" className="mr-1.5" />
+                {!follow && <Button size="sm" variant="ghost" icon="refresh" onClick={() => loadLog(activity)}>Reload</Button>}
+              </>
+            )}
+            <Button size="sm" variant="ghost" icon="download" onClick={download} disabled={!hasOutput} aria-label="Download output">
+              <span className="hidden sm:inline">Download</span>
+            </Button>
+            {activity === 'console' && <Button size="sm" variant="ghost" onClick={() => setConsoleLines([])} disabled={!consoleLines.length}>Clear</Button>}
+          </div>
+        </div>
+        <div ref={outRef} onScroll={onScroll} tabIndex={0} aria-label="Activity output" aria-live="off"
+          className={cx('overflow-auto terminal-scroll bg-terminal px-5 py-4 font-mono text-xs leading-5 focus-ring-inset', activity === 'console' && !consoleLines.length ? 'h-32' : 'h-80 sm:h-[28rem]')}>
+          {activity === 'console' ? (
+            consoleLines.length === 0 ? (
+              <div className="h-full flex flex-col items-center justify-center gap-3 text-center font-johnson-text">
+                <span className="flex items-center gap-2 text-[#8b949e] text-[13px]">
+                  <span className="w-2 h-4 bg-[#7ee787] animate-blink" aria-hidden="true" />
+                  Ready for commands
+                </span>
+                <span className="text-[#6e7681] text-xs max-w-sm">Output from start, stop, restart and git pull streams in here line by line as it happens.</span>
+              </div>
+            )
+              : consoleLines.map((l) => (
+                <div key={l.id} className={cx('whitespace-pre-wrap break-words',
+                  { cmd: 'text-[#79c0ff] font-semibold mt-2 first:mt-0', ok: 'text-[#7ee787]', err: 'text-[#ff7b72]', out: 'text-[#c9d1d9]' }[l.tone])}>{l.text}</div>
+              ))
+          ) : log?.note ? (
+            <p className={cx('font-johnson-text text-[13px]', log.error ? 'text-[#ff7b72]' : 'text-[#8b949e]')}>{log.note}</p>
+          ) : (
+            <pre className="whitespace-pre-wrap break-words text-[#c9d1d9] m-0">{log ? log.text || '(empty)' : 'Loading…'}</pre>
+          )}
+        </div>
+      </section>
+
+      {termOpen && (
+        <Suspense fallback={null}>
+          <Terminal manageUrl={server.url} title={server.alias} onClose={() => setTerminal(false)} />
+        </Suspense>
+      )}
+    </Page>
+  );
+}
+
+export default function ServerManagePage() {
+  const { hasPermission } = useRBAC();
+  const [params, setParams] = useSearchParams();
+  const visible = SERVERS.filter((s) => hasPermission(s.permission));
+  const visibleKey = visible.map((s) => s.id).join();
+  const active = visible.find((s) => s.id === params.get('server')) || visible[0];
+  const [health, setHealth] = useState({});
+  const reportHealth = useCallback((id, state) => setHealth((h) => (h[id] === state ? h : { ...h, [id]: state })), []);
+
+  // The open panel reports its own server; only the other tabs are polled here.
+  const check = useCallback(() => {
+    visible.filter((s) => s.id !== active?.id).forEach((s) => {
+      fetchOverview(s.url).then((d) => reportHealth(s.id, summarize(d)), (e) => reportHealth(s.id, failureState(e)));
+    });
+  }, [visibleKey, active?.id, reportHealth]); // eslint-disable-line react-hooks/exhaustive-deps
+  usePolling(check, REFRESH_MS, { enabled: visible.length > 1 });
+
+  if (!active) {
+    return (
+      <Page>
+        <EmptyState icon="server" title="No manage servers available"
+          description="No server is configured for this deployment, or your role doesn’t include any of them. Contact your administrator." />
+      </Page>
+    );
+  }
+  const tabs = visible.length > 1 ? (
+    <Tabs variant="pill" label="Server" value={active.id}
+      onChange={(id) => setParams((p) => { const n = new URLSearchParams(p); n.set('server', id); n.delete('terminal'); return n; })}
+      tabs={visible.map((s) => ({ id: s.id, label: s.label, dot: STATE[health[s.id] || 'loading'].color, title: `${s.alias}: ${STATE[health[s.id] || 'loading'].label}` }))} />
+  ) : null;
+  return <ServerPanel key={active.id} server={active} tabs={tabs} onHealth={reportHealth} />;
+}
