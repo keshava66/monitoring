@@ -2,23 +2,22 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 import { useRBAC } from '../context/RBACContext';
-import { apiJson } from '../utils/apiClient';
+import { apiJson, requestJson } from '../utils/apiClient';
 import { EmptyState, Icon, Page, Section, Skeleton, StatusChip, cx, fmtCompact, fmtNum } from '../components/ui';
 import { ToolOrbit } from '../components/HeroArt';
-import { NAV_ITEMS } from '../navigation';
+import { MANAGE_SERVERS, NAV_ITEMS } from '../navigation';
 
 const GOOD = '#328714';
 const WARN = '#e8a317';
 const BAD = '#eb1700';
 
 const greeting = (d) => (d.getHours() < 12 ? 'Good morning' : d.getHours() < 18 ? 'Good afternoon' : 'Good evening');
-const MANAGED_SERVERS = ['DEV', 'QA', 'PROD', 'POC'].filter((e) => import.meta.env[`VITE_MANAGE_API_${e}_URL`] || import.meta.env.VITE_MANAGE_API_URL).length;
 const settle = (p) => p.then((v) => v, () => null);
 
 /** One live figure per tool, fetched in parallel; anything unavailable shows a dash. */
-function useToolPulse(paths) {
+function useToolPulse(paths, servers) {
   const [pulse, setPulse] = useState({});
-  const key = paths.join('|');
+  const key = `${paths.join('|')}#${servers.map((x) => x.id).join('|')}`;
   useEffect(() => {
     const has = (p) => paths.includes(p);
     const ctrl = new AbortController();
@@ -55,7 +54,20 @@ function useToolPulse(paths) {
         });
       });
     }
-    if (has('/server-manager')) put('/server-manager', { value: String(MANAGED_SERVERS), label: MANAGED_SERVERS === 1 ? 'server managed' : 'servers managed' });
+    if (has('/server-manager')) {
+      if (!servers.length) put('/server-manager', { value: '0', label: 'servers configured' });
+      else {
+        Promise.all(servers.map((x) => settle(requestJson(`${x.url}/health`, opts)))).then((res) => {
+          const up = res.filter(Boolean).length;
+          put('/server-manager', {
+            value: `${up}/${servers.length}`,
+            label: 'servers reachable',
+            note: up === servers.length ? 'all managers online' : `${servers.length - up} unreachable`,
+            color: up === servers.length ? GOOD : up ? WARN : BAD,
+          });
+        });
+      }
+    }
     if (has('/nas-scanner')) {
       settle(apiJson('/api/nas/overview', opts)).then((d) => put('/nas-scanner', d?.kpis
         ? { value: d.kpis.total_size || '—', label: `across ${fmtNum(d.kpis.segments)} segments` }
@@ -184,9 +196,13 @@ export default function Dashboard() {
 
   const tools = useMemo(() => NAV_ITEMS.filter((t) => t.path !== '/dashboard')
     .filter((t) => (t.anyPermissions ? hasAnyPermission(t.anyPermissions) : hasPermission(t.permission))), [hasPermission, hasAnyPermission]);
-  const pulse = useToolPulse(tools.map((t) => t.path));
+  const servers = useMemo(() => MANAGE_SERVERS.filter((x) => hasPermission(x.permission)), [hasPermission]);
+  const pulse = useToolPulse(tools.map((t) => t.path), servers);
   const firstName = (user?.name || '').split(/[\s,]+/).filter(Boolean)[0] || 'there';
-  const attention = Object.values(pulse).filter((p) => p.color && p.color !== GOOD).length;
+  const readings = Object.values(pulse);
+  const checking = readings.length < tools.length;
+  const unavailable = readings.filter((p) => p.value === '—').length;
+  const attention = readings.filter((p) => p.color && p.color !== GOOD).length + unavailable;
 
   return (
     <Page>
@@ -198,8 +214,8 @@ export default function Dashboard() {
           <div className="flex flex-wrap gap-2 mb-4 animate-rise">
             <StatusChip color={roleColor} live>{roleName}</StatusChip>
             {tools.length > 0 && (
-              <StatusChip color={attention ? WARN : GOOD} live={!!attention}>
-                {attention ? `${attention} ${attention === 1 ? 'tool needs' : 'tools need'} a look` : 'All systems reporting'}
+              <StatusChip color={checking ? '#cbc4bc' : attention ? WARN : GOOD} live={!checking && !!attention}>
+                {checking ? 'Checking tools…' : attention ? `${attention} ${attention === 1 ? 'tool needs' : 'tools need'} a look` : 'All systems reporting'}
               </StatusChip>
             )}
           </div>

@@ -353,6 +353,16 @@ def get_terminal(n: int = Query(50, ge=1, le=MAX_LINES)):
     return {"lines": lines, "total": total, "path": TERMINAL_LOG}
 
 
+def _read_range(path: str, start: int, size: int) -> bytes:
+    """Up to `size` bytes from `start`; empty if the log vanished since the stat."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(start)
+            return f.read(size)
+    except FileNotFoundError:
+        return b""
+
+
 def _backlog(path: str, n: int, size: int) -> Tuple[List[str], int]:
     """Last n complete lines and the offset just after them. A trailing partial
     line is left for the live loop so it is never sent in two pieces."""
@@ -429,9 +439,7 @@ async def stream_terminal(
                 pos, identity, buffer = 0, current, b""
                 yield _sse("", event="reset")
             if st.st_size > pos:
-                with open(TERMINAL_LOG, "rb") as f:
-                    f.seek(pos)
-                    chunk = f.read(min(st.st_size - pos, 4 << 20))
+                chunk = await asyncio.to_thread(_read_range, TERMINAL_LOG, pos, min(st.st_size - pos, 4 << 20))
                 offset = pos - len(buffer)
                 pos += len(chunk)
                 buffer += chunk

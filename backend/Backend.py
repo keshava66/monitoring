@@ -186,8 +186,8 @@ class RequestContextMiddleware:
 
 _allowed_origins = [o.strip().rstrip("/") for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()]
 if not _allowed_origins:
-    logger.warning("[CORS] ALLOWED_ORIGINS not set — allowing http://localhost:3000 and :5173 for local development only.")
-    _allowed_origins = ["http://localhost:3000", "http://localhost:5173"]
+    # Fail closed: no browser origin may call the API until one is configured.
+    logger.error("[CORS] ALLOWED_ORIGINS is not set: every browser request from another origin will be refused.")
 
 app.add_middleware(
     CORSMiddleware,

@@ -5,6 +5,21 @@ export const PIPELINE_VIEW_PERMISSIONS = [
 export const SERVER_MANAGER_PERMISSIONS = ['viewServerManagerDev', 'viewServerManagerQA', 'viewServerManagerProd', 'viewServerManagerPOC'];
 export const STATS_PERMISSIONS = ['viewEPODStatsEPOD', 'viewEPODStatsRIMDOCS'];
 
+const MANAGE_LEGACY_URL = import.meta.env.VITE_MANAGE_API_URL || '';
+/** Server Manager hosts configured for this build, one per environment. */
+export const MANAGE_SERVERS = [
+  { id: 'dev', label: 'DEV', alias: 'SmartHub DEV', permission: 'viewServerManagerDev', admin: 'adminAccessDev', url: import.meta.env.VITE_MANAGE_API_DEV_URL || MANAGE_LEGACY_URL },
+  { id: 'qa', label: 'QA', alias: 'SmartHub QA', permission: 'viewServerManagerQA', admin: 'adminAccessQA', url: import.meta.env.VITE_MANAGE_API_QA_URL || MANAGE_LEGACY_URL },
+  { id: 'prod', label: 'PROD', alias: 'SmartHub PROD', permission: 'viewServerManagerProd', admin: 'adminAccessProd', url: import.meta.env.VITE_MANAGE_API_PROD_URL || MANAGE_LEGACY_URL },
+  { id: 'poc', label: 'POC', alias: 'SmartHub POC', permission: 'viewServerManagerPOC', admin: 'adminAccessPOC', url: import.meta.env.VITE_MANAGE_API_POC_URL || MANAGE_LEGACY_URL },
+].filter((s) => s.url).map((s) => {
+  const target = s.url.replace(/\/$/, '');
+  // In `npm run dev` requests go through Vite's proxy (vite.config.js), so a
+  // local session needs neither the manager's CORS allow-list nor a trusted
+  // certificate. Built bundles talk to the manager directly.
+  return { ...s, target, url: import.meta.env.DEV ? `${window.location.origin}/__manage/${s.id}` : target };
+});
+
 export const NAV_ITEMS = [
   { path: '/dashboard', label: 'Dashboard', icon: 'dashboard', permission: 'viewDashboard', group: 'Workspace', color: '#eb1700' },
   { path: '/ingestion-stats', group: 'Operations', label: 'Ingestion Stats', icon: 'database', anyPermissions: STATS_PERMISSIONS,

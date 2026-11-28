@@ -820,7 +820,7 @@ async def _run_command(websocket: WebSocket, inbox: asyncio.Queue, session: _Ses
     """Run one command, streaming its output. Returns False if the client left."""
     for f in session.files():
         f.unlink(missing_ok=True)
-    if not os.path.isdir(session.cwd):
+    if not await asyncio.to_thread(os.path.isdir, session.cwd):
         session.cwd = str(Path.home())
     try:
         proc = await asyncio.create_subprocess_exec(

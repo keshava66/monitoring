@@ -4,25 +4,13 @@ import { useRBAC } from '../context/RBACContext';
 import { useAuth } from '../context/AuthContext';
 import { ApiError, downloadBlob, isAbort, requestJson, streamNdjsonUrl } from '../utils/apiClient';
 import { logAuditEvent } from '../utils/auditLog';
+import { MANAGE_SERVERS as SERVERS } from '../navigation';
 import {
   Alert, Badge, Button, Dot, EmptyState, Icon, Menu, MenuItem, Page, ProgressBar, StatusChip, Tabs, Toggle, cx, useFeedback, usePolling,
 } from '../components/ui';
 
 const Terminal = lazy(() => import('./Terminal'));
 
-const LEGACY_URL = import.meta.env.VITE_MANAGE_API_URL || '';
-const SERVERS = [
-  { id: 'dev', label: 'DEV', alias: 'SmartHub DEV', permission: 'viewServerManagerDev', admin: 'adminAccessDev', url: import.meta.env.VITE_MANAGE_API_DEV_URL || LEGACY_URL },
-  { id: 'qa', label: 'QA', alias: 'SmartHub QA', permission: 'viewServerManagerQA', admin: 'adminAccessQA', url: import.meta.env.VITE_MANAGE_API_QA_URL || LEGACY_URL },
-  { id: 'prod', label: 'PROD', alias: 'SmartHub PROD', permission: 'viewServerManagerProd', admin: 'adminAccessProd', url: import.meta.env.VITE_MANAGE_API_PROD_URL || LEGACY_URL },
-  { id: 'poc', label: 'POC', alias: 'SmartHub POC', permission: 'viewServerManagerPOC', admin: 'adminAccessPOC', url: import.meta.env.VITE_MANAGE_API_POC_URL || LEGACY_URL },
-].filter((s) => s.url).map((s) => {
-  const target = s.url.replace(/\/$/, '');
-  // In `npm run dev` requests go through Vite's proxy (vite.config.js), so a
-  // local session needs neither the manager's CORS allow-list nor a trusted
-  // certificate. Built bundles talk to the manager directly.
-  return { ...s, target, url: import.meta.env.DEV ? `${window.location.origin}/__manage/${s.id}` : target };
-});
 
 const SERVICES = [
   { id: 'backend', label: 'Backend API', icon: 'server' },
