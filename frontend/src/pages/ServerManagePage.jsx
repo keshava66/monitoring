@@ -30,7 +30,6 @@ const SERVICES = [
   { id: 'frontend', label: 'Frontend app', icon: 'globe' },
 ];
 const REFRESH_MS = 30_000;
-const LOCAL_HISTORY = 21; // 10 minutes of 30-second polls
 const BUSY_REFRESH_MS = 3_000;
 const LOG_FOLLOW_MS = 5_000;
 const LOG_LINES = 500;
@@ -200,7 +199,6 @@ function ServerPanel({ server, tabs, onHealth }) {
   const api = useCallback((path, opts) => requestJson(`${server.url}${path}`, opts), [server.url]);
 
   const [overview, setOverview] = useState(null);
-  const [localHistory, setLocalHistory] = useState(() => Object.fromEntries(SERVICES.map((svc) => [svc.id, []])));
   const [failure, setFailure] = useState(null);
   const [lastSync, setLastSync] = useState(null);
   const [pending, setPending] = useState({});
@@ -234,10 +232,6 @@ function ServerPanel({ server, tabs, onHealth }) {
   const refresh = useCallback(async () => {
     try {
       const d = await fetchOverview(server.url);
-      if (d.legacy) {
-        // Older managers keep no history: build it from our own polls.
-        setLocalHistory((h) => Object.fromEntries(SERVICES.map((svc) => [svc.id, [...h[svc.id], d.services[svc.id]?.cpu || 0].slice(-LOCAL_HISTORY)])));
-      }
       setOverview(d);
       setFailure(null);
       onHealth(server.id, summarize(d));
@@ -403,10 +397,7 @@ function ServerPanel({ server, tabs, onHealth }) {
             const busy = busyOf(svc.id);
             const st = busy ? STATE.busy : STATE[svcState(svc.id)];
             const x = overview?.services[svc.id] || {};
-            return {
-              id: svc.id, label: x.name || svc.label, color: st.color, state: busy ? BUSY_LABEL[busy.action] || st.label : st.label,
-              cpu: x.cpu, mem: x.mem, uptime: x.uptime, history: x.history || localHistory[svc.id], every: x.history_every || REFRESH_MS / 1000,
-            };
+            return { id: svc.id, label: x.name || svc.label, color: st.color, state: busy ? BUSY_LABEL[busy.action] || st.label : st.label, cpu: x.cpu, mem: x.mem, uptime: x.uptime, live: svcState(svc.id) === 'running' };
           })} />
         )}
         actions={(

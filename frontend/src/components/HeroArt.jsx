@@ -360,34 +360,21 @@ export function PipelineFlow({ nodes, stages, running }) {
 }
 
 /** Heartbeat trace whose amplitude follows the CPU load. */
-const spanLabel = (seconds) => (seconds >= 90 ? `${Math.round(seconds / 60)} min` : `${seconds}s`);
-
-/** Real CPU samples, oldest first, scaled to the busiest moment (at least 10%). */
-function CpuTrend({ history, every, color }) {
-  const points = history || [];
-  if (points.length < 2) {
-    return <p className="my-1.5 h-7 flex items-center font-johnson-text text-[11.5px] text-jj-gray-05">Collecting CPU history…</p>;
-  }
-  const peak = Math.max(...points);
-  const top = Math.max(10, peak * 1.15);
-  const step = 100 / (points.length - 1);
-  const xy = points.map((v, i) => `${(i * step).toFixed(2)},${(38 - (v / top) * 34).toFixed(2)}`);
+function Trace({ load, color, live }) {
+  const amp = 4 + Math.min(100, Number(load) || 0) * 0.22;
+  const beat = (x) => `L ${x} 20 L ${x + 3} ${20 - amp} L ${x + 6} ${20 + amp * 0.6} L ${x + 9} 20`;
+  let d = 'M 0 20';
+  for (let x = 0; x < 200; x += 25) d += ` L ${x + 8} 20 ${beat(x + 8)}`;
   return (
-    <figure className="my-1">
-      <svg viewBox="0 0 100 40" preserveAspectRatio="none" className="w-full h-7" role="img"
-        aria-label={`CPU over the last ${spanLabel((points.length - 1) * every)}, peak ${peak}%`}>
-        <polygon points={`0,40 ${xy.join(' ')} 100,40`} fill={color} opacity="0.12" />
-        <polyline points={xy.join(' ')} fill="none" stroke={color} strokeWidth="1.6" strokeLinejoin="round" vectorEffect="non-scaling-stroke" />
-      </svg>
-      <figcaption className="flex justify-between font-johnson-text text-[11px] text-jj-gray-05">
-        <span>CPU · last {spanLabel((points.length - 1) * every)}</span>
-        <span className="tabular-nums">peak {peak}%</span>
-      </figcaption>
-    </figure>
+    <svg viewBox="0 0 100 40" preserveAspectRatio="none" className="w-full h-7 my-1 overflow-hidden" aria-hidden="true">
+      <g className={live ? 'animate-[trace_4s_linear_infinite]' : ''}>
+        <path d={d} fill="none" stroke={color} strokeWidth="1.6" strokeLinejoin="round" vectorEffect="non-scaling-stroke" opacity={live ? 1 : 0.35} />
+      </g>
+    </svg>
   );
 }
 
-/** One lane per service: status, a real CPU trend, then current CPU, memory and uptime. */
+/** One lane per service: live trace driven by CPU, plus memory and uptime. */
 export function ServicePulse({ services }) {
   return (
     <div className="w-full h-full flex flex-col justify-center gap-2">
@@ -400,7 +387,7 @@ export function ServicePulse({ services }) {
             </p>
             <span className="font-johnson-text font-medium text-[13px] shrink-0" style={{ color: s.color }}>{s.state}</span>
           </div>
-          <CpuTrend history={s.history} every={s.every} color={s.color} />
+          <Trace load={s.cpu} color={s.color} live={s.live} />
           <dl className="flex gap-4 font-johnson-text text-[12px]">
             {[['CPU', s.cpu != null ? `${s.cpu}%` : '—'], ['Mem', s.mem != null ? `${s.mem}%` : '—'], ['Up', s.uptime || '—']].map(([k, v]) => (
               <div key={k} className="flex gap-1.5 min-w-0">
