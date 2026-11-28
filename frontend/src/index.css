@@ -2,17 +2,23 @@
 @tailwind components;
 @tailwind utilities;
 
+/* Official J&J WOFF2 set from brandcenter.jnj.com (16 files in public/fonts). */
 @font-face { font-family: 'JohnsonText'; src: url('/fonts/JohnsonText-Light.woff2') format('woff2'); font-weight: 300; font-style: normal; font-display: swap; }
 @font-face { font-family: 'JohnsonText'; src: url('/fonts/JohnsonText-LightItalic.woff2') format('woff2'); font-weight: 300; font-style: italic; font-display: swap; }
 @font-face { font-family: 'JohnsonText'; src: url('/fonts/JohnsonText-Regular.woff2') format('woff2'); font-weight: 400; font-style: normal; font-display: swap; }
+@font-face { font-family: 'JohnsonText'; src: url('/fonts/JohnsonText-RegularItalic.woff2') format('woff2'); font-weight: 400; font-style: italic; font-display: swap; }
 @font-face { font-family: 'JohnsonText'; src: url('/fonts/JohnsonText-Medium.woff2') format('woff2'); font-weight: 500; font-style: normal; font-display: swap; }
+@font-face { font-family: 'JohnsonText'; src: url('/fonts/JohnsonText-MediumItalic.woff2') format('woff2'); font-weight: 500; font-style: italic; font-display: swap; }
 @font-face { font-family: 'JohnsonText'; src: url('/fonts/JohnsonText-Bold.woff2') format('woff2'); font-weight: 600 800; font-style: normal; font-display: swap; }
+@font-face { font-family: 'JohnsonText'; src: url('/fonts/JohnsonText-BoldItalic.woff2') format('woff2'); font-weight: 600 800; font-style: italic; font-display: swap; }
 @font-face { font-family: 'JohnsonDisplay'; src: url('/fonts/JohnsonDisplay-Light.woff2') format('woff2'); font-weight: 300; font-style: normal; font-display: swap; }
 @font-face { font-family: 'JohnsonDisplay'; src: url('/fonts/JohnsonDisplay-LightItalic.woff2') format('woff2'); font-weight: 300; font-style: italic; font-display: swap; }
 @font-face { font-family: 'JohnsonDisplay'; src: url('/fonts/JohnsonDisplay-Regular.woff2') format('woff2'); font-weight: 400; font-style: normal; font-display: swap; }
-@font-face { font-family: 'JohnsonDisplay'; src: url('/fonts/JohnsonDisplay-RegularItalic.woff2') format('woff2'); font-weight: 400 500; font-style: italic; font-display: swap; }
+@font-face { font-family: 'JohnsonDisplay'; src: url('/fonts/JohnsonDisplay-RegularItalic.woff2') format('woff2'); font-weight: 400; font-style: italic; font-display: swap; }
 @font-face { font-family: 'JohnsonDisplay'; src: url('/fonts/JohnsonDisplay-Medium.woff2') format('woff2'); font-weight: 500; font-style: normal; font-display: swap; }
+@font-face { font-family: 'JohnsonDisplay'; src: url('/fonts/JohnsonDisplay-MediumItalic.woff2') format('woff2'); font-weight: 500; font-style: italic; font-display: swap; }
 @font-face { font-family: 'JohnsonDisplay'; src: url('/fonts/JohnsonDisplay-Bold.woff2') format('woff2'); font-weight: 600 800; font-style: normal; font-display: swap; }
+@font-face { font-family: 'JohnsonDisplay'; src: url('/fonts/JohnsonDisplay-BoldItalic.woff2') format('woff2'); font-weight: 600 800; font-style: italic; font-display: swap; }
 
 /* Figures line up in paths, PIDs, logs and terminal output. */
 .font-mono { font-variant-numeric: tabular-nums; }
